@@ -1,0 +1,25 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.6
+    hooks:
+      - id: ruff
+        args: ["--fix"]
+        types: [python]
+      - id: ruff-format
+        types: [python]
+
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy type checking
+        language: system
+        entry: poetry run mypy src/tiny_mirror --ignore-missing-imports
+        types: [python]
+        pass_filenames: false
+
+      - id: e2e-tests
+        name: E2E tests (if credentials available)
+        language: system
+        entry: bash scripts/run_e2e_precommit.sh
+        stages: [pre-commit]
+        pass_filenames: false
