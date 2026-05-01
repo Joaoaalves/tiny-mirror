@@ -78,9 +78,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.tiny_client = tiny_client
 
-        # Real services for stages 07-09 land later; orders/stock/buckets
-        # services still raise NotImplementedError — those messages go to
-        # their respective DLQs until those stages are implemented.
+        # Stages 08-09 still ship stub services that raise
+        # NotImplementedError; their messages go to their DLQs until the
+        # matching stage lands.
         app.state.consumers = await start_consumers(
             channel,
             queue_publisher=app.state.queue_publisher,
@@ -88,7 +88,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tiny_client=tiny_client,
                 queue_publisher=app.state.queue_publisher,
             ),
-            order_sync=OrderSyncService(),
+            order_sync=OrderSyncService(
+                tiny_client=tiny_client,
+                queue_publisher=app.state.queue_publisher,
+            ),
             stock_sync=StockSyncService(),
             sale_buckets=SaleBucketService(),
         )
