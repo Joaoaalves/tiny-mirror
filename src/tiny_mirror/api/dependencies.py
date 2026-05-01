@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.config import settings
 from tiny_mirror.database import get_async_session
+from tiny_mirror.infrastructure.external.rate_limiter import RateLimiter
+from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.repositories.token_repository import (
     PostgreSQLTokenRepository,
 )
@@ -45,4 +47,16 @@ def get_token_service(
         tiny_client_id=settings.tiny_client_id,
         tiny_client_secret=settings.tiny_client_secret,
         tiny_initial_refresh_token=settings.tiny_refresh_token,
+    )
+
+
+def get_tiny_client(
+    token_service: TokenService = Depends(get_token_service),
+    redis_client: redis.Redis = Depends(get_redis_client),
+    http_client: httpx.AsyncClient = Depends(get_http_client),
+) -> TinyAPIClient:
+    return TinyAPIClient(
+        token_service=token_service,
+        rate_limiter=RateLimiter(redis_client),
+        http_client=http_client,
     )
