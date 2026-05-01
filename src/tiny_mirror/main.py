@@ -27,10 +27,16 @@ from tiny_mirror.infrastructure.repositories.token_repository import (
     PostgreSQLTokenRepository,
 )
 from tiny_mirror.logging_config import configure_logging
+from tiny_mirror.queue import start_consumers
+from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.queue.topology import setup_topology
 from tiny_mirror.rabbitmq import close_rabbitmq, get_channel, initialize_rabbitmq
 from tiny_mirror.redis_client import close_redis, get_redis, initialize_redis
 from tiny_mirror.scheduler.jobs import setup_scheduler, shutdown_scheduler
+from tiny_mirror.services.order_sync_service import OrderSyncService
+from tiny_mirror.services.product_sync_service import ProductSyncService
+from tiny_mirror.services.sale_bucket_service import SaleBucketService
+from tiny_mirror.services.stock_sync_service import StockSyncService
 from tiny_mirror.services.token_service import TokenService
 
 
@@ -42,15 +48,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("Starting tiny-mirror service", env=settings.app_env)
 
     scheduler: Any = None
-    consumer_tasks: list[Any] = []
+    app.state.consumers = []
 
     try:
         await initialize_database()
         await initialize_redis()
         await initialize_rabbitmq()
-        await setup_topology(get_channel())
+
+        channel = get_channel()
+        await setup_topology(channel)
 
         app.state.http_client = httpx.AsyncClient(timeout=30.0)
+        app.state.queue_publisher = QueuePublisher(channel)
 
         async with AsyncSessionLocal() as session:
             token_service = TokenService(
@@ -63,7 +72,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             await token_service.validate_on_startup()
 
-        # consumer tasks and historical-sync trigger land in stage 05+.
+        # Real services land in stages 06-09; the stub instances make the
+        # consumers wireable today and fail loudly (NotImplementedError ->
+        # DLQ) if a message arrives before those stages are implemented.
+        app.state.consumers = await start_consumers(
+            channel,
+            queue_publisher=app.state.queue_publisher,
+            product_sync=ProductSyncService(),
+            order_sync=OrderSyncService(),
+            stock_sync=StockSyncService(),
+            sale_buckets=SaleBucketService(),
+        )
+
         scheduler = setup_scheduler(app)
         logger.info("tiny-mirror started successfully")
 
@@ -71,8 +91,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         logger.info("Shutting down tiny-mirror service")
         shutdown_scheduler(scheduler)
-        for task in consumer_tasks:
-            task.cancel()
         http_client: httpx.AsyncClient | None = getattr(app.state, "http_client", None)
         if http_client is not None:
             await http_client.aclose()
