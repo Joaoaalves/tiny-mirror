@@ -36,29 +36,49 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log each request's method, path, status, and total elapsed time."""
 
+    SLOW_REQUEST_THRESHOLD_MS = 5000
+    # Probes hit /health every few seconds — logging them every time floods
+    # the structured-log stream without adding signal.
+    SKIP_PATHS = frozenset({"/health", "/ready"})
+
     async def dispatch(
         self,
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        path = request.url.path
+        skip_log = path in self.SKIP_PATHS
+
         start = time.perf_counter()
         try:
             response = await call_next(request)
         except Exception:
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.exception(
-                "Request failed",
-                method=request.method,
-                path=request.url.path,
-                elapsed_ms=round(elapsed_ms, 2),
-            )
+            if not skip_log:
+                elapsed_ms = (time.perf_counter() - start) * 1000
+                logger.exception(
+                    "Request failed",
+                    method=request.method,
+                    path=path,
+                    elapsed_ms=round(elapsed_ms, 2),
+                )
             raise
+
+        if skip_log:
+            return response
+
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info(
-            "Request completed",
-            method=request.method,
-            path=request.url.path,
-            status_code=response.status_code,
-            elapsed_ms=round(elapsed_ms, 2),
-        )
+        rounded = round(elapsed_ms, 2)
+        log_payload = {
+            "method": request.method,
+            "path": path,
+            "status_code": response.status_code,
+            "elapsed_ms": rounded,
+        }
+        if request.url.query:
+            log_payload["query_params"] = request.url.query
+        logger.info("Request completed", **log_payload)
+
+        if elapsed_ms > self.SLOW_REQUEST_THRESHOLD_MS:
+            logger.warning("Slow request detected", **log_payload)
+
         return response
