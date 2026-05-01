@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import structlog
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -31,9 +32,15 @@ async def _http_exception_handler(request: Request, exc: Exception) -> JSONRespo
 
 async def _validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
+    # exc.errors() may include ctx['error'] = ValueError(...) on
+    # `model_validator` failures; jsonable_encoder stringifies it.
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"error": "validation_error", "details": exc.errors()},
+        content={
+            "error": "validation_error",
+            "message": "Request validation failed",
+            "details": jsonable_encoder(exc.errors()),
+        },
     )
 
 
