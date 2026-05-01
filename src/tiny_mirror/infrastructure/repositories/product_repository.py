@@ -124,6 +124,26 @@ class PostgreSQLProductRepository(ProductRepository):
         )
         return [_row_to_dict(row) for row in result.scalars().all()]
 
+    async def get_kit_components_for_ids(
+        self, kit_tiny_ids: list[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        if not kit_tiny_ids:
+            return {}
+        result = await self._session.execute(
+            select(ProductKitComponentORM)
+            .where(ProductKitComponentORM.kit_product_tiny_id.in_(kit_tiny_ids))
+            .order_by(
+                ProductKitComponentORM.kit_product_tiny_id,
+                ProductKitComponentORM.id,
+            )
+        )
+        bucket: dict[int, list[dict[str, Any]]] = {kid: [] for kid in kit_tiny_ids}
+        for row in result.scalars().all():
+            bucket.setdefault(int(row.kit_product_tiny_id), []).append(
+                _row_to_dict(row)
+            )
+        return bucket
+
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
     return {col.name: getattr(row, col.name) for col in row.__table__.columns}

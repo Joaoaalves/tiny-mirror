@@ -64,6 +64,16 @@ class ProductRepository(abc.ABC):
     ) -> list[dict[str, Any]]:
         """Return the components of a kit, in insertion order."""
 
+    @abc.abstractmethod
+    async def get_kit_components_for_ids(
+        self, kit_tiny_ids: list[int]
+    ) -> dict[int, list[dict[str, Any]]]:
+        """Return ``{kit_tiny_id: [components]}`` for every id in the list.
+
+        Bulk version used by the bucket-refresh service to avoid an N+1 lookup.
+        Empty input returns an empty dict without hitting the database.
+        """
+
 
 class OrderRepository(abc.ABC):
     """Persistence contract for orders and their line items."""
@@ -101,6 +111,37 @@ class OrderRepository(abc.ABC):
         self, date_from: Any, date_to: Any
     ) -> list[dict[str, Any]]:
         """Return orders (with items) whose ``order_date`` falls in the range."""
+
+
+class SaleBucketRepository(abc.ABC):
+    """Persistence contract for the daily sale-bucket aggregations."""
+
+    @abc.abstractmethod
+    async def upsert_bucket(self, data: dict[str, Any]) -> None:
+        """Insert (or accumulate) a single bucket row."""
+
+    @abc.abstractmethod
+    async def upsert_buckets_batch(self, buckets: list[dict[str, Any]]) -> None:
+        """Insert (or accumulate) many bucket rows in batches."""
+
+    @abc.abstractmethod
+    async def delete_buckets_for_period(self, date_from: Any, date_to: Any) -> int:
+        """Delete every bucket whose ``bucket_date`` is in the inclusive range.
+
+        Returns the number of rows removed.
+        """
+
+    @abc.abstractmethod
+    async def get_buckets_for_sku(
+        self, sku: str, days: int = 90
+    ) -> list[dict[str, Any]]:
+        """Return buckets for a given SKU over the last ``days`` days."""
+
+    @abc.abstractmethod
+    async def get_buckets_for_period(
+        self, date_from: Any, date_to: Any
+    ) -> list[dict[str, Any]]:
+        """Return every bucket whose ``bucket_date`` is in the range."""
 
 
 class StockRepository(abc.ABC):
