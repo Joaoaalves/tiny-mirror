@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
@@ -89,7 +89,9 @@ class TinyAPIClient:
         if date_final is not None:
             params["dataFinal"] = _format_date_only(date_final)
         if updated_after is not None:
-            params["dataAtualizacao"] = _format_iso_datetime(updated_after)
+            # Tiny v3 accepts ONLY YYYY-MM-DD here (datetime variants -> 400);
+            # see memory/project_tiny_dataAtualizacao.md.
+            params["dataAtualizacao"] = _format_date_only(updated_after)
         if situation is not None:
             params["situacao"] = situation
         return await self._request("GET", "/pedidos", params=params)
@@ -322,10 +324,18 @@ def _format_date_only(value: datetime | date | str) -> str:
 
 
 def _format_iso_datetime(value: datetime | str) -> str:
-    """Return an ISO 8601 datetime string for ``dataAtualizacao``-style params."""
+    """Return ``YYYY-MM-DDTHH:MM:SS`` for ``dataAtualizacao``-style params.
+
+    Tiny rejects ISO strings that include a timezone offset (``+00:00``),
+    even though it accepts the rest of ISO 8601. Strip the offset and emit
+    naive seconds-precision. Aware inputs are converted to UTC before the
+    drop so we never silently shift local time.
+    """
     if isinstance(value, str):
         return value
-    return value.replace(microsecond=0).isoformat()
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    return value.replace(microsecond=0).isoformat(timespec="seconds")
 
 
 def _parse_resource_from_path(path: str) -> tuple[str, str]:
