@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, ClassVar
 
 import structlog
 
@@ -23,7 +23,7 @@ class OrderMapper:
     # Webhook payloads (stage 11) carry the situation as a localized string;
     # the order detail uses an int. This dict gives the consumer a single
     # source of truth for the mapping.
-    SITUATION_NAME_TO_CODE: dict[str, int] = {
+    SITUATION_NAME_TO_CODE: ClassVar[dict[str, int]] = {
         "Aberta": 0,
         "Faturada": 1,
         "Cancelada": 2,
@@ -72,9 +72,7 @@ class OrderMapper:
             "purchase_order_number": raw.get("numeroOrdemCompra"),
             "discount_value": _to_decimal_or_zero(raw.get("valorDesconto")),
             "shipping_value": _to_decimal_or_zero(raw.get("valorFrete")),
-            "other_expenses_value": _to_decimal_or_zero(
-                raw.get("valorOutrasDespesas")
-            ),
+            "other_expenses_value": _to_decimal_or_zero(raw.get("valorOutrasDespesas")),
             "observations": raw.get("observacoes"),
             "internal_observations": raw.get("observacoesInternas"),
             "order_origin": int(raw.get("origemPedido", 0) or 0),

@@ -51,14 +51,8 @@ async def list_orders(
     for clause in filters:
         base_query = base_query.where(clause)
 
-    order_clause = (
-        OrderORM.order_date.desc() if order_by == "desc" else OrderORM.order_date.asc()
-    )
-    list_query = (
-        base_query.order_by(order_clause)
-        .limit(page_size)
-        .offset((page - 1) * page_size)
-    )
+    order_clause = OrderORM.order_date.desc() if order_by == "desc" else OrderORM.order_date.asc()
+    list_query = base_query.order_by(order_clause).limit(page_size).offset((page - 1) * page_size)
 
     count_query = select(func.count(OrderORM.tiny_id))
     for clause in filters:
@@ -73,9 +67,7 @@ async def list_orders(
     total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 0
 
     if total > 0 and page > total_pages:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Page out of range"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page out of range")
 
     return OrderListResponse(
         items=[_to_list_item(o) for o in orders],
@@ -95,9 +87,7 @@ async def get_order(
 ) -> OrderDetailResponse:
     order = await orders.get_by_tiny_id(tiny_id)
     if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Order not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
     return _to_detail_response(order)
 
 

@@ -74,9 +74,7 @@ class OrderWebhookConsumer(BaseConsumer):
 
         # Now read back the persisted order to drive the fan-out.
         async with AsyncSessionLocal() as session:
-            persisted = await PostgreSQLOrderRepository(session).get_by_tiny_id(
-                order_tiny_id
-            )
+            persisted = await PostgreSQLOrderRepository(session).get_by_tiny_id(order_tiny_id)
         if persisted is None:
             # process_order_item logged "Order not found" already; nothing
             # else to fan out.

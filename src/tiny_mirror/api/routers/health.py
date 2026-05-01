@@ -76,9 +76,7 @@ async def health(
     body["scheduler_running"] = scheduler_running
 
     return JSONResponse(
-        status_code=status.HTTP_200_OK
-        if overall_ok
-        else status.HTTP_503_SERVICE_UNAVAILABLE,
+        status_code=status.HTTP_200_OK if overall_ok else status.HTTP_503_SERVICE_UNAVAILABLE,
         content=body,
     )
 

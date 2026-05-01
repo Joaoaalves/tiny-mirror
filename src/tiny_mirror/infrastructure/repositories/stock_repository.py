@@ -23,11 +23,9 @@ class PostgreSQLStockRepository(StockRepository):
     async def upsert(self, stock_data: dict[str, Any]) -> None:
         stmt = pg_insert(StockORM).values(**stock_data)
         update_payload = {
-            col: stmt.excluded[col]
-            for col in stock_data
-            if col not in {"product_tiny_id"}
+            col: stmt.excluded[col] for col in stock_data if col not in {"product_tiny_id"}
         }
-        update_payload["updated_at"] = func.now()
+        update_payload["updated_at"] = func.now()  # type: ignore[assignment]
         update_payload["synced_at"] = stock_data.get("synced_at", func.now())
 
         stmt = stmt.on_conflict_do_update(
@@ -37,16 +35,12 @@ class PostgreSQLStockRepository(StockRepository):
         await self._session.execute(stmt)
         await self._session.commit()
 
-    async def upsert_deposits(
-        self, product_tiny_id: int, deposits: list[dict[str, Any]]
-    ) -> None:
+    async def upsert_deposits(self, product_tiny_id: int, deposits: list[dict[str, Any]]) -> None:
         # DELETE + bulk INSERT inside a single transaction. The atomic
         # replace keeps stock_deposits consistent with the latest API
         # response — a deposit removed in Tiny disappears here too.
         await self._session.execute(
-            delete(StockDepositORM).where(
-                StockDepositORM.product_tiny_id == product_tiny_id
-            )
+            delete(StockDepositORM).where(StockDepositORM.product_tiny_id == product_tiny_id)
         )
 
         if not deposits:
@@ -75,9 +69,7 @@ class PostgreSQLStockRepository(StockRepository):
         )
         return [int(tid) for (tid,) in result.all()]
 
-    async def get_by_product_tiny_id(
-        self, product_tiny_id: int
-    ) -> dict[str, Any] | None:
+    async def get_by_product_tiny_id(self, product_tiny_id: int) -> dict[str, Any] | None:
         stock_result = await self._session.execute(
             select(StockORM).where(StockORM.product_tiny_id == product_tiny_id)
         )
@@ -91,9 +83,7 @@ class PostgreSQLStockRepository(StockRepository):
             .where(StockDepositORM.product_tiny_id == product_tiny_id)
             .order_by(StockDepositORM.id)
         )
-        stock_dict["deposits"] = [
-            _row_to_dict(d) for d in deposits_result.scalars().all()
-        ]
+        stock_dict["deposits"] = [_row_to_dict(d) for d in deposits_result.scalars().all()]
         return stock_dict
 
 

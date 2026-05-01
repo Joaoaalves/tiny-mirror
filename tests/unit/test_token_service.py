@@ -32,6 +32,7 @@ def session_factory() -> MagicMock:
     ``__aenter__`` resolves to a sentinel session. The TokenService never
     inspects the session — it just hands it to the repo factory.
     """
+
     @asynccontextmanager
     async def _ctx():
         yield "fake-session"

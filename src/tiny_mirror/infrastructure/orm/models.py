@@ -57,8 +57,7 @@ class OAuthTokenORM(Base):
         Text,
         nullable=False,
         comment=(
-            "Token used to obtain a new access_token without re-authentication. "
-            "Valid for 1 day."
+            "Token used to obtain a new access_token without re-authentication. " "Valid for 1 day."
         ),
     )
     expires_at: Mapped[datetime] = mapped_column(
@@ -127,8 +126,7 @@ class ProductORM(Base):
         nullable=False,
         unique=True,
         comment=(
-            "Stock Keeping Unit code. Unique identifier used in orders and stock "
-            "management."
+            "Stock Keeping Unit code. Unique identifier used in orders and stock " "management."
         ),
     )
     description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -193,18 +191,13 @@ class ProductORM(Base):
         server_default=text("'[]'::jsonb"),
     )
     variation_type: Mapped[str | None] = mapped_column(String(5), nullable=True)
-    created_at_tiny: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    updated_at_tiny: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    created_at_tiny: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at_tiny: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         comment=(
-            "Last time this record was fetched from the Tiny API. "
-            "Used to detect stale data."
+            "Last time this record was fetched from the Tiny API. " "Used to detect stale data."
         ),
     )
     created_at: Mapped[datetime] = mapped_column(
@@ -316,12 +309,8 @@ class OrderORM(Base):
     order_number: Mapped[int] = mapped_column(Integer, nullable=False, unique=True)
     invoice_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     invoice_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    total_products_value: Mapped[Decimal | None] = mapped_column(
-        Numeric(12, 2), nullable=True
-    )
-    total_order_value: Mapped[Decimal | None] = mapped_column(
-        Numeric(12, 2), nullable=True
-    )
+    total_products_value: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    total_order_value: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     price_list: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     customer: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
@@ -384,9 +373,7 @@ class OrderORM(Base):
         Numeric(12, 2), nullable=False, server_default=text("0")
     )
     expected_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    shipping_date: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    shipping_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     observations: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_observations: Mapped[str | None] = mapped_column(Text, nullable=True)
     order_origin: Mapped[int] = mapped_column(
@@ -529,9 +516,7 @@ class StockDepositORM(Base):
     )
     deposit_tiny_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     deposit_name: Mapped[str] = mapped_column(String(200), nullable=False)
-    ignore: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default=text("false")
-    )
+    ignore: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
     balance: Mapped[Decimal] = mapped_column(
         Numeric(10, 2), nullable=False, server_default=text("0")
     )
@@ -604,9 +589,7 @@ class SaleBucketORM(Base):
     total_revenue: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), nullable=False, server_default=text("0")
     )
-    order_count: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    order_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     is_kit_expansion: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
@@ -625,9 +608,7 @@ class SaleBucketORM(Base):
             "product generated this component quantity."
         ),
     )
-    computed_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    computed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 # ---------------------------------------------------------------------------
@@ -664,16 +645,8 @@ class SyncLogORM(Base):
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
-    completed_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    items_processed: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
-    items_failed: Mapped[int] = mapped_column(
-        Integer, nullable=False, server_default=text("0")
-    )
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    items_processed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    items_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    sync_metadata: Mapped[dict[str, Any] | None] = mapped_column(
-        "metadata", JSONB, nullable=True
-    )
+    sync_metadata: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)

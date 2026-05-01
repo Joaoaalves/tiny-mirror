@@ -23,9 +23,6 @@ from apscheduler.triggers.cron import CronTrigger
 
 from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
-from tiny_mirror.infrastructure.repositories.order_repository import (
-    PostgreSQLOrderRepository,
-)
 from tiny_mirror.infrastructure.repositories.product_repository import (
     PostgreSQLProductRepository,
 )
@@ -76,15 +73,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "token_rotation": CronTrigger.from_crontab(
                 settings.token_rotation_cron, timezone="UTC"
             ),
-            "products_sync": CronTrigger.from_crontab(
-                settings.sync_products_cron, timezone="UTC"
-            ),
-            "orders_sync": CronTrigger.from_crontab(
-                settings.sync_orders_cron, timezone="UTC"
-            ),
-            "stock_full_sync": CronTrigger.from_crontab(
-                settings.sync_stock_cron, timezone="UTC"
-            ),
+            "products_sync": CronTrigger.from_crontab(settings.sync_products_cron, timezone="UTC"),
+            "orders_sync": CronTrigger.from_crontab(settings.sync_orders_cron, timezone="UTC"),
+            "stock_full_sync": CronTrigger.from_crontab(settings.sync_stock_cron, timezone="UTC"),
             "sale_buckets_refresh": CronTrigger.from_crontab(
                 settings.sync_buckets_cron, timezone="UTC"
             ),
@@ -96,19 +87,19 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         )
         raise
 
-    async def _token_rotation():
+    async def _token_rotation() -> None:
         await token_rotation_job(token_service)
 
-    async def _products_sync():
+    async def _products_sync() -> None:
         await products_sync_job(publisher)
 
-    async def _orders_sync():
+    async def _orders_sync() -> None:
         await orders_sync_job(publisher)
 
-    async def _stock_full_sync():
+    async def _stock_full_sync() -> None:
         await stock_full_sync_job(publisher)
 
-    async def _sale_buckets_refresh():
+    async def _sale_buckets_refresh() -> None:
         await sale_buckets_refresh_job(publisher)
 
     scheduler.add_job(
@@ -171,8 +162,7 @@ async def check_and_trigger_initial_sync(app: FastAPI) -> None:
         return
 
     logger.info(
-        "Empty database detected, triggering initial historical sync. "
-        "This may take a while."
+        "Empty database detected, triggering initial historical sync. " "This may take a while."
     )
 
     today = datetime.now(UTC).date()
@@ -259,7 +249,7 @@ async def token_rotation_job(
                 new_expires_at=new_token.expires_at.isoformat(),
             )
             return
-        except Exception as exc:  # noqa: BLE001 — APScheduler swallows by design
+        except Exception as exc:
             last_error = exc
             if attempt < max_retries:
                 logger.warning(
@@ -270,8 +260,7 @@ async def token_rotation_job(
                 await asyncio.sleep(retry_delay_seconds)
             else:
                 logger.critical(
-                    "Token rotation failed after all retries. "
-                    "Manual intervention required.",
+                    "Token rotation failed after all retries. " "Manual intervention required.",
                     total_attempts=attempt,
                     error=str(exc),
                 )
@@ -341,7 +330,7 @@ async def sale_buckets_refresh_job(publisher: QueuePublisher) -> None:
             date_from=history_start.isoformat(),
             date_to=today.isoformat(),
         )
-    except Exception as exc:  # noqa: BLE001 — APScheduler swallows by design
+    except Exception as exc:
         logger.error(
             "Sale buckets refresh job failed to trigger",
             error=str(exc),
@@ -373,7 +362,7 @@ async def _trigger_sync(
             f"{sync_type.capitalize()} sync job triggered",
             sync_log_id=sync_log_id,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error(
             f"{sync_type.capitalize()} sync job failed to trigger",
             error=str(exc),
@@ -389,9 +378,7 @@ async def _trigger_sync(
                         items_failed=0,
                     )
             except Exception:  # pragma: no cover — secondary failure logged
-                logger.exception(
-                    "Failed to mark sync_log as failed", sync_log_id=sync_log_id
-                )
+                logger.exception("Failed to mark sync_log as failed", sync_log_id=sync_log_id)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
 
-import httpx
 import pytest
 import pytest_asyncio
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,7 +24,7 @@ from sqlalchemy import delete, select
 from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import QueueException
-from tiny_mirror.infrastructure.orm.models import OrderORM, ProductORM, SyncLogORM
+from tiny_mirror.infrastructure.orm.models import ProductORM, SyncLogORM
 from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.rabbitmq import get_channel
 from tiny_mirror.scheduler import jobs as jobs_module
@@ -187,6 +186,7 @@ async def test_failing_job_marks_sync_log_failed(
     """When publish_sync_message raises, the job catches the exception
     AND updates the sync_log row to status=failed with a useful error
     message — so the trigger failure stays observable in /sync/logs."""
+
     async def _broken(*args, **kwargs):
         raise QueueException("simulated failure")
 

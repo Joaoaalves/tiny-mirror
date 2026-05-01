@@ -303,12 +303,8 @@ async def webhook_workspace(
 
 async def _purge_sentinel() -> None:
     async with AsyncSessionLocal() as session:
-        await session.execute(
-            delete(OrderORM).where(OrderORM.tiny_id == SENTINEL_ORDER_ID)
-        )
-        await session.execute(
-            delete(ProductORM).where(ProductORM.tiny_id == SENTINEL_PRODUCT_ID)
-        )
+        await session.execute(delete(OrderORM).where(OrderORM.tiny_id == SENTINEL_ORDER_ID))
+        await session.execute(delete(ProductORM).where(ProductORM.tiny_id == SENTINEL_PRODUCT_ID))
         await session.commit()
 
 
@@ -362,9 +358,7 @@ async def test_order_webhook_consumer_handles_real_order_id(
     )
 
     async with AsyncSessionLocal() as session:
-        persisted = await PostgreSQLOrderRepository(session).get_by_tiny_id(
-            e2e_order_id
-        )
+        persisted = await PostgreSQLOrderRepository(session).get_by_tiny_id(e2e_order_id)
     assert persisted is not None
     assert int(persisted["tiny_id"]) == e2e_order_id
 
@@ -390,9 +384,7 @@ async def test_stock_webhook_consumer_persists_stock(
     async with AsyncSessionLocal() as session:
         existing = (
             await session.execute(
-                ProductORM.__table__.select().where(
-                    ProductORM.tiny_id == e2e_product_id
-                )
+                ProductORM.__table__.select().where(ProductORM.tiny_id == e2e_product_id)
             )
         ).first()
         if existing is None:
@@ -437,9 +429,7 @@ async def test_stock_webhook_consumer_persists_stock(
     )
 
     async with AsyncSessionLocal() as session:
-        row = await PostgreSQLStockRepository(session).get_by_product_tiny_id(
-            e2e_product_id
-        )
+        row = await PostgreSQLStockRepository(session).get_by_product_tiny_id(e2e_product_id)
     assert row is not None
     # We re-fetched from the API, so deposits should be populated even
     # though the webhook payload only carried the consolidated balance.
@@ -490,9 +480,7 @@ async def test_order_webhook_handle_is_idempotent(
     async with AsyncSessionLocal() as session:
         order_count = (
             await session.execute(
-                select(func.count(OrderORM.tiny_id)).where(
-                    OrderORM.tiny_id == e2e_order_id
-                )
+                select(func.count(OrderORM.tiny_id)).where(OrderORM.tiny_id == e2e_order_id)
             )
         ).scalar_one()
         item_count = (

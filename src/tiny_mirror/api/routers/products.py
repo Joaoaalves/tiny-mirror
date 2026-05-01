@@ -71,9 +71,7 @@ async def list_products(
         base_query = base_query.where(clause)
 
     list_query = (
-        base_query.order_by(ProductORM.sku.asc())
-        .limit(page_size)
-        .offset((page - 1) * page_size)
+        base_query.order_by(ProductORM.sku.asc()).limit(page_size).offset((page - 1) * page_size)
     )
     count_query = select(func.count(ProductORM.tiny_id))
     for clause in filters:
@@ -90,9 +88,7 @@ async def list_products(
     total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 0
 
     if total > 0 and page > total_pages:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Page out of range"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page out of range")
 
     # Pull stock data in one extra query so the LEFT JOIN above doesn't
     # explode the row count for products whose stock has multiple rows
@@ -104,9 +100,7 @@ async def list_products(
         stock_result = await session.execute(
             select(StockORM).where(StockORM.product_tiny_id.in_(page_ids))
         )
-        stock_by_id = {
-            int(s.product_tiny_id): s for s in stock_result.scalars().all()
-        }
+        stock_by_id = {int(s.product_tiny_id): s for s in stock_result.scalars().all()}
 
     items = [_to_list_item(p, stock_by_id.get(int(p.tiny_id))) for p in products]
 
@@ -130,9 +124,7 @@ async def get_product(
 ) -> ProductDetailResponse:
     product = await products.get_by_tiny_id(tiny_id)
     if product is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
     # All three repos share the same DB session via FastAPI's dependency
     # cache, so the queries must run sequentially.

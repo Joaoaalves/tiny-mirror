@@ -43,9 +43,7 @@ class PostgreSQLSaleBucketRepository(SaleBucketRepository):
             await self._session.execute(stmt)
         await self._session.commit()
 
-    async def delete_buckets_for_period(
-        self, date_from: date, date_to: date
-    ) -> int:
+    async def delete_buckets_for_period(self, date_from: date, date_to: date) -> int:
         result = await self._session.execute(
             delete(SaleBucketORM).where(
                 and_(
@@ -55,11 +53,9 @@ class PostgreSQLSaleBucketRepository(SaleBucketRepository):
             )
         )
         await self._session.commit()
-        return int(result.rowcount or 0)
+        return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
-    async def get_buckets_for_sku(
-        self, sku: str, days: int = 90
-    ) -> list[dict[str, Any]]:
+    async def get_buckets_for_sku(self, sku: str, days: int = 90) -> list[dict[str, Any]]:
         cutoff = (datetime.now(UTC).date()) - timedelta(days=days)
         result = await self._session.execute(
             select(SaleBucketORM)
@@ -69,9 +65,7 @@ class PostgreSQLSaleBucketRepository(SaleBucketRepository):
         )
         return [_row_to_dict(row) for row in result.scalars().all()]
 
-    async def get_buckets_for_period(
-        self, date_from: date, date_to: date
-    ) -> list[dict[str, Any]]:
+    async def get_buckets_for_period(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
         result = await self._session.execute(
             select(SaleBucketORM)
             .where(SaleBucketORM.bucket_date >= date_from)

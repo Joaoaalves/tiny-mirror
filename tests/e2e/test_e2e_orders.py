@@ -41,9 +41,9 @@ async def test_list_orders_returns_valid_structure(
 
     assert "itens" in response and isinstance(response["itens"], list)
     assert "paginacao" in response
-    assert response["paginacao"].get("total", 0) >= 1, (
-        "expected at least one order in the live Tiny account"
-    )
+    assert (
+        response["paginacao"].get("total", 0) >= 1
+    ), "expected at least one order in the live Tiny account"
 
     item = response["itens"][0]
     for required in ("id", "numeroPedido", "situacao"):
@@ -116,9 +116,7 @@ async def test_process_order_item_persists_order_and_items(
     live_rabbitmq: QueuePublisher,
     e2e_order_id: int,
 ) -> None:
-    service = OrderSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("orders")
 
@@ -143,9 +141,7 @@ async def test_process_order_item_is_idempotent(
     live_rabbitmq: QueuePublisher,
     e2e_order_id: int,
 ) -> None:
-    service = OrderSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("orders")
 
@@ -164,9 +160,7 @@ async def test_process_order_item_is_idempotent(
     async with AsyncSessionLocal() as session:
         order_count = (
             await session.execute(
-                select(func.count(OrderORM.tiny_id)).where(
-                    OrderORM.tiny_id == e2e_order_id
-                )
+                select(func.count(OrderORM.tiny_id)).where(OrderORM.tiny_id == e2e_order_id)
             )
         ).scalar_one()
         second_items = (
@@ -178,9 +172,9 @@ async def test_process_order_item_is_idempotent(
         ).scalar_one()
 
     assert int(order_count) == 1, "second sync must not duplicate the order row"
-    assert int(first_items) == int(second_items), (
-        "second sync must replace items, not duplicate them"
-    )
+    assert int(first_items) == int(
+        second_items
+    ), "second sync must replace items, not duplicate them"
 
 
 async def test_run_incremental_sync_publishes_orders_stock_and_buckets(
@@ -197,9 +191,7 @@ async def test_run_incremental_sync_publishes_orders_stock_and_buckets(
     """
     # Seed: persist the pinned order so the incremental fan-out has at least
     # one product to refresh stock for.
-    seeder = OrderSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    seeder = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         seed_log_id = await SyncLogRepository(session).create_sync_log("orders")
     await seeder.process_order_item(e2e_order_id, seed_log_id)
@@ -217,9 +209,7 @@ async def test_run_incremental_sync_publishes_orders_stock_and_buckets(
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("orders")
 
-    service = OrderSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     await service.run_incremental_sync(sync_log_id)
 
     # orders.item count must equal what list_orders reports for the same
@@ -274,9 +264,7 @@ async def test_run_historical_sync_emits_one_window_message_per_7_days(
         if leftover is None:
             break
 
-    service = OrderSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("orders")
 
@@ -305,9 +293,7 @@ async def test_run_incremental_sync_records_total_enqueued(
     live_tiny_client: TinyAPIClient,
     live_rabbitmq: QueuePublisher,
 ) -> None:
-    service = OrderSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("orders")
 
@@ -315,9 +301,7 @@ async def test_run_incremental_sync_records_total_enqueued(
 
     async with AsyncSessionLocal() as session:
         row = (
-            await session.execute(
-                select(SyncLogORM).where(SyncLogORM.id == sync_log_id)
-            )
+            await session.execute(select(SyncLogORM).where(SyncLogORM.id == sync_log_id))
         ).scalar_one()
     metadata = row.sync_metadata or {}
     assert "total_enqueued" in metadata

@@ -19,7 +19,6 @@ from decimal import Decimal
 import httpx
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI
 from sqlalchemy import delete
 
 from tiny_mirror.database import AsyncSessionLocal
@@ -80,9 +79,7 @@ async def seeded_product() -> AsyncIterator[None]:
         await session.commit()
     yield
     async with AsyncSessionLocal() as session:
-        await session.execute(
-            delete(ProductORM).where(ProductORM.tiny_id == SENTINEL_PRODUCT_ID)
-        )
+        await session.execute(delete(ProductORM).where(ProductORM.tiny_id == SENTINEL_PRODUCT_ID))
         await session.commit()
 
 
@@ -126,12 +123,8 @@ async def seeded_order() -> AsyncIterator[None]:
         await session.commit()
     yield
     async with AsyncSessionLocal() as session:
-        await session.execute(
-            delete(OrderORM).where(OrderORM.tiny_id == SENTINEL_ORDER_ID)
-        )
-        await session.execute(
-            delete(ProductORM).where(ProductORM.tiny_id == SENTINEL_PRODUCT_ID)
-        )
+        await session.execute(delete(OrderORM).where(OrderORM.tiny_id == SENTINEL_ORDER_ID))
+        await session.execute(delete(ProductORM).where(ProductORM.tiny_id == SENTINEL_PRODUCT_ID))
         await session.commit()
 
 
@@ -161,9 +154,7 @@ async def test_request_id_header_is_set_on_every_response(
 async def test_request_id_is_propagated_when_supplied_by_client(
     http_client: httpx.AsyncClient,
 ) -> None:
-    response = await http_client.get(
-        "/health", headers={"X-Request-Id": "test-fixed-id"}
-    )
+    response = await http_client.get("/health", headers={"X-Request-Id": "test-fixed-id"})
     assert response.headers.get("X-Request-Id") == "test-fixed-id"
 
 
@@ -173,9 +164,7 @@ async def test_request_id_is_propagated_when_supplied_by_client(
 async def test_products_list_returns_pagination_envelope(
     http_client: httpx.AsyncClient, seeded_product: None
 ) -> None:
-    response = await http_client.get(
-        "/products", params={"sku": "API-TEST", "page_size": 10}
-    )
+    response = await http_client.get("/products", params={"sku": "API-TEST", "page_size": 10})
     assert response.status_code == 200
     body = response.json()
     assert "items" in body and "pagination" in body
@@ -197,9 +186,7 @@ async def test_products_list_filters_by_situation(
     http_client: httpx.AsyncClient, seeded_product: None
 ) -> None:
     # situation=I — our seeded product is 'A', so it must NOT show up.
-    response = await http_client.get(
-        "/products", params={"situation": "I", "page_size": 100}
-    )
+    response = await http_client.get("/products", params={"situation": "I", "page_size": 100})
     assert response.status_code == 200
     skus = [item["sku"] for item in response.json()["items"]]
     assert "API-TEST-1" not in skus
@@ -246,9 +233,7 @@ async def test_orders_list_returns_pagination_envelope(
 async def test_orders_list_does_not_include_items(
     http_client: httpx.AsyncClient, seeded_order: None
 ) -> None:
-    response = await http_client.get(
-        "/orders", params={"ecommerce_name": "API-TEST"}
-    )
+    response = await http_client.get("/orders", params={"ecommerce_name": "API-TEST"})
     body = response.json()
     assert body["items"], "fixture should produce at least one order"
     # OrderListItem schema must not expose the items array.
@@ -312,9 +297,7 @@ async def test_sync_orders_validates_date_range(
     http_client: httpx.AsyncClient,
 ) -> None:
     # date_from without date_to -> 422
-    response = await http_client.post(
-        "/sync/orders", json={"date_from": "2025-01-01"}
-    )
+    response = await http_client.post("/sync/orders", json={"date_from": "2025-01-01"})
     assert response.status_code == 422
 
     # date_from > date_to -> 422
@@ -398,9 +381,7 @@ async def test_sync_logs_filters_by_status(
             assert item["status"] == "failed"
     finally:
         async with AsyncSessionLocal() as session:
-            await session.execute(
-                delete(SyncLogORM).where(SyncLogORM.error_message == "api-test")
-            )
+            await session.execute(delete(SyncLogORM).where(SyncLogORM.error_message == "api-test"))
             await session.execute(
                 delete(SyncLogORM).where(
                     (SyncLogORM.status == "running")

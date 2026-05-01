@@ -49,13 +49,10 @@ from tiny_mirror.rabbitmq import (
 from tiny_mirror.redis_client import close_redis, get_redis, initialize_redis
 from tiny_mirror.services.token_service import TokenService
 
-
 E2E_ENABLED = bool(os.environ.get("E2E_TINY_ACCESS_TOKEN"))
 
 
-def pytest_collection_modifyitems(
-    config: pytest.Config, items: list[pytest.Item]
-) -> None:
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip every collected test under tests/e2e/ when the gate is off.
 
     Pytest invokes this hook session-wide, not per directory, so we have

@@ -26,14 +26,12 @@ class PostgreSQLProductRepository(ProductRepository):
         """
         stmt = pg_insert(ProductORM).values(**product_data)
         update_payload = {
-            col: stmt.excluded[col]
-            for col in product_data
-            if col not in {"tiny_id", "created_at"}
+            col: stmt.excluded[col] for col in product_data if col not in {"tiny_id", "created_at"}
         }
-        update_payload["updated_at"] = func.now()
+        update_payload["updated_at"] = func.now()  # type: ignore[assignment]
         update_payload["synced_at"] = product_data.get("synced_at", func.now())
 
-        stmt = stmt.on_conflict_do_update(
+        stmt = stmt.on_conflict_do_update(  # type: ignore[assignment]
             index_elements=["tiny_id"],
             set_=update_payload,
         ).returning(literal_column("(xmax = 0)").label("inserted"))
@@ -51,9 +49,7 @@ class PostgreSQLProductRepository(ProductRepository):
         return _row_to_dict(row) if row is not None else None
 
     async def get_by_sku(self, sku: str) -> dict[str, Any] | None:
-        result = await self._session.execute(
-            select(ProductORM).where(ProductORM.sku == sku)
-        )
+        result = await self._session.execute(select(ProductORM).where(ProductORM.sku == sku))
         row = result.scalar_one_or_none()
         return _row_to_dict(row) if row is not None else None
 
@@ -91,9 +87,7 @@ class PostgreSQLProductRepository(ProductRepository):
         existing_skus: dict[str, int] = {}
         if skus:
             sku_lookup = await self._session.execute(
-                select(ProductORM.sku, ProductORM.tiny_id).where(
-                    ProductORM.sku.in_(skus)
-                )
+                select(ProductORM.sku, ProductORM.tiny_id).where(ProductORM.sku.in_(skus))
             )
             existing_skus = {sku: int(tid) for sku, tid in sku_lookup.all()}
 
@@ -114,9 +108,7 @@ class PostgreSQLProductRepository(ProductRepository):
         await self._session.execute(pg_insert(ProductKitComponentORM).values(rows))
         await self._session.commit()
 
-    async def get_kit_components(
-        self, kit_tiny_id: int
-    ) -> list[dict[str, Any]]:
+    async def get_kit_components(self, kit_tiny_id: int) -> list[dict[str, Any]]:
         result = await self._session.execute(
             select(ProductKitComponentORM)
             .where(ProductKitComponentORM.kit_product_tiny_id == kit_tiny_id)
@@ -139,9 +131,7 @@ class PostgreSQLProductRepository(ProductRepository):
         )
         bucket: dict[int, list[dict[str, Any]]] = {kid: [] for kid in kit_tiny_ids}
         for row in result.scalars().all():
-            bucket.setdefault(int(row.kit_product_tiny_id), []).append(
-                _row_to_dict(row)
-            )
+            bucket.setdefault(int(row.kit_product_tiny_id), []).append(_row_to_dict(row))
         return bucket
 
 

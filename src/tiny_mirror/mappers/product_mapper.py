@@ -41,12 +41,16 @@ class ProductMapper:
         else:
             dimensions = None
 
-        prices = {
-            "price": precos.get("preco"),
-            "promotional_price": precos.get("precoPromocional"),
-            "cost_price": precos.get("precoCusto"),
-            "average_cost_price": precos.get("precoCustoMedio"),
-        } if precos else {}
+        prices = (
+            {
+                "price": precos.get("preco"),
+                "promotional_price": precos.get("precoPromocional"),
+                "cost_price": precos.get("precoCusto"),
+                "average_cost_price": precos.get("precoCustoMedio"),
+            }
+            if precos
+            else {}
+        )
 
         return {
             "tiny_id": int(raw["id"]),

@@ -246,9 +246,7 @@ class StockWebhookData(_WebhookBase):
     @classmethod
     def _validate_tipo_estoque(cls, value: str) -> str:
         if value not in ("F", "D"):
-            raise ValueError(
-                f"tipoEstoque must be 'F' (Físico) or 'D' (Disponível); got {value!r}"
-            )
+            raise ValueError(f"tipoEstoque must be 'F' (Físico) or 'D' (Disponível); got {value!r}")
         return value
 
 

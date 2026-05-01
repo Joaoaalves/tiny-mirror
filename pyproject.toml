@@ -80,8 +80,29 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "A", "C4", "PT", "RUF"]
-ignore = ["E501"]
+ignore = [
+    "E501",  # long lines — handled by the formatter
+    # FastAPI uses Depends/Query/Body in argument defaults — that IS the
+    # framework's idiom; B008 fires on every endpoint signature otherwise.
+    "B008",
+    # query-string parameter `type` is intentionally named to match the
+    # public REST contract; A002 would force a Python-internal rename.
+    "A002",
+    # Project-wide convention is ...Exception (TinyMirrorException etc.);
+    # renaming to ...Error would break every import in the codebase.
+    "N818",
+]
 fixable = ["ALL"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files mirror Tiny camelCase field names in their function names
+# (e.g. test_..._dataAtualizacao_...). Allow that. Compound asserts and
+# broad pytest.raises are also fine for high-signal test bodies.
+"tests/**" = ["N802", "PT011", "PT018"]
+# SQLAlchemy ORM models use class-level attributes that ruff flags as
+# RUF012 (ClassVar). Those are SQLAlchemy declarative annotations, not
+# mutable shared state — exempt the ORM module.
+"src/tiny_mirror/infrastructure/orm/models.py" = ["RUF012"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["tiny_mirror"]

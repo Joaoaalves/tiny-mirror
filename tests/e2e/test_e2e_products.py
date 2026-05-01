@@ -41,9 +41,9 @@ async def test_list_products_returns_valid_structure(
 
     assert "itens" in response and isinstance(response["itens"], list)
     assert "paginacao" in response
-    assert response["paginacao"].get("total", 0) >= 1, (
-        "expected at least one active product in the live Tiny account"
-    )
+    assert (
+        response["paginacao"].get("total", 0) >= 1
+    ), "expected at least one active product in the live Tiny account"
 
     item = response["itens"][0]
     for required in ("id", "sku", "descricao", "tipo", "situacao"):
@@ -92,18 +92,14 @@ async def test_process_product_item_persists_row(
     live_rabbitmq: QueuePublisher,
     e2e_product_id: int,
 ) -> None:
-    service = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("products")
 
     await service.process_product_item(e2e_product_id, sync_log_id)
 
     async with AsyncSessionLocal() as session:
-        row = await PostgreSQLProductRepository(session).get_by_tiny_id(
-            e2e_product_id
-        )
+        row = await PostgreSQLProductRepository(session).get_by_tiny_id(e2e_product_id)
     assert row is not None
     assert int(row["tiny_id"]) == e2e_product_id
     assert row["sku"], "sku must be persisted"
@@ -115,9 +111,7 @@ async def test_process_product_item_is_idempotent(
     live_rabbitmq: QueuePublisher,
     e2e_product_id: int,
 ) -> None:
-    service = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("products")
 
@@ -127,9 +121,7 @@ async def test_process_product_item_is_idempotent(
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
-            select(func.count(ProductORM.tiny_id)).where(
-                ProductORM.tiny_id == e2e_product_id
-            )
+            select(func.count(ProductORM.tiny_id)).where(ProductORM.tiny_id == e2e_product_id)
         )
         assert int(result.scalar_one()) == 1
 
@@ -139,9 +131,7 @@ async def test_process_product_item_for_kit_writes_components(
     live_rabbitmq: QueuePublisher,
     e2e_kit_id: int,
 ) -> None:
-    service = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("products")
 
@@ -176,9 +166,7 @@ async def test_run_full_sync_publishes_one_message_per_active_product(
         if leftover is None:
             break
 
-    service = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    service = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("products")
 
@@ -195,15 +183,11 @@ async def test_run_full_sync_publishes_one_message_per_active_product(
             break
         drained += 1
 
-    assert drained == expected, (
-        f"expected {expected} product fan-out messages, drained {drained}"
-    )
+    assert drained == expected, f"expected {expected} product fan-out messages, drained {drained}"
 
     async with AsyncSessionLocal() as session:
         row = (
-            await session.execute(
-                select(SyncLogORM).where(SyncLogORM.id == sync_log_id)
-            )
+            await session.execute(select(SyncLogORM).where(SyncLogORM.id == sync_log_id))
         ).scalar_one()
     metadata = row.sync_metadata or {}
     assert metadata.get("total_enqueued") == expected

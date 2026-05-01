@@ -9,7 +9,7 @@ serialization and routing-key mapping stay consistent.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import aio_pika
 import structlog
@@ -25,7 +25,7 @@ class QueuePublisher:
     # Logical name -> (exchange, routing key). The 'webhooks.*' entries route
     # through the same tiny.sync exchange (topic) — keeping a single exchange
     # simplifies bindings and lets us reuse the dead-letter wiring.
-    ROUTING_MAP: dict[str, tuple[str, str]] = {
+    ROUTING_MAP: ClassVar[dict[str, tuple[str, str]]] = {
         "products.full": (EXCHANGE_MAIN, "sync.products.full"),
         "products.item": (EXCHANGE_MAIN, "sync.products.item"),
         "orders.full": (EXCHANGE_MAIN, "sync.orders.full"),

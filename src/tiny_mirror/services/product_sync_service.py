@@ -52,9 +52,7 @@ class ProductSyncService:
         total: int | None = None
 
         while True:
-            response = await self._tiny.list_products(
-                situation="A", limit=PAGE_SIZE, offset=offset
-            )
+            response = await self._tiny.list_products(situation="A", limit=PAGE_SIZE, offset=offset)
             items = response.get("itens", []) or []
             pagination = response.get("paginacao", {}) or {}
             total = int(pagination.get("total", 0))
@@ -100,9 +98,7 @@ class ProductSyncService:
             total_published=total_published,
         )
 
-    async def process_product_item(
-        self, product_tiny_id: int, sync_log_id: int
-    ) -> None:
+    async def process_product_item(self, product_tiny_id: int, sync_log_id: int) -> None:
         logger.debug("Processing product item", product_tiny_id=product_tiny_id)
 
         try:
@@ -126,9 +122,7 @@ class ProductSyncService:
                 if product_data["type"] == "K":
                     components = ProductMapper.extract_kit_components(raw)
                     if components:
-                        await products.upsert_kit_components(
-                            product_tiny_id, components
-                        )
+                        await products.upsert_kit_components(product_tiny_id, components)
                     logger.debug(
                         "Kit processed",
                         product_tiny_id=product_tiny_id,
@@ -163,9 +157,7 @@ class ProductSyncService:
             action=action,
         )
 
-    async def _record_total_enqueued(
-        self, sync_log_id: int, total_enqueued: int
-    ) -> None:
+    async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
         async with AsyncSessionLocal() as session:
             current = await session.execute(
                 select(SyncLogORM.sync_metadata).where(SyncLogORM.id == sync_log_id)

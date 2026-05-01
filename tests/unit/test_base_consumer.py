@@ -36,7 +36,9 @@ class _Recording(BaseConsumer):
         await self.handler(message_body)
 
 
-def _make_message(body: bytes, *, ack: AsyncMock | None = None, nack: AsyncMock | None = None) -> MagicMock:
+def _make_message(
+    body: bytes, *, ack: AsyncMock | None = None, nack: AsyncMock | None = None
+) -> MagicMock:
     msg = MagicMock()
     msg.body = body
     msg.ack = AsyncMock() if ack is None else ack
@@ -103,9 +105,7 @@ async def test_process_handle_valueerror_nacks_to_dlq() -> None:
 
 async def test_process_tiny_api_exception_nacks_to_dlq() -> None:
     consumer = _Recording()
-    consumer.handler = AsyncMock(
-        side_effect=TinyAPIException("boom", status_code=500)
-    )
+    consumer.handler = AsyncMock(side_effect=TinyAPIException("boom", status_code=500))
     msg = _make_message(b'{"a": 1}')
 
     await consumer.process(msg)

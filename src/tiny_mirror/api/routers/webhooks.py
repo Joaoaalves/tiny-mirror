@@ -96,8 +96,7 @@ async def receive_order_webhook(
         # The order will be picked up by the regular hourly sync — never
         # propagate the error to Tiny.
         logger.error(
-            "Failed to publish order webhook to queue, "
-            "will be handled by regular sync",
+            "Failed to publish order webhook to queue, " "will be handled by regular sync",
             order_tiny_id=payload.dados.id_venda_tiny,
             error=str(exc),
         )
@@ -169,8 +168,7 @@ async def receive_stock_webhook(
         await publisher.publish_sync_message("webhooks.stock", message)
     except QueueException as exc:
         logger.error(
-            "Failed to publish stock webhook to queue, "
-            "will be handled by regular sync",
+            "Failed to publish stock webhook to queue, " "will be handled by regular sync",
             product_tiny_id=payload.dados.id_produto,
             error=str(exc),
         )
@@ -190,9 +188,7 @@ async def _read_json(request: Request) -> dict[str, Any] | None:
 
 
 def _ack() -> JSONResponse:
-    return JSONResponse(
-        status_code=status.HTTP_200_OK, content={"status": "received"}
-    )
+    return JSONResponse(status_code=status.HTTP_200_OK, content={"status": "received"})
 
 
 def _cnpj_matches(received: str) -> bool:

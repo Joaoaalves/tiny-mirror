@@ -101,12 +101,8 @@ async def test_process_stock_item_persists_stock_and_deposits(
     e2e_product_id: int,
 ) -> None:
     # Stock has a FK to products; ensure the product exists first.
-    product_svc = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
-    stock_svc = StockSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    product_svc = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
+    stock_svc = StockSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("stock")
     await product_svc.process_product_item(e2e_product_id, sync_log_id)
@@ -114,9 +110,7 @@ async def test_process_stock_item_persists_stock_and_deposits(
     await stock_svc.process_stock_item(e2e_product_id, sync_log_id)
 
     async with AsyncSessionLocal() as session:
-        row = await PostgreSQLStockRepository(session).get_by_product_tiny_id(
-            e2e_product_id
-        )
+        row = await PostgreSQLStockRepository(session).get_by_product_tiny_id(e2e_product_id)
     assert row is not None
     assert int(row["product_tiny_id"]) == e2e_product_id
     assert isinstance(row["deposits"], list)
@@ -132,12 +126,8 @@ async def test_process_stock_item_is_idempotent(
     live_rabbitmq: QueuePublisher,
     e2e_product_id: int,
 ) -> None:
-    product_svc = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
-    stock_svc = StockSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    product_svc = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
+    stock_svc = StockSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("stock")
     await product_svc.process_product_item(e2e_product_id, sync_log_id)
@@ -171,9 +161,9 @@ async def test_process_stock_item_is_idempotent(
         ).scalar_one()
 
     assert int(stock_count) == 1, "second sync must not duplicate the stock row"
-    assert int(first_deposit_count) == int(second_deposit_count), (
-        "deposit count must be stable across re-syncs (atomic replace, not append)"
-    )
+    assert int(first_deposit_count) == int(
+        second_deposit_count
+    ), "deposit count must be stable across re-syncs (atomic replace, not append)"
 
 
 async def test_process_stock_item_skips_when_product_not_synced(
@@ -183,9 +173,7 @@ async def test_process_stock_item_skips_when_product_not_synced(
     """If the product isn't in our products table, the FK on stock would
     raise. Service must degrade to a warning + skip instead.
     """
-    stock_svc = StockSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    stock_svc = StockSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("stock")
 
@@ -195,9 +183,7 @@ async def test_process_stock_item_skips_when_product_not_synced(
     candidate = 999999999  # very unlikely to be in the live store
 
     async with AsyncSessionLocal() as session:
-        product_row = await PostgreSQLProductRepository(session).get_by_tiny_id(
-            candidate
-        )
+        product_row = await PostgreSQLProductRepository(session).get_by_tiny_id(candidate)
     assert product_row is None, "test prerequisite: product should not be in DB"
 
     # Must not raise.
@@ -213,9 +199,7 @@ async def test_run_full_sync_publishes_one_message_per_active_product(
     products.situation='A'. Seed at least one such row first.
     """
     # Seed: ensure at least one active product row.
-    product_svc = ProductSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    product_svc = ProductSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         seed_log = await SyncLogRepository(session).create_sync_log("products")
     await product_svc.process_product_item(e2e_product_id, seed_log)
@@ -227,14 +211,10 @@ async def test_run_full_sync_publishes_one_message_per_active_product(
         if leftover is None:
             break
 
-    stock_svc = StockSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    stock_svc = StockSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("stock")
-        active_count = len(
-            await PostgreSQLProductRepository(session).list_active()
-        )
+        active_count = len(await PostgreSQLProductRepository(session).list_active())
 
     await stock_svc.run_full_sync(sync_log_id)
 
@@ -258,9 +238,7 @@ async def test_run_incremental_sync_for_products_empty_list_is_noop(
         if leftover is None:
             break
 
-    stock_svc = StockSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    stock_svc = StockSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("stock")
 
@@ -283,9 +261,7 @@ async def test_run_incremental_sync_for_products_publishes_one_per_id(
         if leftover is None:
             break
 
-    stock_svc = StockSyncService(
-        tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-    )
+    stock_svc = StockSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         sync_log_id = await SyncLogRepository(session).create_sync_log("stock")
 

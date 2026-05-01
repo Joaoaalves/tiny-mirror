@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, date, datetime
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -68,9 +68,7 @@ async def sync_products(
     sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
     publisher: QueuePublisher = Depends(get_queue_publisher),
 ) -> SyncTriggerResponse:
-    sync_log_id = await sync_logs.create_sync_log(
-        "products", metadata={"triggered_by": "manual"}
-    )
+    sync_log_id = await sync_logs.create_sync_log("products", metadata={"triggered_by": "manual"})
     await publisher.publish_sync_message(
         "products.full",
         {
@@ -79,9 +77,7 @@ async def sync_products(
             "published_at": datetime.now(UTC).isoformat(),
         },
     )
-    return SyncTriggerResponse(
-        message="Product sync triggered", sync_log_id=sync_log_id
-    )
+    return SyncTriggerResponse(message="Product sync triggered", sync_log_id=sync_log_id)
 
 
 @router.post(
@@ -94,7 +90,7 @@ async def sync_orders(
     sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
     publisher: QueuePublisher = Depends(get_queue_publisher),
 ) -> SyncTriggerResponse:
-    metadata: dict = {"triggered_by": "manual"}
+    metadata: dict[str, Any] = {"triggered_by": "manual"}
     if body.date_from is not None and body.date_to is not None:
         metadata["date_from"] = body.date_from.isoformat()
         metadata["date_to"] = body.date_to.isoformat()
@@ -103,7 +99,7 @@ async def sync_orders(
 
     sync_log_id = await sync_logs.create_sync_log("orders", metadata=metadata)
 
-    payload: dict
+    payload: dict[str, Any]
     if body.date_from is not None and body.date_to is not None:
         payload = {
             "is_historical": True,
@@ -124,9 +120,7 @@ async def sync_orders(
         }
     await publisher.publish_sync_message("orders.full", payload)
 
-    return SyncTriggerResponse(
-        message="Order sync triggered", sync_log_id=sync_log_id
-    )
+    return SyncTriggerResponse(message="Order sync triggered", sync_log_id=sync_log_id)
 
 
 @router.post(
@@ -138,9 +132,7 @@ async def sync_stock(
     sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
     publisher: QueuePublisher = Depends(get_queue_publisher),
 ) -> SyncTriggerResponse:
-    sync_log_id = await sync_logs.create_sync_log(
-        "stock", metadata={"triggered_by": "manual"}
-    )
+    sync_log_id = await sync_logs.create_sync_log("stock", metadata={"triggered_by": "manual"})
     await publisher.publish_sync_message(
         "stock.full",
         {
@@ -148,9 +140,7 @@ async def sync_stock(
             "published_at": datetime.now(UTC).isoformat(),
         },
     )
-    return SyncTriggerResponse(
-        message="Stock sync triggered", sync_log_id=sync_log_id
-    )
+    return SyncTriggerResponse(message="Stock sync triggered", sync_log_id=sync_log_id)
 
 
 # ---------------------------------------------------------------------------
@@ -159,8 +149,7 @@ async def sync_stock(
 @router.get("/logs", response_model=SyncLogListResponse)
 async def list_sync_logs(
     sync_type: Annotated[
-        Literal["products", "orders", "stock", "sale_buckets", "token_rotation"]
-        | None,
+        Literal["products", "orders", "stock", "sale_buckets", "token_rotation"] | None,
         Query(),
     ] = None,
     log_status: Annotated[
@@ -199,9 +188,7 @@ async def list_sync_logs(
     total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 0
 
     if total > 0 and page > total_pages:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Page out of range"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Page out of range")
 
     items = [
         SyncLogResponse(

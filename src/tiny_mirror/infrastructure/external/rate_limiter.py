@@ -60,9 +60,7 @@ class RateLimiter:
     async def update_from_headers(self, headers: dict[str, str]) -> None:
         # Header names from the Tiny API are case-insensitive in HTTP, but
         # httpx already lowercases keys when iterated as a dict. Be defensive.
-        remaining = headers.get("X-RateLimit-Remaining") or headers.get(
-            "x-ratelimit-remaining"
-        )
+        remaining = headers.get("X-RateLimit-Remaining") or headers.get("x-ratelimit-remaining")
         reset_in = headers.get("X-RateLimit-Reset") or headers.get("x-ratelimit-reset")
         if remaining is None or reset_in is None:
             return
@@ -70,9 +68,5 @@ class RateLimiter:
             reset_at = time.time() + int(reset_in)
         except (TypeError, ValueError):
             return
-        await self._redis.set(
-            self.REDIS_KEY_REMAINING, str(remaining), ex=self.REDIS_TTL_SECONDS
-        )
-        await self._redis.set(
-            self.REDIS_KEY_RESET_AT, f"{reset_at:.3f}", ex=self.REDIS_TTL_SECONDS
-        )
+        await self._redis.set(self.REDIS_KEY_REMAINING, str(remaining), ex=self.REDIS_TTL_SECONDS)
+        await self._redis.set(self.REDIS_KEY_RESET_AT, f"{reset_at:.3f}", ex=self.REDIS_TTL_SECONDS)

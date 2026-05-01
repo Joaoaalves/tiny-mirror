@@ -51,9 +51,7 @@ async def test_product_item_consumer_delegates_to_process_product_item() -> None
 
     await consumer.handle({"product_tiny_id": 100, "sync_log_id": 1})
 
-    service.process_product_item.assert_awaited_once_with(
-        product_tiny_id=100, sync_log_id=1
-    )
+    service.process_product_item.assert_awaited_once_with(product_tiny_id=100, sync_log_id=1)
 
 
 # ---------------------------------------------------------------------------
@@ -65,9 +63,7 @@ async def test_order_full_sync_consumer_routes_incremental() -> None:
         channel=MagicMock(), queue_publisher=MagicMock(), order_sync_service=service
     )
 
-    await consumer.handle(
-        {"is_historical": False, "sync_log_id": 5, "lookback_hours": 2}
-    )
+    await consumer.handle({"is_historical": False, "sync_log_id": 5, "lookback_hours": 2})
 
     service.run_incremental_sync.assert_awaited_once_with(5)
     service.run_date_range_sync.assert_not_awaited()
@@ -88,9 +84,7 @@ async def test_order_full_sync_consumer_routes_historical() -> None:
         }
     )
 
-    service.run_date_range_sync.assert_awaited_once_with(
-        date(2025, 1, 1), date(2025, 1, 7), 9
-    )
+    service.run_date_range_sync.assert_awaited_once_with(date(2025, 1, 1), date(2025, 1, 7), 9)
     service.run_incremental_sync.assert_not_awaited()
 
 
@@ -102,9 +96,7 @@ async def test_order_item_consumer_delegates() -> None:
 
     await consumer.handle({"order_tiny_id": 999, "sync_log_id": 2})
 
-    service.process_order_item.assert_awaited_once_with(
-        order_tiny_id=999, sync_log_id=2
-    )
+    service.process_order_item.assert_awaited_once_with(order_tiny_id=999, sync_log_id=2)
 
 
 # ---------------------------------------------------------------------------
@@ -129,9 +121,7 @@ async def test_stock_item_consumer_delegates() -> None:
 
     await consumer.handle({"product_tiny_id": 50, "sync_log_id": 4})
 
-    service.process_stock_item.assert_awaited_once_with(
-        product_tiny_id=50, sync_log_id=4
-    )
+    service.process_stock_item.assert_awaited_once_with(product_tiny_id=50, sync_log_id=4)
 
 
 # ---------------------------------------------------------------------------

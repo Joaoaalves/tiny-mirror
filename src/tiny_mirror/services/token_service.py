@@ -49,9 +49,7 @@ class TokenService:
     REDIS_TTL_MIN_SECONDS = 60
     REFRESH_LOCK_TTL_SECONDS = 30
     TOKEN_EXPIRY_WARNING_MINUTES = 30
-    TINY_TOKEN_URL = (
-        "https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token"
-    )
+    TINY_TOKEN_URL = "https://accounts.tiny.com.br/realms/tiny/protocol/openid-connect/token"
 
     def __init__(
         self,

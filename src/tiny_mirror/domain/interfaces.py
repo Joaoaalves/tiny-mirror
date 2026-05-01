@@ -59,9 +59,7 @@ class ProductRepository(abc.ABC):
         """Replace the components of a kit atomically (DELETE + INSERT)."""
 
     @abc.abstractmethod
-    async def get_kit_components(
-        self, kit_tiny_id: int
-    ) -> list[dict[str, Any]]:
+    async def get_kit_components(self, kit_tiny_id: int) -> list[dict[str, Any]]:
         """Return the components of a kit, in insertion order."""
 
     @abc.abstractmethod
@@ -83,9 +81,7 @@ class OrderRepository(abc.ABC):
         """Insert or update an order row. Returns ``"created"`` or ``"updated"``."""
 
     @abc.abstractmethod
-    async def upsert_items(
-        self, order_tiny_id: int, items: list[dict[str, Any]]
-    ) -> None:
+    async def upsert_items(self, order_tiny_id: int, items: list[dict[str, Any]]) -> None:
         """Replace every line item of an order atomically (DELETE + bulk INSERT)."""
 
     @abc.abstractmethod
@@ -107,9 +103,7 @@ class OrderRepository(abc.ABC):
         """Return the number of orders currently stored."""
 
     @abc.abstractmethod
-    async def get_orders_in_period(
-        self, date_from: Any, date_to: Any
-    ) -> list[dict[str, Any]]:
+    async def get_orders_in_period(self, date_from: Any, date_to: Any) -> list[dict[str, Any]]:
         """Return orders (with items) whose ``order_date`` falls in the range."""
 
 
@@ -132,15 +126,11 @@ class SaleBucketRepository(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def get_buckets_for_sku(
-        self, sku: str, days: int = 90
-    ) -> list[dict[str, Any]]:
+    async def get_buckets_for_sku(self, sku: str, days: int = 90) -> list[dict[str, Any]]:
         """Return buckets for a given SKU over the last ``days`` days."""
 
     @abc.abstractmethod
-    async def get_buckets_for_period(
-        self, date_from: Any, date_to: Any
-    ) -> list[dict[str, Any]]:
+    async def get_buckets_for_period(self, date_from: Any, date_to: Any) -> list[dict[str, Any]]:
         """Return every bucket whose ``bucket_date`` is in the range."""
 
 
@@ -152,9 +142,7 @@ class StockRepository(abc.ABC):
         """Insert or update the stock row for ``product_tiny_id``."""
 
     @abc.abstractmethod
-    async def upsert_deposits(
-        self, product_tiny_id: int, deposits: list[dict[str, Any]]
-    ) -> None:
+    async def upsert_deposits(self, product_tiny_id: int, deposits: list[dict[str, Any]]) -> None:
         """Atomically replace every deposit row for the given product."""
 
     @abc.abstractmethod
@@ -162,7 +150,5 @@ class StockRepository(abc.ABC):
         """Return the tiny ids of every active product (situation='A')."""
 
     @abc.abstractmethod
-    async def get_by_product_tiny_id(
-        self, product_tiny_id: int
-    ) -> dict[str, Any] | None:
+    async def get_by_product_tiny_id(self, product_tiny_id: int) -> dict[str, Any] | None:
         """Return the stock row with its ``deposits`` array."""

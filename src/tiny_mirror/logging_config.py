@@ -34,7 +34,7 @@ def configure_logging(log_level: str) -> None:
     ]
 
     formatter = structlog.stdlib.ProcessorFormatter(
-        foreign_pre_chain=pre_chain,
+        foreign_pre_chain=pre_chain,  # type: ignore[arg-type]
         processors=[
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,
             structlog.processors.StackInfoRenderer(),

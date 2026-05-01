@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC
+from datetime import UTC, datetime
 
 import structlog
 from sqlalchemy import select
@@ -59,15 +59,13 @@ class PostgreSQLTokenRepository(TokenRepository):
         await self._session.commit()
 
 
-def _ensure_utc(value: object) -> object:
+def _ensure_utc(value: datetime) -> datetime:
     """Datetimes round-tripped through asyncpg are tz-aware, but be defensive.
 
     SQLAlchemy + asyncpg already returns timezone-aware datetimes for
     ``TIMESTAMPTZ`` columns; this helper only kicks in if a future driver
     change strips the tzinfo.
     """
-    from datetime import datetime  # local import to avoid module-level dep
-
-    if isinstance(value, datetime) and value.tzinfo is None:
+    if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value

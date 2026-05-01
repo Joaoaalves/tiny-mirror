@@ -13,9 +13,10 @@ Every test cleans up after itself.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, date, datetime
 from decimal import Decimal
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -59,9 +60,7 @@ async def _drop_sentinel_rows() -> None:
             delete(SaleBucketORM).where(SaleBucketORM.bucket_date == SENTINEL_DATE)
         )
         # Delete orders — CASCADE cleans order_items.
-        await session.execute(
-            delete(OrderORM).where(OrderORM.order_date == SENTINEL_DATE)
-        )
+        await session.execute(delete(OrderORM).where(OrderORM.order_date == SENTINEL_DATE))
         # Delete kit components and products by tiny_id range.
         await session.execute(
             delete(ProductKitComponentORM).where(
@@ -89,9 +88,7 @@ async def _drop_sentinel_rows() -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-async def _insert_product(
-    session, *, tiny_id: int, sku: str, type_: str = "P"
-) -> None:
+async def _insert_product(session, *, tiny_id: int, sku: str, type_: str = "P") -> None:
     session.add(
         ProductORM(
             tiny_id=tiny_id,
@@ -174,9 +171,7 @@ async def _get_buckets_for_sentinel() -> list[SaleBucketORM]:
 # ---------------------------------------------------------------------------
 async def test_direct_bucket_for_simple_product(clean_sentinel: None) -> None:
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1"
-        )
+        await _insert_product(session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1")
         await _insert_order_with_items(
             session,
             order_tiny_id=ORDER_BASE_ID,
@@ -212,12 +207,8 @@ async def test_kit_with_single_component_emits_one_expansion(
     clean_sentinel: None,
 ) -> None:
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=KIT_PRODUCT_TINY_ID, sku="10U-MAST", type_="K"
-        )
-        await _insert_product(
-            session, tiny_id=COMPONENT_A_TINY_ID, sku="MAST-FIT"
-        )
+        await _insert_product(session, tiny_id=KIT_PRODUCT_TINY_ID, sku="10U-MAST", type_="K")
+        await _insert_product(session, tiny_id=COMPONENT_A_TINY_ID, sku="MAST-FIT")
         # Flush so the FK on product_kit_components.component_product_tiny_id
         # finds the row inserted above.
         await session.flush()
@@ -269,15 +260,9 @@ async def test_kit_with_two_components_emits_two_expansions(
     clean_sentinel: None,
 ) -> None:
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=KIT_PRODUCT_TINY_ID, sku="COMBO-ABC", type_="K"
-        )
-        await _insert_product(
-            session, tiny_id=COMPONENT_A_TINY_ID, sku="PROD-A"
-        )
-        await _insert_product(
-            session, tiny_id=COMPONENT_B_TINY_ID, sku="PROD-B"
-        )
+        await _insert_product(session, tiny_id=KIT_PRODUCT_TINY_ID, sku="COMBO-ABC", type_="K")
+        await _insert_product(session, tiny_id=COMPONENT_A_TINY_ID, sku="PROD-A")
+        await _insert_product(session, tiny_id=COMPONENT_B_TINY_ID, sku="PROD-B")
         await session.flush()
         await _insert_kit_component(
             session,
@@ -314,9 +299,7 @@ async def test_kit_with_two_components_emits_two_expansions(
 
     buckets = await _get_buckets_for_sentinel()
     direct = [b for b in buckets if not b.is_kit_expansion]
-    expansion = sorted(
-        [b for b in buckets if b.is_kit_expansion], key=lambda b: b.sku
-    )
+    expansion = sorted([b for b in buckets if b.is_kit_expansion], key=lambda b: b.sku)
 
     assert len(direct) == 1
     assert direct[0].quantity_sold == Decimal("3.00")
@@ -335,9 +318,7 @@ async def test_two_orders_same_day_aggregate_into_one_bucket(
     clean_sentinel: None,
 ) -> None:
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1"
-        )
+        await _insert_product(session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1")
         # Two orders, same product / channel / day.
         for offset, qty in enumerate([2, 5]):
             await _insert_order_with_items(
@@ -371,9 +352,7 @@ async def test_order_without_ecommerce_name_uses_direct(
     clean_sentinel: None,
 ) -> None:
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1"
-        )
+        await _insert_product(session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1")
         await _insert_order_with_items(
             session,
             order_tiny_id=ORDER_BASE_ID,
@@ -403,9 +382,7 @@ async def test_kit_without_components_in_db_emits_only_direct_bucket(
 ) -> None:
     async with AsyncSessionLocal() as session:
         # The kit row exists but has zero rows in product_kit_components.
-        await _insert_product(
-            session, tiny_id=ORPHAN_KIT_TINY_ID, sku="ORPHAN-KIT", type_="K"
-        )
+        await _insert_product(session, tiny_id=ORPHAN_KIT_TINY_ID, sku="ORPHAN-KIT", type_="K")
         await _insert_order_with_items(
             session,
             order_tiny_id=ORDER_BASE_ID,
@@ -433,9 +410,7 @@ async def test_kit_without_components_in_db_emits_only_direct_bucket(
 
 async def test_refresh_is_idempotent(clean_sentinel: None) -> None:
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1"
-        )
+        await _insert_product(session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1")
         await _insert_order_with_items(
             session,
             order_tiny_id=ORDER_BASE_ID,
@@ -482,9 +457,7 @@ async def test_get_buckets_for_sku_returns_in_descending_date(
 ) -> None:
     other_date = date(2099, 1, 17)
     async with AsyncSessionLocal() as session:
-        await _insert_product(
-            session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1"
-        )
+        await _insert_product(session, tiny_id=DIRECT_PRODUCT_TINY_ID, sku="DIRECT-1")
         # First sentinel date.
         await _insert_order_with_items(
             session,
@@ -551,7 +524,5 @@ async def test_get_buckets_for_sku_returns_in_descending_date(
             await session.execute(
                 delete(SaleBucketORM).where(SaleBucketORM.bucket_date == other_date)
             )
-            await session.execute(
-                delete(OrderORM).where(OrderORM.order_date == other_date)
-            )
+            await session.execute(delete(OrderORM).where(OrderORM.order_date == other_date))
             await session.commit()

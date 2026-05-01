@@ -63,9 +63,9 @@ class OrderSyncService:
 
         # Fan out an incremental stock refresh for every product touched.
         async with AsyncSessionLocal() as session:
-            product_ids = await PostgreSQLOrderRepository(
-                session
-            ).get_recent_product_tiny_ids(hours=INCREMENTAL_LOOKBACK_HOURS)
+            product_ids = await PostgreSQLOrderRepository(session).get_recent_product_tiny_ids(
+                hours=INCREMENTAL_LOOKBACK_HOURS
+            )
 
         for product_id in product_ids:
             await self._publisher.publish_sync_message(
@@ -136,9 +136,7 @@ class OrderSyncService:
     # ------------------------------------------------------------------
     # Per-window — called by OrderFullSyncConsumer when is_historical=True
     # ------------------------------------------------------------------
-    async def run_date_range_sync(
-        self, date_from: date, date_to: date, sync_log_id: int
-    ) -> None:
+    async def run_date_range_sync(self, date_from: date, date_to: date, sync_log_id: int) -> None:
         logger.info(
             "Starting date range order sync",
             date_from=date_from.isoformat(),
@@ -163,9 +161,7 @@ class OrderSyncService:
     # ------------------------------------------------------------------
     # Per-order — called by OrderItemConsumer for each fan-out message
     # ------------------------------------------------------------------
-    async def process_order_item(
-        self, order_tiny_id: int, sync_log_id: int | None
-    ) -> None:
+    async def process_order_item(self, order_tiny_id: int, sync_log_id: int | None) -> None:
         """Sync a single order. ``sync_log_id`` is None for webhook-driven
         calls — counter updates are skipped in that case.
         """
@@ -282,9 +278,7 @@ class OrderSyncService:
 
         return total_published
 
-    async def _record_total_enqueued(
-        self, sync_log_id: int, total_enqueued: int
-    ) -> None:
+    async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
         from sqlalchemy import select, update
 
         from tiny_mirror.infrastructure.orm.models import SyncLogORM

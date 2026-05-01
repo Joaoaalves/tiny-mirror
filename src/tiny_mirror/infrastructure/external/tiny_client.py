@@ -105,9 +105,7 @@ class TinyAPIClient:
     # ------------------------------------------------------------------
     # Internal: request pipeline
     # ------------------------------------------------------------------
-    async def _request(
-        self, method: str, path: str, **kwargs: Any
-    ) -> dict[str, Any]:
+    async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         """Run the full pipeline (rate limit → token → send → retry/backoff)."""
         url = f"{self.BASE_URL}{path}"
         attempt = 0

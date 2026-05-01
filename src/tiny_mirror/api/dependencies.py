@@ -71,7 +71,7 @@ def get_queue_publisher(request: Request) -> QueuePublisher:
     publisher = getattr(request.app.state, "queue_publisher", None)
     if publisher is None:
         publisher = QueuePublisher(get_channel())
-    return publisher  # type: ignore[no-any-return]
+    return publisher
 
 
 # ---------------------------------------------------------------------------
@@ -149,27 +149,21 @@ def get_product_sync_service(
     tiny_client: TinyAPIClient = Depends(get_tiny_client),
     queue_publisher: QueuePublisher = Depends(get_queue_publisher),
 ) -> ProductSyncService:
-    return ProductSyncService(
-        tiny_client=tiny_client, queue_publisher=queue_publisher
-    )
+    return ProductSyncService(tiny_client=tiny_client, queue_publisher=queue_publisher)
 
 
 def get_order_sync_service(
     tiny_client: TinyAPIClient = Depends(get_tiny_client),
     queue_publisher: QueuePublisher = Depends(get_queue_publisher),
 ) -> OrderSyncService:
-    return OrderSyncService(
-        tiny_client=tiny_client, queue_publisher=queue_publisher
-    )
+    return OrderSyncService(tiny_client=tiny_client, queue_publisher=queue_publisher)
 
 
 def get_stock_sync_service(
     tiny_client: TinyAPIClient = Depends(get_tiny_client),
     queue_publisher: QueuePublisher = Depends(get_queue_publisher),
 ) -> StockSyncService:
-    return StockSyncService(
-        tiny_client=tiny_client, queue_publisher=queue_publisher
-    )
+    return StockSyncService(tiny_client=tiny_client, queue_publisher=queue_publisher)
 
 
 def get_sale_bucket_service() -> SaleBucketService:

@@ -22,9 +22,7 @@ class SyncLogRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def create_sync_log(
-        self, sync_type: str, metadata: dict[str, Any] | None = None
-    ) -> int:
+    async def create_sync_log(self, sync_type: str, metadata: dict[str, Any] | None = None) -> int:
         stmt = (
             pg_insert(SyncLogORM)
             .values(

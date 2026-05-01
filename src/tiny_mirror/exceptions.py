@@ -7,11 +7,13 @@ project errors from unexpected ones with a single ``except`` clause.
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class TinyMirrorException(Exception):
     """Base class for every exception raised by tiny-mirror."""
 
-    def __init__(self, message: str, details: dict | None = None) -> None:
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.message = message
         self.details = details
@@ -29,7 +31,7 @@ class TinyAPIException(TinyMirrorException):
     def __init__(
         self,
         message: str,
-        details: dict | None = None,
+        details: dict[str, Any] | None = None,
         status_code: int | None = None,
         response_body: str | None = None,
     ) -> None:
@@ -44,7 +46,7 @@ class RateLimitException(TinyAPIException):
     def __init__(
         self,
         message: str,
-        details: dict | None = None,
+        details: dict[str, Any] | None = None,
         status_code: int | None = None,
         response_body: str | None = None,
         retry_after_seconds: int | None = None,
@@ -65,7 +67,7 @@ class TinyNotFoundException(TinyAPIException):
         message: str,
         resource_type: str,
         resource_id: int | str,
-        details: dict | None = None,
+        details: dict[str, Any] | None = None,
         status_code: int | None = 404,
         response_body: str | None = None,
     ) -> None:
@@ -81,7 +83,7 @@ class SyncException(TinyMirrorException):
         self,
         message: str,
         sync_type: str,
-        details: dict | None = None,
+        details: dict[str, Any] | None = None,
         sync_log_id: int | None = None,
     ) -> None:
         super().__init__(message, details)
@@ -95,7 +97,7 @@ class QueueException(TinyMirrorException):
     def __init__(
         self,
         message: str,
-        details: dict | None = None,
+        details: dict[str, Any] | None = None,
         queue_name: str | None = None,
         routing_key: str | None = None,
     ) -> None:

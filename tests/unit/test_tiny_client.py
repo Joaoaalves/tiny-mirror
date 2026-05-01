@@ -139,9 +139,7 @@ async def test_request_401_twice_raises_token_expired(
     mock_http_client: AsyncMock,
     make_response,
 ) -> None:
-    mock_http_client.request = AsyncMock(
-        side_effect=[make_response(401), make_response(401)]
-    )
+    mock_http_client.request = AsyncMock(side_effect=[make_response(401), make_response(401)])
 
     with pytest.raises(TokenExpiredException):
         await client._request("GET", "/produtos")
@@ -170,7 +168,9 @@ async def test_request_429_max_retries_raises_rate_limit_exception(
     mock_http_client: AsyncMock,
     make_response,
 ) -> None:
-    mock_http_client.request = AsyncMock(return_value=make_response(429, headers={"X-RateLimit-Reset": "60"}))
+    mock_http_client.request = AsyncMock(
+        return_value=make_response(429, headers={"X-RateLimit-Reset": "60"})
+    )
 
     with pytest.raises(RateLimitException) as excinfo:
         await client._request("GET", "/produtos")
@@ -234,9 +234,7 @@ async def test_request_500_raises_tiny_api_exception(
     mock_http_client: AsyncMock,
     make_response,
 ) -> None:
-    mock_http_client.request = AsyncMock(
-        return_value=make_response(500, text="server error")
-    )
+    mock_http_client.request = AsyncMock(return_value=make_response(500, text="server error"))
 
     with pytest.raises(TinyAPIException) as excinfo:
         await client._request("GET", "/produtos")
@@ -249,9 +247,7 @@ async def test_request_4xx_other_than_handled_raises_tiny_api_exception(
     mock_http_client: AsyncMock,
     make_response,
 ) -> None:
-    mock_http_client.request = AsyncMock(
-        return_value=make_response(403, text="forbidden")
-    )
+    mock_http_client.request = AsyncMock(return_value=make_response(403, text="forbidden"))
 
     with pytest.raises(TinyAPIException) as excinfo:
         await client._request("GET", "/produtos")
@@ -279,9 +275,7 @@ async def test_request_timeout_translated_to_tiny_api_exception(
     client: TinyAPIClient,
     mock_http_client: AsyncMock,
 ) -> None:
-    mock_http_client.request = AsyncMock(
-        side_effect=httpx.TimeoutException("read timeout")
-    )
+    mock_http_client.request = AsyncMock(side_effect=httpx.TimeoutException("read timeout"))
 
     with pytest.raises(TinyAPIException, match="timed out"):
         await client._request("GET", "/produtos")
@@ -291,9 +285,7 @@ async def test_request_connect_error_translated_to_tiny_api_exception(
     client: TinyAPIClient,
     mock_http_client: AsyncMock,
 ) -> None:
-    mock_http_client.request = AsyncMock(
-        side_effect=httpx.ConnectError("dns failure")
-    )
+    mock_http_client.request = AsyncMock(side_effect=httpx.ConnectError("dns failure"))
 
     with pytest.raises(TinyAPIException, match="Network error"):
         await client._request("GET", "/produtos")
@@ -337,7 +329,7 @@ async def test_list_orders_uses_date_only_for_dataAtualizacao(
     make_response,
 ) -> None:
     """Tiny v3 only accepts YYYY-MM-DD here — see the project memory."""
-    from datetime import datetime, UTC
+    from datetime import UTC, datetime
 
     mock_http_client.request = AsyncMock(return_value=make_response(200, json_body={}))
 

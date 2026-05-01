@@ -71,9 +71,7 @@ class Settings(BaseSettings):
             raise ValueError("APP_ENV must be a string")
         normalized = v.lower()
         if normalized not in _VALID_APP_ENVS:
-            raise ValueError(
-                f"APP_ENV must be one of {sorted(_VALID_APP_ENVS)}, got {v!r}"
-            )
+            raise ValueError(f"APP_ENV must be one of {sorted(_VALID_APP_ENVS)}, got {v!r}")
         return normalized
 
     @field_validator("log_level", mode="before")
@@ -83,9 +81,7 @@ class Settings(BaseSettings):
             raise ValueError("LOG_LEVEL must be a string")
         normalized = v.upper()
         if normalized not in _VALID_LOG_LEVELS:
-            raise ValueError(
-                f"LOG_LEVEL must be one of {sorted(_VALID_LOG_LEVELS)}, got {v!r}"
-            )
+            raise ValueError(f"LOG_LEVEL must be one of {sorted(_VALID_LOG_LEVELS)}, got {v!r}")
         return normalized
 
     @property

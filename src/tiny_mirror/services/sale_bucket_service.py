@@ -71,16 +71,11 @@ class SaleBucketService:
                 int(item["product_tiny_id"])
                 for order in orders
                 for item in order.get("items", [])
-                if item.get("product_type") == "K"
-                and item.get("product_tiny_id") is not None
+                if item.get("product_type") == "K" and item.get("product_tiny_id") is not None
             }
-            kit_components_map = await products_repo.get_kit_components_for_ids(
-                list(kit_ids)
-            )
+            kit_components_map = await products_repo.get_kit_components_for_ids(list(kit_ids))
 
-            accumulator: dict[BucketKey, _BucketAccumulator] = defaultdict(
-                _BucketAccumulator
-            )
+            accumulator: dict[BucketKey, _BucketAccumulator] = defaultdict(_BucketAccumulator)
 
             for order in orders:
                 ecommerce_name = order.get("ecommerce_name") or ""
@@ -113,10 +108,7 @@ class SaleBucketService:
                     # Kit expansion buckets (only for kits that have
                     # components mirrored locally — otherwise we just emit
                     # the direct bucket and warn).
-                    if (
-                        item.get("product_type") == "K"
-                        and item.get("product_tiny_id") is not None
-                    ):
+                    if item.get("product_type") == "K" and item.get("product_tiny_id") is not None:
                         kit_id = int(item["product_tiny_id"])
                         components = kit_components_map.get(kit_id, [])
                         if not components:

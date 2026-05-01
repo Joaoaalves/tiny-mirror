@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from sqlalchemy import delete, exists as sa_exists, func, literal_column, select, text
+from sqlalchemy import delete, func, literal_column, select, text
+from sqlalchemy import exists as sa_exists
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,14 +21,12 @@ class PostgreSQLOrderRepository(OrderRepository):
     async def upsert(self, order_data: dict[str, Any]) -> str:
         stmt = pg_insert(OrderORM).values(**order_data)
         update_payload = {
-            col: stmt.excluded[col]
-            for col in order_data
-            if col not in {"tiny_id", "created_at"}
+            col: stmt.excluded[col] for col in order_data if col not in {"tiny_id", "created_at"}
         }
-        update_payload["updated_at"] = func.now()
+        update_payload["updated_at"] = func.now()  # type: ignore[assignment]
         update_payload["synced_at"] = order_data.get("synced_at", func.now())
 
-        stmt = stmt.on_conflict_do_update(
+        stmt = stmt.on_conflict_do_update(  # type: ignore[assignment]
             index_elements=["tiny_id"],
             set_=update_payload,
         ).returning(literal_column("(xmax = 0)").label("inserted"))
@@ -37,9 +36,7 @@ class PostgreSQLOrderRepository(OrderRepository):
         await self._session.commit()
         return "created" if inserted else "updated"
 
-    async def upsert_items(
-        self, order_tiny_id: int, items: list[dict[str, Any]]
-    ) -> None:
+    async def upsert_items(self, order_tiny_id: int, items: list[dict[str, Any]]) -> None:
         await self._session.execute(
             delete(OrderItemORM).where(OrderItemORM.order_tiny_id == order_tiny_id)
         )
@@ -56,16 +53,12 @@ class PostgreSQLOrderRepository(OrderRepository):
         from tiny_mirror.infrastructure.orm.models import ProductORM
 
         candidate_ids = {
-            item.get("product_tiny_id")
-            for item in items
-            if item.get("product_tiny_id") is not None
+            item.get("product_tiny_id") for item in items if item.get("product_tiny_id") is not None
         }
         existing_ids: set[int] = set()
         if candidate_ids:
             existing = await self._session.execute(
-                select(ProductORM.tiny_id).where(
-                    ProductORM.tiny_id.in_(candidate_ids)
-                )
+                select(ProductORM.tiny_id).where(ProductORM.tiny_id.in_(candidate_ids))
             )
             existing_ids = {int(tid) for (tid,) in existing.all()}
 
@@ -73,8 +66,7 @@ class PostgreSQLOrderRepository(OrderRepository):
         for item in items:
             raw_pid = item.get("product_tiny_id")
             resolved = (
-                int(raw_pid) if raw_pid is not None and int(raw_pid) in existing_ids
-                else None
+                int(raw_pid) if raw_pid is not None and int(raw_pid) in existing_ids else None
             )
             rows.append(
                 {
@@ -136,9 +128,7 @@ class PostgreSQLOrderRepository(OrderRepository):
         result = await self._session.execute(select(func.count(OrderORM.tiny_id)))
         return int(result.scalar_one())
 
-    async def get_orders_in_period(
-        self, date_from: date, date_to: date
-    ) -> list[dict[str, Any]]:
+    async def get_orders_in_period(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
         # Inclusive of the boundary dates: [date_from, date_to + 1 day).
         upper_bound = date_to + timedelta(days=1)
         result = await self._session.execute(

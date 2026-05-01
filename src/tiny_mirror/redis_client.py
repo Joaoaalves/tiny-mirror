@@ -16,7 +16,7 @@ redis_client: redis.Redis | None = None
 async def initialize_redis() -> None:
     """Create the global Redis client and verify connectivity with ``PING``."""
     global redis_client
-    redis_client = redis.from_url(
+    redis_client = redis.from_url(  # type: ignore[no-untyped-call]
         settings.redis_url,
         encoding="utf-8",
         decode_responses=True,

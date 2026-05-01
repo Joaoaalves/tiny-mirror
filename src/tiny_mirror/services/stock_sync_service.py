@@ -107,9 +107,7 @@ class StockSyncService:
     # Per-product — used both by the queue consumer and the webhook
     # consumer. ``sync_log_id`` is None for webhook-driven calls.
     # ------------------------------------------------------------------
-    async def process_stock_item(
-        self, product_tiny_id: int, sync_log_id: int | None
-    ) -> None:
+    async def process_stock_item(self, product_tiny_id: int, sync_log_id: int | None) -> None:
         logger.debug("Processing stock item", product_tiny_id=product_tiny_id)
 
         try:
@@ -130,9 +128,9 @@ class StockSyncService:
             # fail; degrade to a warning + skip instead of raising. The
             # daily product sync will pick the product up and the next
             # stock pass will succeed.
-            product_exists = await PostgreSQLProductRepository(
-                session
-            ).get_by_tiny_id(product_tiny_id)
+            product_exists = await PostgreSQLProductRepository(session).get_by_tiny_id(
+                product_tiny_id
+            )
             if product_exists is None:
                 logger.warning(
                     "Skipping stock for product not yet synced",
@@ -178,9 +176,7 @@ class StockSyncService:
         )
 
     # ------------------------------------------------------------------
-    async def _record_total_enqueued(
-        self, sync_log_id: int, total_enqueued: int
-    ) -> None:
+    async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
         from sqlalchemy import select, update
 
         from tiny_mirror.infrastructure.orm.models import SyncLogORM
