@@ -47,9 +47,18 @@ class Settings(BaseSettings):
 
     sync_products_cron: str = "0 2 * * *"
     sync_orders_cron: str = "0 * * * *"
-    sync_stock_cron: str = "0 3 * * *"
+    # Stock full sync runs weekly (Sunday 03:00 UTC) as a safety net only.
+    # Day-to-day stock freshness comes from Tiny order webhooks: every order
+    # webhook fans out a stock.item refresh per product touched by the order
+    # (see OrderWebhookConsumer). A daily full pass for 537 active products
+    # is wasteful when stock only changes after a sale.
+    sync_stock_cron: str = "0 3 * * 0"
     sync_buckets_cron: str = "0 4 * * *"
     token_rotation_cron: str = "0 */2 * * *"
+
+    # Dedup window for manual sync triggers. Repeated POSTs to /sync/* within
+    # this many seconds get a 409 instead of fanning out duplicates.
+    sync_trigger_lock_seconds: int = 300
 
     @field_validator("database_url", mode="before")
     @classmethod

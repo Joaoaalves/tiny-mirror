@@ -172,3 +172,6 @@ pyrightconfig.json
 
 .claude/**
 **CLAUDE**
+
+# Local Tiny audit dumps — never commit raw catalog data
+audit/

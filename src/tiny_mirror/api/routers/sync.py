@@ -6,6 +6,8 @@ import math
 from datetime import UTC, date, datetime
 from typing import Annotated, Any, Literal
 
+import redis.asyncio as redis
+import structlog
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
@@ -14,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tiny_mirror.api.dependencies import (
     db_session,
     get_queue_publisher,
+    get_redis_client,
     get_sync_log_repository,
 )
 from tiny_mirror.api.schemas import (
@@ -22,6 +25,7 @@ from tiny_mirror.api.schemas import (
     SyncLogResponse,
     SyncTriggerResponse,
 )
+from tiny_mirror.config import settings
 from tiny_mirror.infrastructure.orm.models import SyncLogORM
 from tiny_mirror.infrastructure.repositories.sync_log_repository import (
     SyncLogRepository,
@@ -29,6 +33,32 @@ from tiny_mirror.infrastructure.repositories.sync_log_repository import (
 from tiny_mirror.queue.publisher import QueuePublisher
 
 router = APIRouter()
+logger = structlog.get_logger(__name__)
+
+
+# Dedup lock for manual sync triggers. SET NX EX returns True only if the
+# key did not exist; subsequent calls within the TTL get a 409. The lock
+# is intentionally never released — the TTL is the release.
+_LOCK_KEY_PREFIX = "tiny-mirror:sync-lock:"
+
+
+async def _acquire_sync_lock(redis_client: redis.Redis, sync_type: str) -> None:
+    key = f"{_LOCK_KEY_PREFIX}{sync_type}"
+    acquired = await redis_client.set(key, "1", nx=True, ex=settings.sync_trigger_lock_seconds)
+    if not acquired:
+        ttl = await redis_client.ttl(key)
+        logger.info(
+            "Manual sync trigger rejected: lock already held",
+            sync_type=sync_type,
+            ttl_seconds=ttl,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A {sync_type} sync was triggered within the last "
+                f"{settings.sync_trigger_lock_seconds}s; retry in ~{max(ttl, 1)}s."
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +97,9 @@ class OrdersSyncRequest(BaseModel):
 async def sync_products(
     sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
     publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
 ) -> SyncTriggerResponse:
+    await _acquire_sync_lock(redis_client, "products")
     sync_log_id = await sync_logs.create_sync_log("products", metadata={"triggered_by": "manual"})
     await publisher.publish_sync_message(
         "products.full",
@@ -89,7 +121,9 @@ async def sync_orders(
     body: OrdersSyncRequest = Body(default_factory=OrdersSyncRequest),
     sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
     publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
 ) -> SyncTriggerResponse:
+    await _acquire_sync_lock(redis_client, "orders")
     metadata: dict[str, Any] = {"triggered_by": "manual"}
     if body.date_from is not None and body.date_to is not None:
         metadata["date_from"] = body.date_from.isoformat()
@@ -131,7 +165,9 @@ async def sync_orders(
 async def sync_stock(
     sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
     publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
 ) -> SyncTriggerResponse:
+    await _acquire_sync_lock(redis_client, "stock")
     sync_log_id = await sync_logs.create_sync_log("stock", metadata={"triggered_by": "manual"})
     await publisher.publish_sync_message(
         "stock.full",
