@@ -105,6 +105,8 @@ class SyncLogRepository:
         """
         # Use raw SQL so the comparison can read total_enqueued out of the
         # JSONB metadata column atomically with the status check.
+        # The Python attribute is sync_metadata; the SQL column is "metadata"
+        # (mapped_column("metadata", ...)). Use the SQL name in raw queries.
         result = await self._session.execute(
             text(
                 """
@@ -113,9 +115,9 @@ class SyncLogRepository:
                     completed_at = now()
                 WHERE id = :id
                   AND status = 'running'
-                  AND (sync_metadata ->> 'total_enqueued') IS NOT NULL
+                  AND (metadata ->> 'total_enqueued') IS NOT NULL
                   AND (items_processed + items_failed)
-                      >= ((sync_metadata ->> 'total_enqueued')::int)
+                      >= ((metadata ->> 'total_enqueued')::int)
                 """
             ),
             {"id": sync_log_id},
