@@ -31,7 +31,11 @@ from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.queue.topology import setup_topology
 from tiny_mirror.rabbitmq import close_rabbitmq, get_channel, initialize_rabbitmq
 from tiny_mirror.redis_client import close_redis, get_redis, initialize_redis
-from tiny_mirror.scheduler.jobs import setup_scheduler, shutdown_scheduler
+from tiny_mirror.scheduler.jobs import (
+    check_and_trigger_initial_sync,
+    setup_scheduler,
+    shutdown_scheduler,
+)
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
@@ -100,6 +104,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
         scheduler = setup_scheduler(app)
+        app.state.scheduler = scheduler
+
+        await check_and_trigger_initial_sync(app)
+
         logger.info("tiny-mirror started successfully")
 
         yield
