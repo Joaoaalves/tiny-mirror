@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
+import httpx
 import structlog
 from fastapi import FastAPI
 
@@ -21,12 +22,16 @@ from tiny_mirror.api.routers.products import router as products_router
 from tiny_mirror.api.routers.sync import router as sync_router
 from tiny_mirror.api.routers.webhooks import router as webhooks_router
 from tiny_mirror.config import settings
-from tiny_mirror.database import close_database, initialize_database
+from tiny_mirror.database import AsyncSessionLocal, close_database, initialize_database
+from tiny_mirror.infrastructure.repositories.token_repository import (
+    PostgreSQLTokenRepository,
+)
 from tiny_mirror.logging_config import configure_logging
 from tiny_mirror.queue.topology import setup_topology
 from tiny_mirror.rabbitmq import close_rabbitmq, get_channel, initialize_rabbitmq
-from tiny_mirror.redis_client import close_redis, initialize_redis
+from tiny_mirror.redis_client import close_redis, get_redis, initialize_redis
 from tiny_mirror.scheduler.jobs import setup_scheduler, shutdown_scheduler
+from tiny_mirror.services.token_service import TokenService
 
 
 @asynccontextmanager
@@ -44,6 +49,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await initialize_redis()
         await initialize_rabbitmq()
         await setup_topology(get_channel())
+
+        app.state.http_client = httpx.AsyncClient(timeout=30.0)
+
+        async with AsyncSessionLocal() as session:
+            token_service = TokenService(
+                token_repository=PostgreSQLTokenRepository(session),
+                redis_client=get_redis(),
+                http_client=app.state.http_client,
+                tiny_client_id=settings.tiny_client_id,
+                tiny_client_secret=settings.tiny_client_secret,
+                tiny_initial_refresh_token=settings.tiny_refresh_token,
+            )
+            await token_service.validate_on_startup()
+
         # consumer tasks and historical-sync trigger land in stage 05+.
         scheduler = setup_scheduler(app)
         logger.info("tiny-mirror started successfully")
@@ -54,6 +73,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         shutdown_scheduler(scheduler)
         for task in consumer_tasks:
             task.cancel()
+        http_client: httpx.AsyncClient | None = getattr(app.state, "http_client", None)
+        if http_client is not None:
+            await http_client.aclose()
         await close_rabbitmq()
         await close_redis()
         await close_database()
