@@ -30,8 +30,8 @@ EnvironmentFile=/opt/tiny-mirror/.env
 # multiple machines + a load balancer, never with workers > 1.
 ExecStart=/opt/tiny-mirror/current/.venv/bin/uvicorn \
     src.tiny_mirror.main:app \
-    --host 0.0.0.0 \
-    --port 8000 \
+    --host ${APP_HOST} \
+    --port ${APP_PORT} \
     --workers 1 \
     --log-level warning
 

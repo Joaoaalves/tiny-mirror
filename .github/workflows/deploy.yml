@@ -202,10 +202,11 @@ jobs:
           }
 
       - name: Health check
+        # uvicorn binds to localhost only — nginx is the public ingress.
+        # We curl /health from inside the VPS over SSH.
         run: |
           sleep 3
-          curl --fail --silent --show-error \
-            "http://${{ secrets.VPS_HOST }}:8000/health" \
+          ssh vps "curl --fail --silent --show-error http://127.0.0.1:8001/health" \
           | python3 -c "import sys, json; d=json.load(sys.stdin); print(d); exit(0 if d['status']=='ok' else 1)"
 
       - name: Cleanup SSH credentials
