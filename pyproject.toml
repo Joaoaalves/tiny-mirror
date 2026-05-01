@@ -3,7 +3,6 @@ name = "tiny-mirror"
 version = "1.0.0"
 description = "Espelho local de dados do Tiny ERP via API REST"
 authors = ["tiny-mirror"]
-readme = "README.md"
 packages = [{include = "tiny_mirror", from = "src"}]
 
 [tool.poetry.dependencies]

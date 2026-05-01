@@ -181,6 +181,13 @@ jobs:
           ssh vps "cd /opt/tiny-mirror/current && \
             poetry install --only main --no-interaction"
 
+      - name: Ensure .env symlink for pydantic-settings
+        # Settings() looks for `.env` in the working directory; the real file
+        # lives at /opt/tiny-mirror/.env (preserved across deploys via the
+        # rsync --exclude above). The symlink is idempotent.
+        run: |
+          ssh vps "ln -sfn /opt/tiny-mirror/.env /opt/tiny-mirror/current/.env"
+
       - name: Apply database migrations
         # Migrations run BEFORE the service restart. If they fail, the
         # deploy aborts and the previous service keeps running.
