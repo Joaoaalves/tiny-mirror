@@ -10,12 +10,9 @@ from fastapi import Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.config import settings
-from tiny_mirror.database import get_async_session
+from tiny_mirror.database import AsyncSessionLocal, get_async_session
 from tiny_mirror.infrastructure.external.rate_limiter import RateLimiter
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
-from tiny_mirror.infrastructure.repositories.token_repository import (
-    PostgreSQLTokenRepository,
-)
 from tiny_mirror.redis_client import get_redis
 from tiny_mirror.services.token_service import TokenService
 
@@ -36,12 +33,11 @@ def get_redis_client() -> redis.Redis:
 
 
 def get_token_service(
-    session: AsyncSession = Depends(db_session),
     redis_client: redis.Redis = Depends(get_redis_client),
     http_client: httpx.AsyncClient = Depends(get_http_client),
 ) -> TokenService:
     return TokenService(
-        token_repository=PostgreSQLTokenRepository(session),
+        session_factory=AsyncSessionLocal,
         redis_client=redis_client,
         http_client=http_client,
         tiny_client_id=settings.tiny_client_id,

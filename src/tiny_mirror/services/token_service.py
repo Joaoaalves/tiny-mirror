@@ -17,11 +17,14 @@ truth; the env values are ignored.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
 
 import httpx
 import redis.asyncio as redis
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.domain.interfaces import TokenRepository
 from tiny_mirror.domain.models import OAuthToken
@@ -29,6 +32,12 @@ from tiny_mirror.exceptions import (
     ConfigurationException,
     TokenExpiredException,
 )
+from tiny_mirror.infrastructure.repositories.token_repository import (
+    PostgreSQLTokenRepository,
+)
+
+SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+RepositoryFactory = Callable[[AsyncSession], TokenRepository]
 
 logger = structlog.get_logger(__name__)
 
@@ -46,14 +55,16 @@ class TokenService:
 
     def __init__(
         self,
-        token_repository: TokenRepository,
+        session_factory: SessionFactory,
         redis_client: redis.Redis,
         http_client: httpx.AsyncClient,
         tiny_client_id: str,
         tiny_client_secret: str,
         tiny_initial_refresh_token: str,
+        repository_factory: RepositoryFactory = PostgreSQLTokenRepository,
     ) -> None:
-        self._repository = token_repository
+        self._session_factory = session_factory
+        self._repository_factory = repository_factory
         self._redis = redis_client
         self._http = http_client
         self._client_id = tiny_client_id
@@ -70,7 +81,8 @@ class TokenService:
             return cached if isinstance(cached, str) else cached.decode("utf-8")
 
         logger.debug("OAuth token cache miss, loading from database")
-        token = await self._repository.get_current_token()
+        async with self._session_factory() as session:
+            token = await self._repository_factory(session).get_current_token()
         if token is None:
             raise ConfigurationException(
                 "No OAuth token found in database. Bootstrap from .env failed; check "
@@ -113,7 +125,8 @@ class TokenService:
 
     async def refresh_tokens(self) -> OAuthToken:
         """Force a refresh using the current DB row as the source of truth."""
-        current = await self._repository.get_current_token()
+        async with self._session_factory() as session:
+            current = await self._repository_factory(session).get_current_token()
         if current is None:
             raise ConfigurationException(
                 "Cannot refresh: no OAuth token in database. Run bootstrap first."
@@ -139,7 +152,8 @@ class TokenService:
         return token.is_expiring_soon(self.TOKEN_EXPIRY_WARNING_MINUTES)
 
     async def validate_on_startup(self) -> None:
-        token = await self._repository.get_current_token()
+        async with self._session_factory() as session:
+            token = await self._repository_factory(session).get_current_token()
 
         if token is None:
             logger.info("oauth_tokens empty, bootstrapping from .env")
@@ -205,7 +219,8 @@ class TokenService:
 
         # Another worker is refreshing — give it a moment, then retry the DB.
         await asyncio.sleep(1.0)
-        latest = await self._repository.get_current_token()
+        async with self._session_factory() as session:
+            latest = await self._repository_factory(session).get_current_token()
         if latest is not None and not latest.is_expired():
             return latest
         return await self._refresh_with_token(refresh_token)
@@ -249,7 +264,8 @@ class TokenService:
             refresh_expires_at=now + timedelta(seconds=int(payload["refresh_expires_in"])),
         )
 
-        await self._repository.save_token(new_token)
+        async with self._session_factory() as session:
+            await self._repository_factory(session).save_token(new_token)
         await self._cache_access_token(new_token)
 
         logger.info(
