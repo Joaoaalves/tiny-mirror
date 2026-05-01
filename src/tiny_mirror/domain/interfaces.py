@@ -101,3 +101,27 @@ class OrderRepository(abc.ABC):
         self, date_from: Any, date_to: Any
     ) -> list[dict[str, Any]]:
         """Return orders (with items) whose ``order_date`` falls in the range."""
+
+
+class StockRepository(abc.ABC):
+    """Persistence contract for product stock and deposit-level breakdown."""
+
+    @abc.abstractmethod
+    async def upsert(self, stock_data: dict[str, Any]) -> None:
+        """Insert or update the stock row for ``product_tiny_id``."""
+
+    @abc.abstractmethod
+    async def upsert_deposits(
+        self, product_tiny_id: int, deposits: list[dict[str, Any]]
+    ) -> None:
+        """Atomically replace every deposit row for the given product."""
+
+    @abc.abstractmethod
+    async def get_product_tiny_ids_to_sync(self) -> list[int]:
+        """Return the tiny ids of every active product (situation='A')."""
+
+    @abc.abstractmethod
+    async def get_by_product_tiny_id(
+        self, product_tiny_id: int
+    ) -> dict[str, Any] | None:
+        """Return the stock row with its ``deposits`` array."""
