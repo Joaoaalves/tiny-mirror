@@ -16,10 +16,12 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 import structlog
+from sqlalchemy import select
 
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
+from tiny_mirror.infrastructure.orm.models import OrderORM
 from tiny_mirror.infrastructure.repositories.order_repository import (
     PostgreSQLOrderRepository,
 )
@@ -187,6 +189,7 @@ class OrderSyncService:
                 await orders.upsert_items(order_tiny_id, items)
                 if sync_log_id is not None:
                     await sync_logs.increment_processed(sync_log_id)
+                    await sync_logs.try_finalize(sync_log_id)
             except TinyAPIException as exc:
                 logger.error(
                     "Tiny API error while syncing order",
@@ -196,6 +199,7 @@ class OrderSyncService:
                 )
                 if sync_log_id is not None:
                     await sync_logs.increment_failed(sync_log_id)
+                    await sync_logs.try_finalize(sync_log_id)
                 raise
             except Exception as exc:
                 logger.error(
@@ -205,6 +209,7 @@ class OrderSyncService:
                 )
                 if sync_log_id is not None:
                     await sync_logs.increment_failed(sync_log_id)
+                    await sync_logs.try_finalize(sync_log_id)
                 raise
 
         logger.info(
@@ -245,18 +250,14 @@ class OrderSyncService:
             pagination = response.get("paginacao", {}) or {}
             total = int(pagination.get("total", 0))
 
-            logger.debug(
-                "Listed order page",
-                offset=offset,
-                count=len(items),
-                total=total,
-            )
-
             if not items:
                 break
 
-            for item in items:
-                order_tiny_id = int(item["id"])
+            page_ids = [int(item["id"]) for item in items]
+            new_ids = await self._filter_new_order_ids(page_ids)
+            skipped = len(page_ids) - len(new_ids)
+
+            for order_tiny_id in new_ids:
                 await self._publisher.publish_sync_message(
                     "orders.item",
                     {
@@ -272,11 +273,39 @@ class OrderSyncService:
                 )
                 total_published += 1
 
+            logger.debug(
+                "Listed order page",
+                offset=offset,
+                count=len(items),
+                total=total,
+                published=len(new_ids),
+                skipped_existing=skipped,
+            )
+
             offset += PAGE_SIZE
             if (total and offset >= total) or len(items) < PAGE_SIZE:
                 break
 
         return total_published
+
+    async def _filter_new_order_ids(self, candidate_ids: list[int]) -> list[int]:
+        """Drop ids that are already in the local orders table.
+
+        The cron lookback window overlaps with prior runs, so the same
+        order surfaces hour after hour until it falls out of the window.
+        Re-fetching its detail every hour wastes the 60 req/min Tiny
+        budget without changing the row — status changes already arrive
+        through the order webhook, which calls process_order_item
+        directly without going through this fan-out.
+        """
+        if not candidate_ids:
+            return []
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                select(OrderORM.tiny_id).where(OrderORM.tiny_id.in_(candidate_ids))
+            )
+            existing = {int(tid) for (tid,) in result.all()}
+        return [oid for oid in candidate_ids if oid not in existing]
 
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
         from sqlalchemy import select, update

@@ -147,6 +147,7 @@ class ProductSyncService:
                     )
 
                 await sync_logs.increment_processed(sync_log_id)
+                await sync_logs.try_finalize(sync_log_id)
             except TinyAPIException as exc:
                 logger.error(
                     "Tiny API error while syncing product",
@@ -155,6 +156,7 @@ class ProductSyncService:
                     status_code=exc.status_code,
                 )
                 await sync_logs.increment_failed(sync_log_id)
+                await sync_logs.try_finalize(sync_log_id)
                 raise
             except Exception as exc:
                 logger.error(
@@ -163,6 +165,7 @@ class ProductSyncService:
                     error=str(exc),
                 )
                 await sync_logs.increment_failed(sync_log_id)
+                await sync_logs.try_finalize(sync_log_id)
                 raise
 
         logger.info(

@@ -79,6 +79,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "sale_buckets_refresh": CronTrigger.from_crontab(
                 settings.sync_buckets_cron, timezone="UTC"
             ),
+            "sync_log_watchdog": CronTrigger.from_crontab(
+                settings.sync_log_watchdog_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -101,6 +104,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _sale_buckets_refresh() -> None:
         await sale_buckets_refresh_job(publisher)
+
+    async def _sync_log_watchdog() -> None:
+        await sync_log_watchdog_job()
 
     scheduler.add_job(
         _token_rotation,
@@ -130,6 +136,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _sale_buckets_refresh,
         trigger=triggers["sale_buckets_refresh"],
         id="sale_buckets_refresh",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _sync_log_watchdog,
+        trigger=triggers["sync_log_watchdog"],
+        id="sync_log_watchdog",
         replace_existing=True,
     )
 
@@ -311,6 +323,28 @@ async def stock_full_sync_job(publisher: QueuePublisher) -> None:
     )
 
 
+async def sync_log_watchdog_job() -> None:
+    """Force-close sync_logs that overstay the running window.
+
+    A row may stay in ``running`` indefinitely when items escape into a
+    DLQ (no counter update) or when the consumer crashed mid-run. Tiny's
+    60 req/min rate limit makes legitimate runs slow, so the threshold
+    is intentionally generous (``settings.sync_log_running_max_minutes``,
+    default 90). The dashboard then reflects reality without killing
+    healthy long-running passes.
+    """
+    async with AsyncSessionLocal() as session:
+        closed = await SyncLogRepository(session).mark_stalled_as_failed(
+            max_minutes=settings.sync_log_running_max_minutes
+        )
+    if closed:
+        logger.warning(
+            "Watchdog auto-closed stalled sync_logs",
+            count=closed,
+            max_minutes=settings.sync_log_running_max_minutes,
+        )
+
+
 async def sale_buckets_refresh_job(publisher: QueuePublisher) -> None:
     logger.info("Sale buckets refresh job started")
     today: date = datetime.now(UTC).date()
@@ -398,5 +432,6 @@ __all__ = [
     "setup_scheduler",
     "shutdown_scheduler",
     "stock_full_sync_job",
+    "sync_log_watchdog_job",
     "token_rotation_job",
 ]

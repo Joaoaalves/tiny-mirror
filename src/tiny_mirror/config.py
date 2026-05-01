@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     # this many seconds get a 409 instead of fanning out duplicates.
     sync_trigger_lock_seconds: int = 300
 
+    # sync_log watchdog. Runs every N minutes via the scheduler; any sync_log
+    # still in 'running' for longer than running_max_minutes is force-closed
+    # to 'failed'. Tiny rate limit is ~60 req/min, so a full product fan-out
+    # of 661 items can legitimately take 11+ minutes; pick a generous bound
+    # so genuinely-running jobs are not killed.
+    sync_log_watchdog_cron: str = "*/5 * * * *"
+    sync_log_running_max_minutes: int = 90
+
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

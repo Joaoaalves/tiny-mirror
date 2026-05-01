@@ -146,6 +146,7 @@ class StockSyncService:
                 await stock_repo.upsert_deposits(product_tiny_id, deposits)
                 if sync_log_id is not None:
                     await sync_logs.increment_processed(sync_log_id)
+                    await sync_logs.try_finalize(sync_log_id)
             except TinyAPIException as exc:
                 logger.error(
                     "Tiny API error while syncing stock",
@@ -155,6 +156,7 @@ class StockSyncService:
                 )
                 if sync_log_id is not None:
                     await sync_logs.increment_failed(sync_log_id)
+                    await sync_logs.try_finalize(sync_log_id)
                 raise
             except Exception as exc:
                 logger.error(
@@ -164,6 +166,7 @@ class StockSyncService:
                 )
                 if sync_log_id is not None:
                     await sync_logs.increment_failed(sync_log_id)
+                    await sync_logs.try_finalize(sync_log_id)
                 raise
 
         logger.info(
