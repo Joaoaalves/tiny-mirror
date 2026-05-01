@@ -48,17 +48,34 @@ class ProductSyncService:
         logger.info("Starting full product sync", sync_log_id=sync_log_id)
 
         total_published = 0
-        offset = 0
-        total: int | None = None
+        # Tiny v3 /produtos accepts a single value per request; paginate
+        # active and inactive in two passes. Excluded ("E") is intentionally
+        # skipped — those are products deleted from the operator's catalog.
+        for situation in ("A", "I"):
+            total_published += await self._enqueue_situation(sync_log_id, situation)
 
+        await self._record_total_enqueued(sync_log_id, total_published)
+
+        logger.info(
+            "Full product sync enqueued",
+            sync_log_id=sync_log_id,
+            total_published=total_published,
+        )
+
+    async def _enqueue_situation(self, sync_log_id: int, situation: str) -> int:
+        published = 0
+        offset = 0
         while True:
-            response = await self._tiny.list_products(situation="A", limit=PAGE_SIZE, offset=offset)
+            response = await self._tiny.list_products(
+                situation=situation, limit=PAGE_SIZE, offset=offset
+            )
             items = response.get("itens", []) or []
             pagination = response.get("paginacao", {}) or {}
             total = int(pagination.get("total", 0))
 
             logger.debug(
                 "Listed product page",
+                situation=situation,
                 offset=offset,
                 count=len(items),
                 total=total,
@@ -81,22 +98,21 @@ class ProductSyncService:
                     "Published product item",
                     product_tiny_id=product_tiny_id,
                     sync_log_id=sync_log_id,
+                    situation=situation,
                 )
-                total_published += 1
+                published += 1
 
             offset += PAGE_SIZE
-            if (total is not None and offset >= total) or len(items) < PAGE_SIZE:
+            if offset >= total or len(items) < PAGE_SIZE:
                 break
 
-        # Record fan-out size in metadata.total_enqueued so the per-item
-        # handler can own items_processed without double-counting.
-        await self._record_total_enqueued(sync_log_id, total_published)
-
         logger.info(
-            "Full product sync enqueued",
+            "Product situation enqueued",
             sync_log_id=sync_log_id,
-            total_published=total_published,
+            situation=situation,
+            count=published,
         )
+        return published
 
     async def process_product_item(self, product_tiny_id: int, sync_log_id: int) -> None:
         logger.debug("Processing product item", product_tiny_id=product_tiny_id)

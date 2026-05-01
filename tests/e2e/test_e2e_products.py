@@ -153,9 +153,9 @@ async def test_run_full_sync_publishes_one_message_per_active_product(
     live_tiny_client: TinyAPIClient,
     live_rabbitmq: QueuePublisher,
 ) -> None:
-    """Full sync must paginate the active catalog and publish exactly one
-    products.item message per active product. We drain the queue before
-    and after so the count is unambiguous.
+    """Full sync must paginate active + inactive products and publish exactly
+    one products.item message per product across both situations. We drain
+    the queue before and after so the count is unambiguous.
     """
     channel = get_channel()
     queue = await channel.get_queue("tiny.sync.products.item")
@@ -172,9 +172,13 @@ async def test_run_full_sync_publishes_one_message_per_active_product(
 
     await service.run_full_sync(sync_log_id)
 
-    # Cross-check expected count via the same listing endpoint.
-    head = await live_tiny_client.list_products(situation="A", limit=1)
-    expected = int(head.get("paginacao", {}).get("total", 0))
+    # Cross-check expected count via the same listing endpoint, summing the
+    # two situations the service paginates over.
+    head_active = await live_tiny_client.list_products(situation="A", limit=1)
+    head_inactive = await live_tiny_client.list_products(situation="I", limit=1)
+    expected = int(head_active.get("paginacao", {}).get("total", 0)) + int(
+        head_inactive.get("paginacao", {}).get("total", 0)
+    )
 
     drained = 0
     while True:
