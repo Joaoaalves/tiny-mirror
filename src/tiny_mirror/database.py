@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 
 import structlog
-from sqlalchemy import text
+from sqlalchemy import MetaData, text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -17,6 +17,14 @@ from tiny_mirror.config import settings
 from tiny_mirror.exceptions import DatabaseException
 
 logger = structlog.get_logger(__name__)
+
+NAMING_CONVENTION = {
+    "ix": "ix_%(table_name)s_%(column_0_name)s",
+    "uq": "uq_%(table_name)s_%(column_0_name)s",
+    "ck": "ck_%(table_name)s_%(constraint_name)s",
+    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+    "pk": "pk_%(table_name)s",
+}
 
 
 engine = create_async_engine(
@@ -36,7 +44,13 @@ AsyncSessionLocal = async_sessionmaker(
 
 
 class Base(DeclarativeBase):
-    """Declarative base for every ORM model in the project."""
+    """Declarative base for every ORM model in the project.
+
+    Constraints and indexes follow the project naming convention so that
+    Alembic-generated migrations and hand-written SQL stay consistent.
+    """
+
+    metadata = MetaData(naming_convention=NAMING_CONVENTION)
 
 
 async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
