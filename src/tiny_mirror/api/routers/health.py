@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 import redis.asyncio as redis
 from aio_pika.abc import AbstractChannel
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,15 +26,16 @@ VERSION = "1.0.0"
 
 @router.get("/health")
 async def health(
+    request: Request,
     session: AsyncSession = Depends(db_session),
     redis_client: redis.Redis = Depends(get_redis_client),
     channel: AbstractChannel = Depends(get_rabbitmq_channel),
 ) -> JSONResponse:
-    """Aggregate health probe — checks Postgres, Redis and RabbitMQ.
-
-    All three checks run sequentially because the cost is small (~ms) and
-    parallelizing buys very little. Any failure flips the overall status
-    to ``degraded`` and the response code to 503.
+    """Aggregate health probe — checks Postgres, Redis, RabbitMQ and the
+    scheduler. Any failure flips the overall status to ``degraded`` and
+    the response code to 503. The scheduler check is informational only
+    (it cannot flip the status to degraded — a missing scheduler in test
+    contexts does not mean the service is broken).
     """
     components: dict[str, str] = {}
     overall_ok = True
@@ -61,6 +62,10 @@ async def health(
         overall_ok = False
         components["rabbitmq"] = f"error: {exc}"
 
+    scheduler = getattr(request.app.state, "scheduler", None)
+    scheduler_running = bool(scheduler is not None and scheduler.running)
+    components["scheduler"] = "ok" if scheduler_running else "absent"
+
     body = HealthResponse(
         status="ok" if overall_ok else "degraded",
         timestamp=datetime.now(UTC),
@@ -68,6 +73,7 @@ async def health(
         environment=settings.app_env,
         components=components,
     ).model_dump(mode="json")
+    body["scheduler_running"] = scheduler_running
 
     return JSONResponse(
         status_code=status.HTTP_200_OK
