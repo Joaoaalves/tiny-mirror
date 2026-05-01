@@ -56,12 +56,18 @@ E2E_ENABLED = bool(os.environ.get("E2E_TINY_ACCESS_TOKEN"))
 def pytest_collection_modifyitems(
     config: pytest.Config, items: list[pytest.Item]
 ) -> None:
-    """Skip every collected test in the e2e folder when the gate is off."""
+    """Skip every collected test under tests/e2e/ when the gate is off.
+
+    Pytest invokes this hook session-wide, not per directory, so we have
+    to filter for our subpath ourselves — otherwise a sibling suite
+    (tests/unit) would be skipped just because we are.
+    """
     if E2E_ENABLED:
         return
     skip_marker = pytest.mark.skip(reason="E2E_TINY_ACCESS_TOKEN not set")
     for item in items:
-        item.add_marker(skip_marker)
+        if "tests/e2e/" in str(item.fspath) or item.get_closest_marker("e2e"):
+            item.add_marker(skip_marker)
 
 
 # ---------------------------------------------------------------------------
