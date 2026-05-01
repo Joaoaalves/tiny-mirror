@@ -23,11 +23,10 @@ from tiny_mirror.api.routers.sync import router as sync_router
 from tiny_mirror.api.routers.webhooks import router as webhooks_router
 from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal, close_database, initialize_database
-from tiny_mirror.infrastructure.repositories.token_repository import (
-    PostgreSQLTokenRepository,
-)
+from tiny_mirror.infrastructure.external.rate_limiter import RateLimiter
+from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.logging_config import configure_logging
-from tiny_mirror.queue import start_consumers
+from tiny_mirror.queue.bootstrap import start_consumers
 from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.queue.topology import setup_topology
 from tiny_mirror.rabbitmq import close_rabbitmq, get_channel, initialize_rabbitmq
@@ -61,24 +60,34 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.http_client = httpx.AsyncClient(timeout=30.0)
         app.state.queue_publisher = QueuePublisher(channel)
 
-        async with AsyncSessionLocal() as session:
-            token_service = TokenService(
-                token_repository=PostgreSQLTokenRepository(session),
-                redis_client=get_redis(),
-                http_client=app.state.http_client,
-                tiny_client_id=settings.tiny_client_id,
-                tiny_client_secret=settings.tiny_client_secret,
-                tiny_initial_refresh_token=settings.tiny_refresh_token,
-            )
-            await token_service.validate_on_startup()
+        token_service = TokenService(
+            session_factory=AsyncSessionLocal,
+            redis_client=get_redis(),
+            http_client=app.state.http_client,
+            tiny_client_id=settings.tiny_client_id,
+            tiny_client_secret=settings.tiny_client_secret,
+            tiny_initial_refresh_token=settings.tiny_refresh_token,
+        )
+        await token_service.validate_on_startup()
+        app.state.token_service = token_service
 
-        # Real services land in stages 06-09; the stub instances make the
-        # consumers wireable today and fail loudly (NotImplementedError ->
-        # DLQ) if a message arrives before those stages are implemented.
+        tiny_client = TinyAPIClient(
+            token_service=token_service,
+            rate_limiter=RateLimiter(get_redis()),
+            http_client=app.state.http_client,
+        )
+        app.state.tiny_client = tiny_client
+
+        # Real services for stages 07-09 land later; orders/stock/buckets
+        # services still raise NotImplementedError — those messages go to
+        # their respective DLQs until those stages are implemented.
         app.state.consumers = await start_consumers(
             channel,
             queue_publisher=app.state.queue_publisher,
-            product_sync=ProductSyncService(),
+            product_sync=ProductSyncService(
+                tiny_client=tiny_client,
+                queue_publisher=app.state.queue_publisher,
+            ),
             order_sync=OrderSyncService(),
             stock_sync=StockSyncService(),
             sale_buckets=SaleBucketService(),
