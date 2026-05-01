@@ -164,8 +164,11 @@ class OrderSyncService:
     # Per-order — called by OrderItemConsumer for each fan-out message
     # ------------------------------------------------------------------
     async def process_order_item(
-        self, order_tiny_id: int, sync_log_id: int
+        self, order_tiny_id: int, sync_log_id: int | None
     ) -> None:
+        """Sync a single order. ``sync_log_id`` is None for webhook-driven
+        calls — counter updates are skipped in that case.
+        """
         logger.debug("Processing order item", order_tiny_id=order_tiny_id)
 
         try:
@@ -186,7 +189,8 @@ class OrderSyncService:
             try:
                 action = await orders.upsert(order_data)
                 await orders.upsert_items(order_tiny_id, items)
-                await sync_logs.increment_processed(sync_log_id)
+                if sync_log_id is not None:
+                    await sync_logs.increment_processed(sync_log_id)
             except TinyAPIException as exc:
                 logger.error(
                     "Tiny API error while syncing order",
@@ -194,7 +198,8 @@ class OrderSyncService:
                     error=str(exc),
                     status_code=exc.status_code,
                 )
-                await sync_logs.increment_failed(sync_log_id)
+                if sync_log_id is not None:
+                    await sync_logs.increment_failed(sync_log_id)
                 raise
             except Exception as exc:
                 logger.error(
@@ -202,7 +207,8 @@ class OrderSyncService:
                     order_tiny_id=order_tiny_id,
                     error=str(exc),
                 )
-                await sync_logs.increment_failed(sync_log_id)
+                if sync_log_id is not None:
+                    await sync_logs.increment_failed(sync_log_id)
                 raise
 
         logger.info(
