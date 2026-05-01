@@ -92,7 +92,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tiny_client=tiny_client,
                 queue_publisher=app.state.queue_publisher,
             ),
-            stock_sync=StockSyncService(),
+            stock_sync=StockSyncService(
+                tiny_client=tiny_client,
+                queue_publisher=app.state.queue_publisher,
+            ),
             sale_buckets=SaleBucketService(),
         )
 
