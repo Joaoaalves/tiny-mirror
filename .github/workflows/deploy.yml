@@ -142,9 +142,10 @@ jobs:
       - name: Configure SSH
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.VPS_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY }}" | tr -d '\r' > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-          echo "${{ secrets.VPS_HOST_KEY }}" >> ~/.ssh/known_hosts
+          printf '%s\n' "${{ secrets.VPS_HOST_KEY }}" >> ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
           cat >> ~/.ssh/config << EOF
           Host vps
@@ -154,6 +155,7 @@ jobs:
             IdentityFile ~/.ssh/deploy_key
             StrictHostKeyChecking yes
           EOF
+          ssh-keygen -y -f ~/.ssh/deploy_key > /dev/null
 
       - name: Sync code to VPS
         run: |
