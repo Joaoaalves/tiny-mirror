@@ -37,6 +37,11 @@ class TinyAPIClient:
     MAX_DELAY_SECONDS = 60.0
     MAX_JITTER_SECONDS = 0.5
     REQUEST_TIMEOUT_SECONDS = 30
+    # Tiny occasionally returns spurious 400s; retry once after a short pause
+    # rather than dropping data. Real validation errors will still fail on
+    # the second attempt.
+    BAD_REQUEST_MAX_RETRIES = 1
+    BAD_REQUEST_RETRY_DELAY_SECONDS = 1.0
 
     def __init__(
         self,
@@ -104,12 +109,14 @@ class TinyAPIClient:
         """Run the full pipeline (rate limit → token → send → retry/backoff)."""
         url = f"{self.BASE_URL}{path}"
         attempt = 0
+        bad_request_attempts = 0
         token_already_refreshed = False
+        caller_headers = dict(kwargs.pop("headers", {}) or {})
 
         while True:
             await self._rate_limiter.wait_if_needed()
             access_token = await self._tokens.get_valid_access_token()
-            headers = dict(kwargs.pop("headers", {}) or {})
+            headers = dict(caller_headers)
             headers["Authorization"] = f"Bearer {access_token}"
 
             logger.debug("Tiny API request starting", method=method, path=path)
@@ -242,6 +249,35 @@ class TinyAPIClient:
                 )
                 await asyncio.sleep(wait_time)
                 continue
+
+            # ------------------------------------------------------------------
+            # 400 — Tiny occasionally returns transient 400s. Always log the
+            # body (so a real validation error stays diagnosable) and retry
+            # once after a short pause before giving up.
+            # ------------------------------------------------------------------
+            if status == 400:
+                body_preview = response.text[:500]
+                logger.warning(
+                    "Received 400 from Tiny API",
+                    method=method,
+                    path=path,
+                    attempt=bad_request_attempts + 1,
+                    response_body_preview=body_preview,
+                )
+                if bad_request_attempts < self.BAD_REQUEST_MAX_RETRIES:
+                    bad_request_attempts += 1
+                    await asyncio.sleep(self.BAD_REQUEST_RETRY_DELAY_SECONDS)
+                    continue
+                logger.error(
+                    "Tiny API returned 400 after retry",
+                    path=path,
+                    response_body_preview=body_preview,
+                )
+                raise TinyAPIException(
+                    f"Client error from Tiny API: {status}",
+                    status_code=status,
+                    response_body=body_preview,
+                )
 
             # ------------------------------------------------------------------
             # Other 4xx / 5xx — surface to caller
