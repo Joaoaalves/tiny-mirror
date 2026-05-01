@@ -28,7 +28,8 @@ class Settings(BaseSettings):
 
     tiny_client_id: str
     tiny_client_secret: str
-    tiny_redirect_uri: str
+    tiny_access_token: str
+    tiny_refresh_token: str
 
     app_host: str = "0.0.0.0"
     app_port: int = 8000
