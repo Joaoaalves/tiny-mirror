@@ -1,11 +1,14 @@
 # systemd unit for tiny-mirror.
 #
-# Install with:
-#   sudo cp tiny-mirror.service /etc/systemd/system/tiny-mirror.service
+# Install once on the VPS:
+#   sudo cp /opt/tiny-mirror/current/tiny-mirror.service \
+#       /etc/systemd/system/tiny-mirror.service
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now tiny-mirror
+#   sudo systemctl enable tiny-mirror
+#   sudo systemctl start tiny-mirror
 #
-# Adjust User, WorkingDirectory and EnvironmentFile to match the deploy host.
+# Subsequent restarts are handled by the CI/CD pipeline (see
+# .github/workflows/deploy.yml).
 
 [Unit]
 Description=tiny-mirror — Tiny ERP local mirror
@@ -13,22 +16,32 @@ After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
-Type=simple
-User=tiny-mirror
-Group=tiny-mirror
-WorkingDirectory=/opt/tiny-mirror
+Type=exec
+User=tinymirror
+Group=tinymirror
+WorkingDirectory=/opt/tiny-mirror/current
 EnvironmentFile=/opt/tiny-mirror/.env
-ExecStart=/opt/tiny-mirror/.venv/bin/gunicorn \
+
+# IMPORTANT: workers MUST stay at 1.
+# tiny-mirror runs an in-process scheduler (APScheduler), an in-process
+# RabbitMQ consumer set and a single OAuth token rotation flow. Multiple
+# workers would duplicate every cron firing, double-process every queue
+# message, and race on the token-rotation lock. Scale horizontally with
+# multiple machines + a load balancer, never with workers > 1.
+ExecStart=/opt/tiny-mirror/current/.venv/bin/uvicorn \
     src.tiny_mirror.main:app \
-    --workers 2 \
-    --worker-class uvicorn.workers.UvicornWorker \
-    --bind 0.0.0.0:8000 \
-    --access-logfile - \
-    --error-logfile - \
-    --timeout 60 \
-    --graceful-timeout 30
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 1 \
+    --log-level warning
+
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+
 Restart=on-failure
 RestartSec=5s
+StartLimitIntervalSec=60
+StartLimitBurst=3
 KillMode=mixed
 TimeoutStopSec=30
 
