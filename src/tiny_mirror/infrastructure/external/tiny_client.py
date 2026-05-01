@@ -37,11 +37,11 @@ class TinyAPIClient:
     MAX_DELAY_SECONDS = 60.0
     MAX_JITTER_SECONDS = 0.5
     REQUEST_TIMEOUT_SECONDS = 30
-    # Tiny occasionally returns spurious 400s; retry once after a short pause
-    # rather than dropping data. Real validation errors will still fail on
-    # the second attempt.
-    BAD_REQUEST_MAX_RETRIES = 1
-    BAD_REQUEST_RETRY_DELAY_SECONDS = 1.0
+    # Tiny v3 is unreliable: it returns spurious 400s, 5xx and times out
+    # under load. Treat these as transient and retry with exponential
+    # backoff up to the same budget as 429. Genuine validation errors
+    # will still fail on the last attempt and surface to the caller.
+    TRANSIENT_STATUS_CODES = frozenset({400, 408, 425, 500, 502, 503, 504})
 
     def __init__(
         self,
@@ -106,10 +106,15 @@ class TinyAPIClient:
     # Internal: request pipeline
     # ------------------------------------------------------------------
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        """Run the full pipeline (rate limit → token → send → retry/backoff)."""
+        """Run the full pipeline (rate limit → token → send → retry/backoff).
+
+        Retries are unified: any transient outcome — connection error,
+        timeout, 429, or any code in :attr:`TRANSIENT_STATUS_CODES` —
+        consumes one attempt from the same ``MAX_RETRIES`` budget and
+        backs off with exponential delay + jitter.
+        """
         url = f"{self.BASE_URL}{path}"
         attempt = 0
-        bad_request_attempts = 0
         token_already_refreshed = False
         caller_headers = dict(kwargs.pop("headers", {}) or {})
 
@@ -119,7 +124,13 @@ class TinyAPIClient:
             headers = dict(caller_headers)
             headers["Authorization"] = f"Bearer {access_token}"
 
-            logger.debug("Tiny API request starting", method=method, path=path)
+            logger.debug(
+                "Tiny API request starting",
+                method=method,
+                path=path,
+                attempt=attempt + 1,
+                max_attempts=self.MAX_RETRIES + 1,
+            )
             start = time.perf_counter()
 
             try:
@@ -131,18 +142,48 @@ class TinyAPIClient:
                     **kwargs,
                 )
             except httpx.TimeoutException as exc:
+                if attempt < self.MAX_RETRIES:
+                    attempt += 1
+                    wait_time = self._backoff_seconds(attempt)
+                    logger.warning(
+                        "Tiny API request timed out, retrying after backoff",
+                        method=method,
+                        path=path,
+                        attempt=attempt,
+                        max_retries=self.MAX_RETRIES,
+                        wait_seconds=round(wait_time, 2),
+                        timeout_seconds=self.REQUEST_TIMEOUT_SECONDS,
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
                 logger.error(
-                    "Request to Tiny API timed out",
+                    "Request to Tiny API timed out after retries",
                     method=method,
                     path=path,
+                    attempts=attempt + 1,
                     timeout_seconds=self.REQUEST_TIMEOUT_SECONDS,
                 )
                 raise TinyAPIException("Request timed out") from exc
             except (httpx.ConnectError, httpx.NetworkError) as exc:
+                if attempt < self.MAX_RETRIES:
+                    attempt += 1
+                    wait_time = self._backoff_seconds(attempt)
+                    logger.warning(
+                        "Network error to Tiny API, retrying after backoff",
+                        method=method,
+                        path=path,
+                        attempt=attempt,
+                        max_retries=self.MAX_RETRIES,
+                        wait_seconds=round(wait_time, 2),
+                        error_message=str(exc),
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
                 logger.error(
-                    "Network error connecting to Tiny API",
+                    "Network error connecting to Tiny API after retries",
                     method=method,
                     path=path,
+                    attempts=attempt + 1,
                     error_message=str(exc),
                 )
                 raise TinyAPIException(f"Network error: {exc}") from exc
@@ -155,6 +196,7 @@ class TinyAPIClient:
                 path=path,
                 status_code=response.status_code,
                 duration_ms=duration_ms,
+                attempt=attempt + 1,
             )
 
             status = response.status_code
@@ -173,7 +215,7 @@ class TinyAPIClient:
                     ) from exc
 
             # ------------------------------------------------------------------
-            # 401 — refresh once, retry once
+            # 401 — refresh once, retry once (does not count against budget)
             # ------------------------------------------------------------------
             if status == 401:
                 if token_already_refreshed:
@@ -189,7 +231,6 @@ class TinyAPIClient:
                 )
                 await self._tokens.handle_unauthorized()
                 token_already_refreshed = True
-                # Loop again WITHOUT counting against the 429 retry budget.
                 continue
 
             # ------------------------------------------------------------------
@@ -211,81 +252,87 @@ class TinyAPIClient:
                     response_body=response.text[:500],
                 )
 
-            # ------------------------------------------------------------------
-            # 429 — rate-limit hit, exponential backoff with jitter
-            # ------------------------------------------------------------------
-            if status == 429:
-                attempt += 1
-                if attempt >= self.MAX_RETRIES:
-                    reset_seconds = response.headers.get("X-RateLimit-Reset") or (
-                        response.headers.get("x-ratelimit-reset")
-                    )
-                    retry_after: int | None
-                    try:
-                        retry_after = int(reset_seconds) if reset_seconds else None
-                    except (TypeError, ValueError):
-                        retry_after = None
-                    logger.error(
-                        "Rate limit exceeded after retries",
-                        path=path,
-                        max_retries=self.MAX_RETRIES,
-                    )
-                    raise RateLimitException(
-                        f"Rate limit exceeded after {self.MAX_RETRIES} retries",
-                        status_code=status,
-                        response_body=response.text[:500],
-                        retry_after_seconds=retry_after,
-                    )
-                wait_time = min(
-                    self.BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
-                    self.MAX_DELAY_SECONDS,
-                ) + random.uniform(0, self.MAX_JITTER_SECONDS)
-                logger.warning(
-                    "Rate limit hit, retrying after backoff",
-                    path=path,
-                    attempt=attempt,
-                    max_retries=self.MAX_RETRIES,
-                    wait_seconds=round(wait_time, 2),
-                )
-                await asyncio.sleep(wait_time)
-                continue
+            body_preview = response.text[:500]
 
             # ------------------------------------------------------------------
-            # 400 — Tiny occasionally returns transient 400s. Always log the
-            # body (so a real validation error stays diagnosable) and retry
-            # once after a short pause before giving up.
+            # 429 — rate-limit hit
             # ------------------------------------------------------------------
-            if status == 400:
-                body_preview = response.text[:500]
-                logger.warning(
-                    "Received 400 from Tiny API",
+            if status == 429:
+                if attempt < self.MAX_RETRIES:
+                    attempt += 1
+                    wait_time = self._backoff_seconds(attempt)
+                    logger.warning(
+                        "Rate limit hit, retrying after backoff",
+                        method=method,
+                        path=path,
+                        attempt=attempt,
+                        max_retries=self.MAX_RETRIES,
+                        wait_seconds=round(wait_time, 2),
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+                reset_seconds = response.headers.get("X-RateLimit-Reset") or (
+                    response.headers.get("x-ratelimit-reset")
+                )
+                retry_after: int | None
+                try:
+                    retry_after = int(reset_seconds) if reset_seconds else None
+                except (TypeError, ValueError):
+                    retry_after = None
+                logger.error(
+                    "Rate limit exceeded after retries",
                     method=method,
                     path=path,
-                    attempt=bad_request_attempts + 1,
-                    response_body_preview=body_preview,
+                    attempts=attempt + 1,
+                    max_retries=self.MAX_RETRIES,
                 )
-                if bad_request_attempts < self.BAD_REQUEST_MAX_RETRIES:
-                    bad_request_attempts += 1
-                    await asyncio.sleep(self.BAD_REQUEST_RETRY_DELAY_SECONDS)
+                raise RateLimitException(
+                    f"Rate limit exceeded after {self.MAX_RETRIES} retries",
+                    status_code=status,
+                    response_body=body_preview,
+                    retry_after_seconds=retry_after,
+                )
+
+            # ------------------------------------------------------------------
+            # Transient 4xx (400/408/425) and 5xx — same retry budget as 429
+            # ------------------------------------------------------------------
+            if status in self.TRANSIENT_STATUS_CODES:
+                if attempt < self.MAX_RETRIES:
+                    attempt += 1
+                    wait_time = self._backoff_seconds(attempt)
+                    logger.warning(
+                        "Transient error from Tiny API, retrying after backoff",
+                        method=method,
+                        path=path,
+                        status_code=status,
+                        attempt=attempt,
+                        max_retries=self.MAX_RETRIES,
+                        wait_seconds=round(wait_time, 2),
+                        response_body_preview=body_preview,
+                    )
+                    await asyncio.sleep(wait_time)
                     continue
                 logger.error(
-                    "Tiny API returned 400 after retry",
+                    "Transient error from Tiny API after retries",
+                    method=method,
                     path=path,
+                    status_code=status,
+                    attempts=attempt + 1,
                     response_body_preview=body_preview,
                 )
                 raise TinyAPIException(
-                    f"Client error from Tiny API: {status}",
+                    f"Tiny API error after {self.MAX_RETRIES} retries: {status}",
                     status_code=status,
                     response_body=body_preview,
                 )
 
             # ------------------------------------------------------------------
-            # Other 4xx / 5xx — surface to caller
+            # Other 4xx — surface to caller
             # ------------------------------------------------------------------
-            body_preview = response.text[:500]
             if 400 <= status < 500:
                 logger.error(
                     "Client error from Tiny API",
+                    method=method,
                     path=path,
                     status_code=status,
                     response_body_preview=body_preview,
@@ -298,6 +345,7 @@ class TinyAPIClient:
 
             logger.error(
                 "Server error from Tiny API",
+                method=method,
                 path=path,
                 status_code=status,
                 response_body_preview=body_preview,
@@ -307,6 +355,13 @@ class TinyAPIClient:
                 status_code=status,
                 response_body=body_preview,
             )
+
+    def _backoff_seconds(self, attempt: int) -> float:
+        base: float = min(
+            self.BASE_DELAY_SECONDS * (2 ** (attempt - 1)),
+            self.MAX_DELAY_SECONDS,
+        )
+        return base + random.uniform(0, self.MAX_JITTER_SECONDS)
 
 
 # ---------------------------------------------------------------------------

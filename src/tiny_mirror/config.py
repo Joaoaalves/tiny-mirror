@@ -40,6 +40,11 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Optional Seq sink. Empty url disables shipping; the stdout handler
+    # remains active either way.
+    seq_url: str = ""
+    seq_api_key: str = ""
+
     sync_products_cron: str = "0 2 * * *"
     sync_orders_cron: str = "0 * * * *"
     sync_stock_cron: str = "0 3 * * *"

@@ -12,6 +12,9 @@ import sys
 
 import structlog
 
+from tiny_mirror.config import settings
+from tiny_mirror.observability.seq_handler import SeqHandler
+
 
 def configure_logging(log_level: str) -> None:
     """Configure structlog and the stdlib logging module.
@@ -20,6 +23,10 @@ def configure_logging(log_level: str) -> None:
     name/timestamp/exception info, and renders everything as a single JSON
     object per log entry. Third-party loggers (SQLAlchemy, httpx, uvicorn,
     aio_pika) are routed through structlog so they share the same format.
+
+    When ``settings.seq_url`` is set, a parallel :class:`SeqHandler` ships
+    every event to the Seq server in CLEF format; stdout remains the
+    primary local sink.
     """
 
     level = getattr(logging, log_level.upper(), logging.INFO)
@@ -44,13 +51,22 @@ def configure_logging(log_level: str) -> None:
         ],
     )
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
-    root_logger.addHandler(handler)
+    root_logger.addHandler(stream_handler)
     root_logger.setLevel(level)
+
+    if settings.seq_url:
+        seq_handler = SeqHandler(
+            server_url=settings.seq_url,
+            api_key=settings.seq_api_key or None,
+        )
+        seq_handler.setFormatter(formatter)
+        seq_handler.setLevel(level)
+        root_logger.addHandler(seq_handler)
 
     structlog.configure(
         processors=[
@@ -68,4 +84,7 @@ def configure_logging(log_level: str) -> None:
         cache_logger_on_first_use=True,
     )
 
-    structlog.contextvars.bind_contextvars(service="tiny-mirror")
+    structlog.contextvars.bind_contextvars(
+        service="tiny-mirror",
+        env=settings.app_env,
+    )

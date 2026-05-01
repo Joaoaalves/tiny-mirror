@@ -175,19 +175,23 @@ async def test_request_429_max_retries_raises_rate_limit_exception(
     with pytest.raises(RateLimitException) as excinfo:
         await client._request("GET", "/produtos")
 
-    assert mock_http_client.request.await_count == TinyAPIClient.MAX_RETRIES
+    # Original attempt + MAX_RETRIES retries = MAX_RETRIES + 1 calls total.
+    assert mock_http_client.request.await_count == TinyAPIClient.MAX_RETRIES + 1
     assert excinfo.value.status_code == 429
     assert excinfo.value.retry_after_seconds == 60
 
 
 # ---------------------------------------------------------------------------
-# 400 retry (Tiny flake) and 404 / 5xx
+# Transient retries (400 / 408 / 500 / 502 / 503 / 504) and 404
 # ---------------------------------------------------------------------------
-async def test_request_400_retried_once_then_raises(
+async def test_request_400_retried_with_full_budget_then_raises(
     client: TinyAPIClient,
     mock_http_client: AsyncMock,
     make_response,
 ) -> None:
+    """Tiny is flaky — 400 is treated as transient and retried up to the
+    same budget as 429.
+    """
     mock_http_client.request = AsyncMock(
         return_value=make_response(400, text='{"erro": "validation"}')
     )
@@ -195,8 +199,7 @@ async def test_request_400_retried_once_then_raises(
     with pytest.raises(TinyAPIException):
         await client._request("GET", "/pedidos", params={"limit": 1})
 
-    # Original + one retry per stage_04 spec.
-    assert mock_http_client.request.await_count == 1 + TinyAPIClient.BAD_REQUEST_MAX_RETRIES
+    assert mock_http_client.request.await_count == TinyAPIClient.MAX_RETRIES + 1
 
 
 async def test_request_400_then_200_recovers(
@@ -229,16 +232,18 @@ async def test_request_404_raises_not_found_with_resource_metadata(
     assert str(excinfo.value.resource_id) == "12345"
 
 
-async def test_request_500_raises_tiny_api_exception(
+async def test_request_500_retried_with_full_budget_then_raises(
     client: TinyAPIClient,
     mock_http_client: AsyncMock,
     make_response,
 ) -> None:
+    """5xx is transient — same retry budget as 429/400."""
     mock_http_client.request = AsyncMock(return_value=make_response(500, text="server error"))
 
     with pytest.raises(TinyAPIException) as excinfo:
         await client._request("GET", "/produtos")
 
+    assert mock_http_client.request.await_count == TinyAPIClient.MAX_RETRIES + 1
     assert excinfo.value.status_code == 500
 
 
