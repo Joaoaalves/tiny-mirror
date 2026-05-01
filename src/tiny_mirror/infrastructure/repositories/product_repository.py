@@ -23,7 +23,16 @@ class PostgreSQLProductRepository(ProductRepository):
     async def upsert(self, product_data: dict[str, Any]) -> str:
         """Upsert by ``tiny_id`` and use the system column ``xmax`` to detect
         whether the row was inserted (``xmax = 0``) or updated (``xmax != 0``).
+
+        ``parent_product_tiny_id`` is a self-referential FK and Tiny does
+        not guarantee that parents arrive before children during a fan-out
+        sync. Resolve the parent against the table on the way in and write
+        ``NULL`` if it has not landed yet — the next scheduled sync pass
+        will re-link it once the parent exists. The same pattern is used
+        for ``order_items.product_tiny_id``.
         """
+        product_data = await self._resolve_parent_or_null(product_data)
+
         stmt = pg_insert(ProductORM).values(**product_data)
         update_payload = {
             col: stmt.excluded[col] for col in product_data if col not in {"tiny_id", "created_at"}
@@ -40,6 +49,20 @@ class PostgreSQLProductRepository(ProductRepository):
         inserted = result.scalar_one()
         await self._session.commit()
         return "created" if inserted else "updated"
+
+    async def _resolve_parent_or_null(self, product_data: dict[str, Any]) -> dict[str, Any]:
+        parent_id = product_data.get("parent_product_tiny_id")
+        if parent_id is None:
+            return product_data
+        # A product is its own root — never violate the FK with self-reference.
+        if parent_id == product_data.get("tiny_id"):
+            return {**product_data, "parent_product_tiny_id": None}
+        exists = await self._session.scalar(
+            select(ProductORM.tiny_id).where(ProductORM.tiny_id == parent_id)
+        )
+        if exists is None:
+            return {**product_data, "parent_product_tiny_id": None}
+        return product_data
 
     async def get_by_tiny_id(self, tiny_id: int) -> dict[str, Any] | None:
         result = await self._session.execute(

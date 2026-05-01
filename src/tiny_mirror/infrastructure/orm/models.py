@@ -95,7 +95,7 @@ class OAuthTokenORM(Base):
 class ProductORM(Base):
     __tablename__ = "products"
     __table_args__ = (
-        CheckConstraint("type IN ('P', 'S', 'K')", name="valid_type"),
+        CheckConstraint("type IN ('P', 'S', 'K', 'V', 'F')", name="valid_type"),
         CheckConstraint("situation IN ('A', 'I', 'E')", name="valid_situation"),
         Index("ix_products_type", "type"),
         Index("ix_products_situation", "situation"),
