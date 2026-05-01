@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     tiny_client_secret: str
     tiny_access_token: str
     tiny_refresh_token: str
+    # Optional: when set, webhook handlers reject payloads whose `cnpj`
+    # field does not match. Leave empty to accept any cnpj (still logged).
+    tiny_expected_cnpj: str = ""
 
     app_host: str = "0.0.0.0"
     app_port: int = 8000

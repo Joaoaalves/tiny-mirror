@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class _Base(BaseModel):
@@ -206,3 +206,61 @@ class HealthResponse(_Base):
     version: str
     environment: str
     components: dict[str, str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Webhooks (Tiny -> tiny-mirror)
+# ---------------------------------------------------------------------------
+class _WebhookBase(BaseModel):
+    """Base for webhook payloads — accepts both alias (Tiny camelCase) and
+    snake_case so tests / consumers can build payloads either way.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class OrderWebhookData(_WebhookBase):
+    id_pedido_ecommerce: str = Field(alias="idPedidoEcommerce")
+    id_venda_tiny: int = Field(alias="idVendaTiny")
+    situacao: str
+    descricao_situacao: str = Field(alias="descricaoSituacao")
+
+
+class OrderWebhookPayload(_WebhookBase):
+    cnpj: str
+    id_ecommerce: str | int = Field(alias="idEcommerce")
+    tipo: str
+    versao: str
+    dados: OrderWebhookData
+
+
+class StockWebhookData(_WebhookBase):
+    tipo_estoque: str = Field(alias="tipoEstoque")
+    saldo: float
+    id_produto: int = Field(alias="idProduto")
+    sku: str
+    sku_mapeamento: str | None = Field(default=None, alias="skuMapeamento")
+    sku_mapeamento_pai: str | None = Field(default=None, alias="skuMapeamentoPai")
+
+    @field_validator("tipo_estoque")
+    @classmethod
+    def _validate_tipo_estoque(cls, value: str) -> str:
+        if value not in ("F", "D"):
+            raise ValueError(
+                f"tipoEstoque must be 'F' (Físico) or 'D' (Disponível); got {value!r}"
+            )
+        return value
+
+
+class StockWebhookPayload(_WebhookBase):
+    cnpj: str
+    id_ecommerce: str | int = Field(alias="idEcommerce")
+    tipo: str
+    versao: str
+    dados: StockWebhookData
+
+
+class WebhookAck(_Base):
+    """Stable response shape for every webhook endpoint."""
+
+    status: str
