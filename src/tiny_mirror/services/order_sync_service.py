@@ -308,7 +308,7 @@ class OrderSyncService:
         return [oid for oid in candidate_ids if oid not in existing]
 
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
-        from sqlalchemy import select, update
+        from sqlalchemy import update
 
         from tiny_mirror.infrastructure.orm.models import SyncLogORM
 
@@ -324,3 +324,7 @@ class OrderSyncService:
                 .values(sync_metadata=metadata)
             )
             await session.commit()
+            # Edge case: when no items were enqueued (e.g. every Tiny page
+            # row was already in the DB), the per-item finalizer never runs.
+            # Try to close the row right after the fan-out.
+            await SyncLogRepository(session).try_finalize(sync_log_id)

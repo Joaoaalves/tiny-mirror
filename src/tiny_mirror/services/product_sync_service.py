@@ -189,3 +189,5 @@ class ProductSyncService:
                 .values(sync_metadata=metadata)
             )
             await session.commit()
+            # Close immediately if nothing was enqueued (no consumer will run).
+            await SyncLogRepository(session).try_finalize(sync_log_id)
