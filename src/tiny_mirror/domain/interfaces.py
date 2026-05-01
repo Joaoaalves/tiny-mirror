@@ -63,3 +63,41 @@ class ProductRepository(abc.ABC):
         self, kit_tiny_id: int
     ) -> list[dict[str, Any]]:
         """Return the components of a kit, in insertion order."""
+
+
+class OrderRepository(abc.ABC):
+    """Persistence contract for orders and their line items."""
+
+    @abc.abstractmethod
+    async def upsert(self, order_data: dict[str, Any]) -> str:
+        """Insert or update an order row. Returns ``"created"`` or ``"updated"``."""
+
+    @abc.abstractmethod
+    async def upsert_items(
+        self, order_tiny_id: int, items: list[dict[str, Any]]
+    ) -> None:
+        """Replace every line item of an order atomically (DELETE + bulk INSERT)."""
+
+    @abc.abstractmethod
+    async def get_by_tiny_id(self, tiny_id: int) -> dict[str, Any] | None:
+        """Return the order with its items as a nested ``items`` field."""
+
+    @abc.abstractmethod
+    async def get_recent_product_tiny_ids(self, hours: int) -> list[int]:
+        """Return DISTINCT product tiny ids from items of orders updated in
+        the last ``hours`` hours. Used to fan out incremental stock sync.
+        """
+
+    @abc.abstractmethod
+    async def exists(self, tiny_id: int) -> bool:
+        """Return whether an order row with the given tiny id is in the DB."""
+
+    @abc.abstractmethod
+    async def count(self) -> int:
+        """Return the number of orders currently stored."""
+
+    @abc.abstractmethod
+    async def get_orders_in_period(
+        self, date_from: Any, date_to: Any
+    ) -> list[dict[str, Any]]:
+        """Return orders (with items) whose ``order_date`` falls in the range."""
