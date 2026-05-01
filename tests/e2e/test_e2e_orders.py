@@ -177,20 +177,18 @@ async def test_process_order_item_is_idempotent(
     ), "second sync must replace items, not duplicate them"
 
 
-async def test_run_incremental_sync_publishes_orders_stock_and_buckets(
+async def test_run_incremental_sync_publishes_orders_and_buckets(
     live_tiny_client: TinyAPIClient,
     live_rabbitmq: QueuePublisher,
     e2e_order_id: int,
 ) -> None:
-    """Sanity-check the full incremental fan-out: orders.item per recent
-    order, stock.item per recent product, and exactly one buckets.refresh.
-
-    We seed the DB with one persisted order so get_recent_product_tiny_ids
-    has something to return (the test_process_order_item_persists_order_and_items
-    test would already do that, but tests should not depend on order).
+    """Sanity-check the incremental fan-out: orders.item per recent order
+    that we have not synced yet, and exactly one buckets.refresh. Stock
+    is intentionally NOT fanned out — the daily stock cron is the single
+    owner of stock freshness.
     """
-    # Seed: persist the pinned order so the incremental fan-out has at least
-    # one product to refresh stock for.
+    # Seed: persist the pinned order so the incremental run has something
+    # to skip (filter_new_order_ids must filter it out).
     seeder = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     async with AsyncSessionLocal() as session:
         seed_log_id = await SyncLogRepository(session).create_sync_log("orders")
@@ -198,9 +196,8 @@ async def test_run_incremental_sync_publishes_orders_stock_and_buckets(
 
     channel = get_channel()
     orders_q = await channel.get_queue("tiny.sync.orders.item")
-    stock_q = await channel.get_queue("tiny.sync.stock.item")
     buckets_q = await channel.get_queue("tiny.sync.buckets.refresh")
-    for q in (orders_q, stock_q, buckets_q):
+    for q in (orders_q, buckets_q):
         while True:
             leftover = await q.get(no_ack=True, fail=False)
             if leftover is None:
@@ -235,16 +232,6 @@ async def test_run_incremental_sync_publishes_orders_stock_and_buckets(
     assert buckets_msg is not None, "expected exactly one buckets.refresh message"
     extra = await buckets_q.get(no_ack=True, fail=False)
     assert extra is None, "expected exactly one buckets.refresh message"
-
-    # stock.item: at least one (the seeded order's product, if products
-    # already had it synced; otherwise 0 because product_tiny_id is NULL).
-    drained_stock = 0
-    while True:
-        msg = await stock_q.get(no_ack=True, fail=False)
-        if msg is None:
-            break
-        drained_stock += 1
-    assert drained_stock >= 0  # always true; documents intent
 
 
 async def test_run_historical_sync_emits_one_window_message_per_7_days(

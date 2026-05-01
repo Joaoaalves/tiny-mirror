@@ -47,12 +47,10 @@ class OrderWebhookConsumer(BaseConsumer):
         channel: AbstractChannel,
         queue_publisher: QueuePublisher,
         order_sync_service: OrderSyncService,
-        stock_sync_service: StockSyncService,
         sale_bucket_service: SaleBucketService,
     ) -> None:
         super().__init__(channel, queue_publisher)
         self._orders = order_sync_service
-        self._stock = stock_sync_service
         self._buckets = sale_bucket_service
 
     async def handle(self, message_body: dict[str, Any]) -> None:
@@ -82,25 +80,11 @@ class OrderWebhookConsumer(BaseConsumer):
 
         items = persisted.get("items", []) or []
 
-        # Fan out an incremental stock refresh for every product touched by
-        # the order. NULL product_tiny_id means we never synced that product
-        # — skip; the daily sync will pick it up.
-        product_ids = {
-            int(item["product_tiny_id"])
-            for item in items
-            if item.get("product_tiny_id") is not None
-        }
-        for pid in product_ids:
-            await self._publisher.publish_sync_message(
-                "stock.item",
-                {
-                    "product_tiny_id": pid,
-                    "sync_log_id": None,
-                    "published_at": datetime.now(UTC).isoformat(),
-                },
-            )
-
         # Recompute the day's sale buckets so analytics catch the change.
+        # Stock is intentionally NOT refreshed here — webhooks are not
+        # reliable enough to be the source of truth, and a per-order
+        # fan-out floods the queue. The daily stock cron is the single
+        # source of truth.
         order_date = persisted["order_date"]
         await self._publisher.publish_sync_message(
             "buckets.refresh",
@@ -117,7 +101,6 @@ class OrderWebhookConsumer(BaseConsumer):
             order_tiny_id=order_tiny_id,
             order_number=persisted.get("order_number"),
             items_count=len(items),
-            stock_products_queued=len(product_ids),
         )
 
 

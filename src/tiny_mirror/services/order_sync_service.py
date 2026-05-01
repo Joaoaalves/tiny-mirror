@@ -63,23 +63,8 @@ class OrderSyncService:
             updated_after=lookback_dt,
         )
 
-        # Fan out an incremental stock refresh for every product touched.
-        async with AsyncSessionLocal() as session:
-            product_ids = await PostgreSQLOrderRepository(session).get_recent_product_tiny_ids(
-                hours=INCREMENTAL_LOOKBACK_HOURS
-            )
-
-        for product_id in product_ids:
-            await self._publisher.publish_sync_message(
-                "stock.item",
-                {
-                    "product_tiny_id": int(product_id),
-                    "sync_log_id": sync_log_id,
-                    "published_at": datetime.now(UTC).isoformat(),
-                },
-            )
-
-        # Trigger a sale-bucket refresh covering the same window.
+        # Trigger a sale-bucket refresh covering the same window. Stock is
+        # not refreshed here — the daily stock cron is the single owner.
         date_from = (datetime.now(UTC) - timedelta(hours=INCREMENTAL_LOOKBACK_HOURS)).date()
         date_to = datetime.now(UTC).date()
         await self._publisher.publish_sync_message(
@@ -98,7 +83,6 @@ class OrderSyncService:
             "Incremental order sync completed",
             sync_log_id=sync_log_id,
             total_published=total_published,
-            stock_products_queued=len(product_ids),
         )
 
     # ------------------------------------------------------------------

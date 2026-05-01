@@ -89,12 +89,6 @@ class OrderRepository(abc.ABC):
         """Return the order with its items as a nested ``items`` field."""
 
     @abc.abstractmethod
-    async def get_recent_product_tiny_ids(self, hours: int) -> list[int]:
-        """Return DISTINCT product tiny ids from items of orders updated in
-        the last ``hours`` hours. Used to fan out incremental stock sync.
-        """
-
-    @abc.abstractmethod
     async def exists(self, tiny_id: int) -> bool:
         """Return whether an order row with the given tiny id is in the DB."""
 

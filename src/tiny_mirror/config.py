@@ -47,12 +47,12 @@ class Settings(BaseSettings):
 
     sync_products_cron: str = "0 2 * * *"
     sync_orders_cron: str = "0 * * * *"
-    # Stock full sync runs weekly (Sunday 03:00 UTC) as a safety net only.
-    # Day-to-day stock freshness comes from Tiny order webhooks: every order
-    # webhook fans out a stock.item refresh per product touched by the order
-    # (see OrderWebhookConsumer). A daily full pass for 537 active products
-    # is wasteful when stock only changes after a sale.
-    sync_stock_cron: str = "0 3 * * 0"
+    # Stock full sync runs daily (03:00 UTC). Stock is refreshed only here
+    # — neither order webhooks nor the hourly order cron fan out per-product
+    # stock refreshes anymore. Tiny order webhooks are too unreliable to
+    # depend on for stock freshness, and the per-product fan-out flooded
+    # the queue under the 60 req/min budget.
+    sync_stock_cron: str = "0 3 * * *"
     sync_buckets_cron: str = "0 4 * * *"
     token_rotation_cron: str = "0 */2 * * *"
 

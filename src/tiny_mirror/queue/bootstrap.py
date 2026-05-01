@@ -59,7 +59,7 @@ async def start_consumers(
         StockFullSyncConsumer(channel, queue_publisher, stock_sync),
         StockItemConsumer(channel, queue_publisher, stock_sync),
         BucketRefreshConsumer(channel, queue_publisher, sale_buckets),
-        OrderWebhookConsumer(channel, queue_publisher, order_sync, stock_sync, sale_buckets),
+        OrderWebhookConsumer(channel, queue_publisher, order_sync, sale_buckets),
         StockWebhookConsumer(channel, queue_publisher, stock_sync),
     ]
     for consumer in consumers:

@@ -5,8 +5,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, literal_column, select, text
-from sqlalchemy import exists as sa_exists
+from sqlalchemy import delete, func, literal_column, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -99,24 +98,6 @@ class PostgreSQLOrderRepository(OrderRepository):
         )
         order_dict["items"] = [_row_to_dict(item) for item in items_result.scalars().all()]
         return order_dict
-
-    async def get_recent_product_tiny_ids(self, hours: int) -> list[int]:
-        # DISTINCT product_tiny_id from order_items joined to orders updated
-        # within the lookback. Used to fan out incremental stock refresh.
-        cutoff = func.now() - text(f"INTERVAL '{int(hours)} hours'")
-        stmt = (
-            select(OrderItemORM.product_tiny_id)
-            .where(OrderItemORM.product_tiny_id.is_not(None))
-            .where(
-                sa_exists().where(
-                    (OrderORM.tiny_id == OrderItemORM.order_tiny_id)
-                    & (OrderORM.updated_at >= cutoff)
-                )
-            )
-            .distinct()
-        )
-        result = await self._session.execute(stmt)
-        return [int(row[0]) for row in result.all() if row[0] is not None]
 
     async def exists(self, tiny_id: int) -> bool:
         result = await self._session.execute(

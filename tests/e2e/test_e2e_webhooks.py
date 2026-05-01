@@ -316,25 +316,21 @@ async def test_order_webhook_consumer_handles_real_order_id(
     e2e_order_id: int,
 ) -> None:
     """End-to-end consumer flow with a real Tiny order id: the consumer
-    must persist the order, fan out one stock.item per product, and emit
-    exactly one buckets.refresh for the order's date.
+    must persist the order and emit exactly one buckets.refresh for the
+    order's date. Stock fan-out is intentionally NOT done here — the
+    daily stock cron is the single owner of stock freshness.
     """
     channel = get_channel()
-    stock_q = await channel.get_queue("tiny.sync.stock.item")
     buckets_q = await channel.get_queue("tiny.sync.buckets.refresh")
-    for q in (stock_q, buckets_q):
-        while True:
-            leftover = await q.get(no_ack=True, fail=False)
-            if leftover is None:
-                break
+    while True:
+        leftover = await buckets_q.get(no_ack=True, fail=False)
+        if leftover is None:
+            break
 
     consumer = OrderWebhookConsumer(
         channel=channel,
         queue_publisher=live_rabbitmq,
         order_sync_service=OrderSyncService(
-            tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-        ),
-        stock_sync_service=StockSyncService(
             tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
         ),
         sale_bucket_service=SaleBucketService(),
@@ -450,9 +446,6 @@ async def test_order_webhook_handle_is_idempotent(
         channel=get_channel(),
         queue_publisher=live_rabbitmq,
         order_sync_service=OrderSyncService(
-            tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
-        ),
-        stock_sync_service=StockSyncService(
             tiny_client=live_tiny_client, queue_publisher=live_rabbitmq
         ),
         sale_bucket_service=SaleBucketService(),
