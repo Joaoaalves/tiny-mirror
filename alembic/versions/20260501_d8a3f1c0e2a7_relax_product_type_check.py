@@ -23,18 +23,21 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.drop_constraint("ck_products_valid_type", "products", type_="check")
+    # The naming convention "ck_%(table_name)s_%(constraint_name)s" prefixes
+    # the short name automatically; pass the bare suffix to avoid the
+    # double-prefix that broke the previous deploy attempt.
+    op.drop_constraint("valid_type", "products", type_="check")
     op.create_check_constraint(
-        "ck_products_valid_type",
+        "valid_type",
         "products",
         "type IN ('P', 'S', 'K', 'V', 'F')",
     )
 
 
 def downgrade() -> None:
-    op.drop_constraint("ck_products_valid_type", "products", type_="check")
+    op.drop_constraint("valid_type", "products", type_="check")
     op.create_check_constraint(
-        "ck_products_valid_type",
+        "valid_type",
         "products",
         "type IN ('P', 'S', 'K')",
     )
