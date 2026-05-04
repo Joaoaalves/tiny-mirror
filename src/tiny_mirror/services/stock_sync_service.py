@@ -6,6 +6,13 @@ happens in :meth:`process_stock_item`. Webhook-driven updates use the
 same :meth:`process_stock_item` with ``sync_log_id=None`` (the sync_log
 counters are no-ops in that case).
 
+When an :class:`MercadoLivreAPIClient` is wired in, every per-product
+call also pulls the SKU's Full ML stock straight from the ML API and
+overwrites the (unreliable) Tiny "Full Mercado Livre" deposit row in
+``stock_deposits``. Both sources land atomically in the same upsert,
+so the coverage query just reads ``stock_deposits`` without special
+casing.
+
 Each method opens its own ``AsyncSession`` so the service is safe to
 share between long-lived consumer contexts.
 """
@@ -13,11 +20,13 @@ share between long-lived consumer contexts.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
+from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.repositories.product_repository import (
     PostgreSQLProductRepository,
@@ -33,15 +42,27 @@ from tiny_mirror.queue.publisher import QueuePublisher
 
 logger = structlog.get_logger(__name__)
 
+# Deposit name we use to mark the ML-API-sourced Full ML row so it can be
+# distinguished from the (unreliable) Tiny "Full Mercado Livre" deposit.
+# Matching is by name — if Tiny already returns a row with this name we
+# overwrite its values; otherwise we append a synthetic row.
+ML_FULL_DEPOSIT_NAME = "Full Mercado Livre"
+# Sentinel deposit_tiny_id used when we have to append a synthetic row
+# because Tiny did not return a "Full Mercado Livre" deposit at all.
+# Real Tiny deposit IDs are positive — 0 is safe as a sentinel.
+ML_FULL_DEPOSIT_SENTINEL_ID = 0
+
 
 class StockSyncService:
     def __init__(
         self,
         tiny_client: TinyAPIClient,
         queue_publisher: QueuePublisher,
+        ml_client: MercadoLivreAPIClient | None = None,
     ) -> None:
         self._tiny = tiny_client
         self._publisher = queue_publisher
+        self._ml = ml_client
 
     # ------------------------------------------------------------------
     # Daily entry point — fan-out for every active product
@@ -122,6 +143,15 @@ class StockSyncService:
         stock_data = StockMapper.from_tiny_api(raw)
         deposits = StockMapper.extract_deposits(raw)
 
+        # Optionally pull Full ML stock straight from ML API and overlay it
+        # onto the deposits list, replacing the unreliable Tiny row. None
+        # means "we don't know" (skip mutation); 0 means "ML has no stock".
+        sku = stock_data.get("sku") or ""
+        if self._ml is not None and sku:
+            ml_qty = await self._fetch_ml_full_qty(sku)
+            if ml_qty is not None:
+                _overlay_ml_full_deposit(deposits, ml_qty)
+
         async with AsyncSessionLocal() as session:
             # Stock rows have a FK -> products.tiny_id (CASCADE on delete).
             # If the product has not been mirrored yet, the FK insert would
@@ -179,6 +209,49 @@ class StockSyncService:
         )
 
     # ------------------------------------------------------------------
+    # ML helper — sums fulfillment available_quantity across all MLB IDs
+    # for a given SKU. Returns:
+    #   - None if the SKU has no ML listings at all (we don't know),
+    #   - int >= 0 otherwise (sum across logistic_type=='fulfillment' only).
+    # On API error it logs and returns None (preserves previous Tiny row).
+    # ------------------------------------------------------------------
+    async def _fetch_ml_full_qty(self, sku: str) -> int | None:
+        if self._ml is None:
+            return None
+        try:
+            mlb_ids = await self._ml.list_items_by_sku(sku)
+        except Exception as exc:
+            logger.warning("ML search failed for SKU, skipping ML overlay", sku=sku, error=str(exc))
+            return None
+
+        if not mlb_ids:
+            return None
+
+        total = 0
+        any_fulfillment = False
+        for mlb_id in mlb_ids:
+            try:
+                item = await self._ml.get_item(mlb_id)
+            except Exception as exc:
+                logger.warning(
+                    "ML item fetch failed, skipping that listing",
+                    sku=sku,
+                    mlb_id=mlb_id,
+                    error=str(exc),
+                )
+                continue
+            shipping = item.get("shipping") or {}
+            if shipping.get("logistic_type") != "fulfillment":
+                continue
+            any_fulfillment = True
+            total += int(item.get("available_quantity") or 0)
+
+        # If the SKU has MLBs but none are fulfillment, treat as None — the
+        # caller leaves the Tiny "Full Mercado Livre" row alone (with
+        # ignore=true, it does not pollute coverage anyway).
+        return total if any_fulfillment else None
+
+    # ------------------------------------------------------------------
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
         from sqlalchemy import select, update
 
@@ -198,3 +271,35 @@ class StockSyncService:
             await session.commit()
             # Close immediately if nothing was enqueued (no consumer will run).
             await SyncLogRepository(session).try_finalize(sync_log_id)
+
+
+# ---------------------------------------------------------------------------
+def _overlay_ml_full_deposit(deposits: list[dict[str, Any]], ml_qty: int) -> None:
+    """Mutate `deposits` so the Full ML row reflects the authoritative ML
+    quantity and counts in coverage (``ignore=False``).
+
+    If Tiny returned a row named "Full Mercado Livre", overwrite its
+    balance/available with `ml_qty` and flip ``ignore`` off. Otherwise
+    append a synthetic row with a sentinel ``deposit_tiny_id`` (the
+    table's unique constraint is per (product, deposit_tiny_id), so a
+    fixed sentinel is safe per product).
+    """
+    for d in deposits:
+        if d.get("deposit_name") == ML_FULL_DEPOSIT_NAME:
+            d["balance"] = float(ml_qty)
+            d["available"] = float(ml_qty)
+            d["reserved"] = 0.0
+            d["ignore"] = False
+            return
+
+    deposits.append(
+        {
+            "deposit_tiny_id": ML_FULL_DEPOSIT_SENTINEL_ID,
+            "deposit_name": ML_FULL_DEPOSIT_NAME,
+            "ignore": False,
+            "balance": float(ml_qty),
+            "reserved": 0.0,
+            "available": float(ml_qty),
+            "company": "Mercado Livre",
+        }
+    )

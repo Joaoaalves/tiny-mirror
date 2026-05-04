@@ -37,7 +37,6 @@ from tiny_mirror.scheduler.jobs import (
     setup_scheduler,
     shutdown_scheduler,
 )
-from tiny_mirror.services.mercadolivre_stock_service import MercadoLivreStockService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
@@ -85,7 +84,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.tiny_client = tiny_client
 
-        # Mercado Livre stock — optional. Only activated when ML_CLIENT_ID is set.
+        # Mercado Livre overlay — optional. When ML_CLIENT_ID is set, every
+        # per-product stock sync also pulls Full ML available_quantity from
+        # the ML API and overwrites the (unreliable) Tiny "Full Mercado
+        # Livre" deposit row in stock_deposits.
+        ml_api_client: MercadoLivreAPIClient | None = None
         if settings.ml_client_id:
             ml_token_service = MercadoLivreTokenService(
                 session_factory=AsyncSessionLocal,
@@ -103,10 +106,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 http_client=app.state.http_client,
                 ml_user_id=settings.ml_user_id,
             )
-            app.state.ml_stock_service = MercadoLivreStockService(ml_client=ml_api_client)
-            logger.info("Mercado Livre stock sync enabled", ml_user_id=settings.ml_user_id)
+            logger.info("Mercado Livre overlay enabled", ml_user_id=settings.ml_user_id)
         else:
-            logger.info("ML_CLIENT_ID not set; Mercado Livre stock sync disabled")
+            logger.info("ML_CLIENT_ID not set; Mercado Livre overlay disabled")
 
         # Stages 08-09 still ship stub services that raise
         # NotImplementedError; their messages go to their DLQs until the
@@ -125,6 +127,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             stock_sync=StockSyncService(
                 tiny_client=tiny_client,
                 queue_publisher=app.state.queue_publisher,
+                ml_client=ml_api_client,
             ),
             sale_buckets=SaleBucketService(),
         )

@@ -34,7 +34,6 @@ from tiny_mirror.queue.publisher import QueuePublisher
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
-    from tiny_mirror.services.mercadolivre_stock_service import MercadoLivreStockService
     from tiny_mirror.services.token_service import TokenService
 
 
@@ -63,7 +62,6 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
     """
     publisher: QueuePublisher = app.state.queue_publisher
     token_service: TokenService = app.state.token_service
-    ml_stock_service: MercadoLivreStockService | None = getattr(app.state, "ml_stock_service", None)
 
     scheduler = AsyncIOScheduler(
         timezone="UTC",
@@ -87,7 +85,6 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
-            "ml_stock_sync": CronTrigger.from_crontab(settings.sync_ml_stock_cron, timezone="UTC"),
         }
     except ValueError as exc:
         logger.critical(
@@ -159,19 +156,6 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         id="sync_log_watchdog",
         replace_existing=True,
     )
-
-    if ml_stock_service is not None:
-
-        async def _ml_stock_sync() -> None:
-            await ml_stock_sync_job(ml_stock_service)
-
-        scheduler.add_job(
-            _ml_stock_sync,
-            trigger=triggers["ml_stock_sync"],
-            id="ml_stock_sync",
-            replace_existing=True,
-        )
-        logger.info("ML stock sync job registered")
 
     scheduler.start()
     logger.info("Scheduler started", jobs_count=len(scheduler.get_jobs()))
@@ -374,37 +358,6 @@ async def stock_full_sync_job(publisher: QueuePublisher) -> None:
     )
 
 
-async def ml_stock_sync_job(ml_stock_service: MercadoLivreStockService) -> None:
-    """Daily full sync of Mercado Livre fulfillment stock per SKU.
-
-    Runs inline (no queue fan-out). Creates a sync_log row for monitoring,
-    calls :meth:`MercadoLivreStockService.run_full_sync`, which updates the
-    sync_log directly when it completes.
-    """
-    logger.info("ML stock sync job started")
-    sync_log_id: int | None = None
-    try:
-        async with AsyncSessionLocal() as session:
-            sync_log_id = await SyncLogRepository(session).create_sync_log(
-                "mercadolivre_stock", metadata={"triggered_by": "scheduler"}
-            )
-        await ml_stock_service.run_full_sync(sync_log_id)
-        logger.info("ML stock sync job completed", sync_log_id=sync_log_id)
-    except Exception as exc:
-        logger.error("ML stock sync job failed", error=str(exc), sync_log_id=sync_log_id)
-        if sync_log_id is not None:
-            try:
-                async with AsyncSessionLocal() as session:
-                    await SyncLogRepository(session).update_sync_log_failed(
-                        sync_log_id,
-                        error_message=f"Job failed: {exc}",
-                        items_processed=0,
-                        items_failed=0,
-                    )
-            except Exception:  # pragma: no cover
-                logger.exception("Failed to mark ML sync_log as failed", sync_log_id=sync_log_id)
-
-
 async def sync_log_watchdog_job() -> None:
     """Force-close sync_logs that overstay the running window.
 
@@ -508,7 +461,6 @@ __all__ = [
     "TOKEN_ROTATION_MAX_RETRIES",
     "TOKEN_ROTATION_RETRY_DELAY_SECONDS",
     "check_and_trigger_initial_sync",
-    "ml_stock_sync_job",
     "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",

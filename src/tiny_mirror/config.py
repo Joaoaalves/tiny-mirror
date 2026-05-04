@@ -66,13 +66,15 @@ class Settings(BaseSettings):
 
     # Dedup window for manual sync triggers. Repeated POSTs to /sync/* within
     # this many seconds get a 409 instead of fanning out duplicates.
-    # Mercado Livre OAuth + stock (optional — leave empty to disable ML sync)
+    # Mercado Livre OAuth (optional — leave empty to disable ML overlay).
+    # When set, the per-product stock sync also pulls the Full ML
+    # available_quantity for that SKU and overwrites the (unreliable)
+    # Tiny "Full Mercado Livre" deposit row in stock_deposits.
     ml_user_id: str = ""
     ml_client_id: str = ""
     ml_client_secret: str = ""
     ml_refresh_token: str = ""
     ml_access_token: str = ""
-    sync_ml_stock_cron: str = "30 3 * * *"
 
     sync_trigger_lock_seconds: int = 300
 
