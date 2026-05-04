@@ -274,9 +274,7 @@ class OrderSyncService:
                 break
 
             page_ids = [int(item["id"]) for item in items]
-            target_ids = (
-                await self._filter_new_order_ids(page_ids) if skip_existing else page_ids
-            )
+            target_ids = await self._filter_new_order_ids(page_ids) if skip_existing else page_ids
             skipped = len(page_ids) - len(target_ids)
 
             for order_tiny_id in target_ids:
