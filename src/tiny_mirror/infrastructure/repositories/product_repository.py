@@ -82,6 +82,12 @@ class PostgreSQLProductRepository(ProductRepository):
         )
         return [int(tid) for (tid,) in result.all()]
 
+    async def list_active_skus(self) -> list[str]:
+        result = await self._session.execute(
+            select(ProductORM.sku).where(ProductORM.situation == "A")
+        )
+        return [str(sku) for (sku,) in result.all()]
+
     async def count(self) -> int:
         result = await self._session.execute(select(func.count(ProductORM.tiny_id)))
         return int(result.scalar_one())

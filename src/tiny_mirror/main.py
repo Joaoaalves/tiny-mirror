@@ -23,6 +23,7 @@ from tiny_mirror.api.routers.sync import router as sync_router
 from tiny_mirror.api.routers.webhooks import router as webhooks_router
 from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal, close_database, initialize_database
+from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
 from tiny_mirror.infrastructure.external.rate_limiter import RateLimiter
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.logging_config import configure_logging
@@ -36,6 +37,8 @@ from tiny_mirror.scheduler.jobs import (
     setup_scheduler,
     shutdown_scheduler,
 )
+from tiny_mirror.services.mercadolivre_stock_service import MercadoLivreStockService
+from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
@@ -81,6 +84,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             http_client=app.state.http_client,
         )
         app.state.tiny_client = tiny_client
+
+        # Mercado Livre stock — optional. Only activated when ML_CLIENT_ID is set.
+        if settings.ml_client_id:
+            ml_token_service = MercadoLivreTokenService(
+                session_factory=AsyncSessionLocal,
+                redis_client=get_redis(),
+                http_client=app.state.http_client,
+                ml_client_id=settings.ml_client_id,
+                ml_client_secret=settings.ml_client_secret,
+                ml_initial_refresh_token=settings.ml_refresh_token,
+            )
+            await ml_token_service.validate_on_startup()
+            app.state.ml_token_service = ml_token_service
+
+            ml_api_client = MercadoLivreAPIClient(
+                token_service=ml_token_service,
+                http_client=app.state.http_client,
+                ml_user_id=settings.ml_user_id,
+            )
+            app.state.ml_stock_service = MercadoLivreStockService(ml_client=ml_api_client)
+            logger.info("Mercado Livre stock sync enabled", ml_user_id=settings.ml_user_id)
+        else:
+            logger.info("ML_CLIENT_ID not set; Mercado Livre stock sync disabled")
 
         # Stages 08-09 still ship stub services that raise
         # NotImplementedError; their messages go to their DLQs until the

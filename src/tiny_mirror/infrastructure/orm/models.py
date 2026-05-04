@@ -650,3 +650,116 @@ class SyncLogORM(Base):
     items_failed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     sync_metadata: Mapped[dict[str, Any] | None] = mapped_column("metadata", JSONB, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# ml_oauth_tokens
+# ---------------------------------------------------------------------------
+class MLOAuthTokenORM(Base):
+    __tablename__ = "ml_oauth_tokens"
+    __table_args__ = {
+        "comment": (
+            "Stores the single active OAuth2 token for Mercado Livre API authentication. "
+            "Always contains exactly one row. Updated on every token refresh (6h access_token "
+            "TTL). refresh_expires_at is set to access_token expiry + 365 days since ML does "
+            "not return an explicit refresh_token expiry."
+        ),
+    }
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    access_token: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="ML access token (Bearer). Valid for 6 hours.",
+    )
+    refresh_token: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="ML refresh token. Used to obtain a new access_token without re-authentication.",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="UTC timestamp when the access_token expires.",
+    )
+    refresh_expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Always set to expires_at + 365 days (ML has no explicit refresh expiry).",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# mercadolivre_stock
+# ---------------------------------------------------------------------------
+class MercadoLivreStockORM(Base):
+    __tablename__ = "mercadolivre_stock"
+    __table_args__ = (
+        Index("ix_mercadolivre_stock_sku", "sku"),
+        Index("ix_mercadolivre_stock_logistic_type", "logistic_type"),
+        {
+            "comment": (
+                "Per-listing stock levels fetched directly from the Mercado Livre API. "
+                "Each row represents one MLB listing (mlb_id) for a given SKU. "
+                "Primary key is (sku, mlb_id). For coverage analytics, sum "
+                "available_quantity WHERE logistic_type='fulfillment' per SKU to get "
+                "the Full ML stock. This replaces the unreliable Tiny 'Full Mercado "
+                "Livre' deposit (which shows negative saldos and is marked ignore=true)."
+            ),
+        },
+    )
+
+    sku: Mapped[str] = mapped_column(
+        String(100),
+        primary_key=True,
+        comment="Product SKU — matches products.sku.",
+    )
+    mlb_id: Mapped[str] = mapped_column(
+        String(50),
+        primary_key=True,
+        comment="Mercado Livre listing ID (e.g. MLB123456789).",
+    )
+    available_quantity: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        server_default=text("0"),
+        comment=(
+            "Quantity available for this listing. For out-of-stock paused " "listings this is 0."
+        ),
+    )
+    logistic_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment=(
+            "Shipping/logistic type from ML API. 'fulfillment' = Full ML stock "
+            "(this is what we care about). Other values: 'me2', 'cross_docking', etc."
+        ),
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        server_default=text("'active'"),
+        comment="Listing status from ML API ('active', 'paused', 'closed', etc.).",
+    )
+    last_synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="UTC timestamp of the last successful ML API fetch for this listing.",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )

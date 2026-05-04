@@ -49,6 +49,10 @@ class ProductRepository(abc.ABC):
         """Return all ``tiny_id``s with ``situation = 'A'``."""
 
     @abc.abstractmethod
+    async def list_active_skus(self) -> list[str]:
+        """Return all ``sku``s with ``situation = 'A'``."""
+
+    @abc.abstractmethod
     async def count(self) -> int:
         """Return the total number of products in the table."""
 
