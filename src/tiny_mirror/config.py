@@ -46,7 +46,10 @@ class Settings(BaseSettings):
     seq_api_key: str = ""
 
     sync_products_cron: str = "0 2 * * *"
-    sync_orders_cron: str = "0 * * * *"
+    # Orders run every 30 min. _filter_new_order_ids skips ids already in
+    # the local table, so the only Tiny calls are pagination + GET per
+    # genuinely new order — well under the 60 req/min budget.
+    sync_orders_cron: str = "*/30 * * * *"
     # Stock full sync runs daily (03:00 UTC). Stock is refreshed only here
     # — neither order webhooks nor the hourly order cron fan out per-product
     # stock refreshes anymore. Tiny order webhooks are too unreliable to
