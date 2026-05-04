@@ -79,7 +79,8 @@ def upgrade() -> None:
     )
 
     # Expand sync_logs.sync_type to include 'mercadolivre_stock'.
-    op.drop_constraint("valid_sync_type", "sync_logs")
+    # Pass type_="check" so the naming convention prefix (ck_<table>_) applies.
+    op.drop_constraint("valid_sync_type", "sync_logs", type_="check")
     op.create_check_constraint(
         "valid_sync_type",
         "sync_logs",
@@ -89,7 +90,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_constraint("ck_sync_logs_valid_sync_type", "sync_logs")
+    op.drop_constraint("valid_sync_type", "sync_logs", type_="check")
     op.create_check_constraint(
         "valid_sync_type",
         "sync_logs",
