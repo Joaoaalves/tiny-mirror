@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal
 
 import redis.asyncio as redis
@@ -23,6 +23,7 @@ from tiny_mirror.api.schemas import (
     PaginationResponse,
     SyncLogListResponse,
     SyncLogResponse,
+    SyncReconciliationResponse,
     SyncTriggerResponse,
 )
 from tiny_mirror.config import settings
@@ -110,6 +111,88 @@ async def sync_products(
         },
     )
     return SyncTriggerResponse(message="Product sync triggered", sync_log_id=sync_log_id)
+
+
+class OrdersReconcileRequest(BaseModel):
+    """Body for ``POST /sync/orders/reconcile``.
+
+    Defaults to a single-day reconciliation of yesterday — same as the
+    daily cron — when no body is supplied.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    date_from: date | None = None
+    date_to: date | None = None
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> OrdersReconcileRequest:
+        if (self.date_from is None) != (self.date_to is None):
+            raise ValueError("date_from and date_to must be supplied together")
+        if (
+            self.date_from is not None
+            and self.date_to is not None
+            and self.date_from > self.date_to
+        ):
+            raise ValueError("date_from must be <= date_to")
+        return self
+
+
+@router.post(
+    "/orders/reconcile",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SyncReconciliationResponse,
+)
+async def reconcile_orders(
+    body: OrdersReconcileRequest = Body(default_factory=OrdersReconcileRequest),
+    sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
+    publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> SyncReconciliationResponse:
+    """Re-fetch every order whose ``dataAtualizacao`` falls within the
+    given range and upsert them. One ``orders.full`` message per day so
+    each day shows up as its own sync_log row. Default range covers
+    yesterday only — same as the scheduled cron.
+    """
+    await _acquire_sync_lock(redis_client, "orders_reconciliation")
+
+    today = datetime.now(UTC).date()
+    if body.date_from is not None and body.date_to is not None:
+        date_from = body.date_from
+        date_to = body.date_to
+    else:
+        date_from = date_to = today - timedelta(days=1)
+
+    sync_log_ids: list[int] = []
+    cursor = date_from
+    while cursor <= date_to:
+        sync_log_id = await sync_logs.create_sync_log(
+            "orders",
+            metadata={
+                "triggered_by": "manual",
+                "mode": "reconcile",
+                "target_date": cursor.isoformat(),
+            },
+        )
+        await publisher.publish_sync_message(
+            "orders.full",
+            {
+                "mode": "reconcile",
+                "target_date": cursor.isoformat(),
+                "sync_log_id": sync_log_id,
+                "published_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        sync_log_ids.append(sync_log_id)
+        cursor += timedelta(days=1)
+
+    return SyncReconciliationResponse(
+        message=f"Orders reconciliation triggered for {len(sync_log_ids)} day(s)",
+        sync_log_ids=sync_log_ids,
+        days_count=len(sync_log_ids),
+        date_from=date_from,
+        date_to=date_to,
+    )
 
 
 @router.post(

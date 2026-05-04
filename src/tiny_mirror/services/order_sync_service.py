@@ -50,6 +50,36 @@ class OrderSyncService:
     # ------------------------------------------------------------------
     # Incremental — hourly scheduler entry point
     # ------------------------------------------------------------------
+    async def run_reconciliation_sync(self, target_date: date, sync_log_id: int) -> None:
+        """Re-fetch every order updated on ``target_date`` and upsert them.
+
+        Tiny v3 exposes ``dataAtualizacao=YYYY-MM-DD`` which returns every
+        order whose last update happened on that day, regardless of when
+        the order was created. That is the only reliable way to catch
+        status changes (e.g. an order created on day N that was cancelled
+        on day N+2): the order's ``dataAtualizacao`` advances to N+2 and
+        shows up in this listing. Unlike the incremental path, this one
+        does NOT filter out ids already in the local table — the whole
+        point is to re-upsert and pick up status drift.
+        """
+        logger.info(
+            "Starting order reconciliation sync",
+            sync_log_id=sync_log_id,
+            target_date=target_date.isoformat(),
+        )
+        total_published = await self._fan_out_orders(
+            sync_log_id=sync_log_id,
+            updated_after=target_date,
+            skip_existing=False,
+        )
+        await self._record_total_enqueued(sync_log_id, total_published)
+        logger.info(
+            "Order reconciliation sync enqueued",
+            sync_log_id=sync_log_id,
+            target_date=target_date.isoformat(),
+            total_published=total_published,
+        )
+
     async def run_incremental_sync(self, sync_log_id: int) -> None:
         lookback_dt = datetime.now(UTC) - timedelta(hours=INCREMENTAL_LOOKBACK_HOURS)
         logger.info(
@@ -212,12 +242,18 @@ class OrderSyncService:
         self,
         *,
         sync_log_id: int,
-        updated_after: datetime | None = None,
+        updated_after: datetime | date | None = None,
         date_initial: date | None = None,
         date_final: date | None = None,
+        skip_existing: bool = True,
     ) -> int:
-        """Paginate either updated_after (incremental) or date range (historical)
-        and publish one ``orders.item`` message per order. Returns the count.
+        """Paginate Tiny orders and publish one ``orders.item`` per id.
+
+        ``skip_existing=True`` (default) drops ids already in the local
+        ``orders`` table — used by the incremental cron to avoid
+        re-fetching the same order every hour. ``skip_existing=False``
+        publishes every id; used by the reconciliation path that has to
+        pick up status drift on already-mirrored orders.
         """
         total_published = 0
         offset = 0
@@ -238,10 +274,12 @@ class OrderSyncService:
                 break
 
             page_ids = [int(item["id"]) for item in items]
-            new_ids = await self._filter_new_order_ids(page_ids)
-            skipped = len(page_ids) - len(new_ids)
+            target_ids = (
+                await self._filter_new_order_ids(page_ids) if skip_existing else page_ids
+            )
+            skipped = len(page_ids) - len(target_ids)
 
-            for order_tiny_id in new_ids:
+            for order_tiny_id in target_ids:
                 await self._publisher.publish_sync_message(
                     "orders.item",
                     {
@@ -262,7 +300,7 @@ class OrderSyncService:
                 offset=offset,
                 count=len(items),
                 total=total,
-                published=len(new_ids),
+                published=len(target_ids),
                 skipped_existing=skipped,
             )
 

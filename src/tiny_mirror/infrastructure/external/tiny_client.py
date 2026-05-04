@@ -77,7 +77,7 @@ class TinyAPIClient:
         self,
         date_initial: datetime | date | str | None = None,
         date_final: datetime | date | str | None = None,
-        updated_after: datetime | str | None = None,
+        updated_after: datetime | date | str | None = None,
         situation: int | None = None,
         limit: int = 100,
         offset: int = 0,

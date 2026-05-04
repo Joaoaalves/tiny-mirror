@@ -26,6 +26,11 @@ class OrderFullSyncConsumer(BaseConsumer):
 
     async def handle(self, message_body: dict[str, Any]) -> None:
         sync_log_id = int(message_body["sync_log_id"])
+        mode = message_body.get("mode")
+        if mode == "reconcile":
+            target_date = date.fromisoformat(message_body["target_date"])
+            await self._service.run_reconciliation_sync(target_date, sync_log_id)
+            return
         is_historical = bool(message_body.get("is_historical", False))
         if is_historical:
             date_from = date.fromisoformat(message_body["date_from"])

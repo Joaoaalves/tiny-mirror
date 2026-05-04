@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     # the local table, so the only Tiny calls are pagination + GET per
     # genuinely new order — well under the 60 req/min budget.
     sync_orders_cron: str = "*/30 * * * *"
+    # Daily reconciliation: re-fetch every order whose dataAtualizacao was
+    # yesterday, regardless of whether it is already in the DB. Catches
+    # status changes (cancellations, deliveries) the incremental cron
+    # cannot see, since _filter_new_order_ids skips known ids.
+    sync_orders_reconciliation_cron: str = "0 3 * * *"
     # Stock full sync runs daily (03:00 UTC). Stock is refreshed only here
     # — neither order webhooks nor the hourly order cron fan out per-product
     # stock refreshes anymore. Tiny order webhooks are too unreliable to

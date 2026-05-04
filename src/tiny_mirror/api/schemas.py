@@ -197,6 +197,14 @@ class SyncTriggerResponse(_Base):
     sync_log_id: int
 
 
+class SyncReconciliationResponse(_Base):
+    message: str
+    sync_log_ids: list[int]
+    days_count: int
+    date_from: date
+    date_to: date
+
+
 # ---------------------------------------------------------------------------
 # Health
 # ---------------------------------------------------------------------------

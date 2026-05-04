@@ -75,6 +75,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             ),
             "products_sync": CronTrigger.from_crontab(settings.sync_products_cron, timezone="UTC"),
             "orders_sync": CronTrigger.from_crontab(settings.sync_orders_cron, timezone="UTC"),
+            "orders_reconciliation": CronTrigger.from_crontab(
+                settings.sync_orders_reconciliation_cron, timezone="UTC"
+            ),
             "stock_full_sync": CronTrigger.from_crontab(settings.sync_stock_cron, timezone="UTC"),
             "sale_buckets_refresh": CronTrigger.from_crontab(
                 settings.sync_buckets_cron, timezone="UTC"
@@ -98,6 +101,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _orders_sync() -> None:
         await orders_sync_job(publisher)
+
+    async def _orders_reconciliation() -> None:
+        await orders_reconciliation_job(publisher)
 
     async def _stock_full_sync() -> None:
         await stock_full_sync_job(publisher)
@@ -124,6 +130,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _orders_sync,
         trigger=triggers["orders_sync"],
         id="orders_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _orders_reconciliation,
+        trigger=triggers["orders_reconciliation"],
+        id="orders_reconciliation",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -312,6 +324,29 @@ async def orders_sync_job(publisher: QueuePublisher) -> None:
     )
 
 
+async def orders_reconciliation_job(publisher: QueuePublisher) -> None:
+    """Daily safety net: re-fetch every order updated yesterday and upsert
+    them, so cancellations and other status drift the incremental cron
+    cannot see still land in the mirror within ~24h.
+    """
+    yesterday = (datetime.now(UTC) - timedelta(days=1)).date()
+    logger.info("Orders reconciliation job started", target_date=yesterday.isoformat())
+    await _trigger_sync(
+        publisher,
+        sync_type="orders",
+        queue_type="orders.full",
+        message_extra={
+            "mode": "reconcile",
+            "target_date": yesterday.isoformat(),
+        },
+        log_metadata={
+            "triggered_by": "scheduler",
+            "mode": "reconcile",
+            "target_date": yesterday.isoformat(),
+        },
+    )
+
+
 async def stock_full_sync_job(publisher: QueuePublisher) -> None:
     logger.info("Stock full sync job started")
     await _trigger_sync(
@@ -426,6 +461,7 @@ __all__ = [
     "TOKEN_ROTATION_MAX_RETRIES",
     "TOKEN_ROTATION_RETRY_DELAY_SECONDS",
     "check_and_trigger_initial_sync",
+    "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",
     "sale_buckets_refresh_job",
