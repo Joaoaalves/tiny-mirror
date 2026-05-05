@@ -53,6 +53,16 @@ class ProductRepository(abc.ABC):
         """Return all ``sku``s with ``situation = 'A'``."""
 
     @abc.abstractmethod
+    async def get_types_for_ids(self, tiny_ids: list[int]) -> dict[int, str]:
+        """Return ``{tiny_id: type}`` for every id in the list.
+
+        Used by the bucket service to identify kit line items at compute
+        time — ``order_items.product_type`` mirrors Tiny's order payload
+        which reports ``'P'`` even for kit lines, so the only reliable
+        signal is the product master ``products.type``.
+        """
+
+    @abc.abstractmethod
     async def count(self) -> int:
         """Return the total number of products in the table."""
 

@@ -88,6 +88,14 @@ class PostgreSQLProductRepository(ProductRepository):
         )
         return [str(sku) for (sku,) in result.all()]
 
+    async def get_types_for_ids(self, tiny_ids: list[int]) -> dict[int, str]:
+        if not tiny_ids:
+            return {}
+        result = await self._session.execute(
+            select(ProductORM.tiny_id, ProductORM.type).where(ProductORM.tiny_id.in_(tiny_ids))
+        )
+        return {int(tid): str(t) for tid, t in result.all()}
+
     async def count(self) -> int:
         result = await self._session.execute(select(func.count(ProductORM.tiny_id)))
         return int(result.scalar_one())

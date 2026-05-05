@@ -67,12 +67,18 @@ class SaleBucketService:
             orders = await orders_repo.get_orders_in_period(date_from, date_to)
             logger.info("Orders to process for buckets", count=len(orders))
 
-            kit_ids = {
+            # The kit signal is on the PRODUCT master, not on the order line.
+            # Tiny's order API returns tipo='P' for the kit line itself, so
+            # order_items.product_type is unreliable. Resolve every line's
+            # product_tiny_id against products.type in a single batch query.
+            all_product_ids = {
                 int(item["product_tiny_id"])
                 for order in orders
                 for item in order.get("items", [])
-                if item.get("product_type") == "K" and item.get("product_tiny_id") is not None
+                if item.get("product_tiny_id") is not None
             }
+            type_map = await products_repo.get_types_for_ids(list(all_product_ids))
+            kit_ids = {pid for pid, ptype in type_map.items() if ptype == "K"}
             kit_components_map = await products_repo.get_kit_components_for_ids(list(kit_ids))
 
             accumulator: dict[BucketKey, _BucketAccumulator] = defaultdict(_BucketAccumulator)
@@ -108,8 +114,9 @@ class SaleBucketService:
                     # Kit expansion buckets (only for kits that have
                     # components mirrored locally — otherwise we just emit
                     # the direct bucket and warn).
-                    if item.get("product_type") == "K" and item.get("product_tiny_id") is not None:
-                        kit_id = int(item["product_tiny_id"])
+                    product_id = item.get("product_tiny_id")
+                    if product_id is not None and type_map.get(int(product_id)) == "K":
+                        kit_id = int(product_id)
                         components = kit_components_map.get(kit_id, [])
                         if not components:
                             logger.warning(
