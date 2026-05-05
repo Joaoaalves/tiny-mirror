@@ -110,6 +110,40 @@ def test_extract_deposits_missing_field_returns_empty_list() -> None:
     assert StockMapper.extract_deposits({"id": 1}) == []
 
 
+def test_from_tiny_api_clamps_negative_values_to_zero() -> None:
+    """Tiny returns negative saldos for Full ML oversells. Clamp at the
+    boundary so coverage math never sees a negative."""
+    raw = {
+        "id": 1,
+        "saldo": -10,
+        "reservado": -2,
+        "disponivel": -12,
+    }
+    mapped = StockMapper.from_tiny_api(raw)
+    assert mapped["balance"] == 0.0
+    assert mapped["reserved"] == 0.0
+    assert mapped["available"] == 0.0
+
+
+def test_extract_deposits_clamps_negative_values_to_zero() -> None:
+    raw = {
+        "id": 1,
+        "depositos": [
+            {
+                "id": 10,
+                "nome": "Galpão",
+                "desconsiderar": False,
+                "saldo": -3,
+                "reservado": 0,
+                "disponivel": -3,
+            },
+        ],
+    }
+    deposits = StockMapper.extract_deposits(raw)
+    assert deposits[0]["balance"] == 0.0
+    assert deposits[0]["available"] == 0.0
+
+
 def test_extract_deposits_skips_deposits_without_id() -> None:
     raw = {
         "id": 1,

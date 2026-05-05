@@ -3,6 +3,11 @@
 The Tiny `GET /estoque/{idProduto}` payload bundles the consolidated
 balance with a per-deposit breakdown. The mapper splits these into the
 ``stock`` and ``stock_deposits`` shapes used by the persistence layer.
+
+Negative stock values returned by Tiny (a frequent artefact of Full ML
+oversells and bookkeeping errors) are clamped to ``0`` on the way in:
+no matter what Tiny says, "less than nothing in stock" is not a
+business reality the coverage report should react to.
 """
 
 from __future__ import annotations
@@ -24,9 +29,9 @@ class StockMapper:
             # Tiny calls the SKU `codigo` on the stock endpoint.
             "sku": raw.get("codigo") or "",
             "unit": raw.get("unidade"),
-            "balance": _to_float(raw.get("saldo")),
-            "reserved": _to_float(raw.get("reservado")),
-            "available": _to_float(raw.get("disponivel")),
+            "balance": _to_non_negative_float(raw.get("saldo")),
+            "reserved": _to_non_negative_float(raw.get("reservado")),
+            "available": _to_non_negative_float(raw.get("disponivel")),
             "location": raw.get("localizacao"),
             "synced_at": datetime.now(UTC),
         }
@@ -51,9 +56,9 @@ class StockMapper:
                     "deposit_tiny_id": int(deposit_id),
                     "deposit_name": deposit.get("nome") or "",
                     "ignore": bool(deposit.get("desconsiderar", False)),
-                    "balance": _to_float(deposit.get("saldo")),
-                    "reserved": _to_float(deposit.get("reservado")),
-                    "available": _to_float(deposit.get("disponivel")),
+                    "balance": _to_non_negative_float(deposit.get("saldo")),
+                    "reserved": _to_non_negative_float(deposit.get("reservado")),
+                    "available": _to_non_negative_float(deposit.get("disponivel")),
                     "company": deposit.get("empresa"),
                 }
             )
@@ -67,3 +72,9 @@ def _to_float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _to_non_negative_float(value: Any) -> float:
+    """Coerce to float and clamp to ``0`` so negative Tiny values never
+    leak into our stock tables. See module docstring for context."""
+    return max(0.0, _to_float(value))
