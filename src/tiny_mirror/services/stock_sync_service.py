@@ -227,7 +227,11 @@ class StockSyncService:
         if not mlb_ids:
             return None
 
-        total = 0
+        # Group by inventory_id — multiple fulfillment listings that share the
+        # same inventory report the same physical stock; summing them would
+        # double-count. Fall back to mlb_id as the key when inventory_id is
+        # absent so each listing is counted once.
+        inventory_qty: dict[str, int] = {}
         any_fulfillment = False
         for mlb_id in mlb_ids:
             try:
@@ -244,12 +248,17 @@ class StockSyncService:
             if shipping.get("logistic_type") != "fulfillment":
                 continue
             any_fulfillment = True
-            total += int(item.get("available_quantity") or 0)
+            inv_key = item.get("inventory_id") or mlb_id
+            qty = int(item.get("available_quantity") or 0)
+            # Keep max for this bucket — guards against transient ML cache skew
+            # between listings that share an inventory.
+            if inv_key not in inventory_qty or qty > inventory_qty[inv_key]:
+                inventory_qty[inv_key] = qty
 
         # If the SKU has MLBs but none are fulfillment, treat as None — the
         # caller leaves the Tiny "Full Mercado Livre" row alone (with
         # ignore=true, it does not pollute coverage anyway).
-        return total if any_fulfillment else None
+        return sum(inventory_qty.values()) if any_fulfillment else None
 
     # ------------------------------------------------------------------
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:

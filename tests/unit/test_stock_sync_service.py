@@ -231,6 +231,90 @@ async def test_fetch_ml_full_qty_zero_when_fulfillment_with_zero_stock(
     assert result == 0
 
 
+async def test_fetch_ml_full_qty_deduplicates_shared_inventory(
+    stock_service: StockSyncService, ml_client: AsyncMock
+) -> None:
+    """Two fulfillment listings sharing inventory_id report the same physical
+    stock. Must return 30 (one inventory bucket), not 60 (naive sum)."""
+    ml_client.list_items_by_sku = AsyncMock(return_value=["MLB_A", "MLB_B"])
+    ml_client.get_item = AsyncMock(
+        side_effect=[
+            {
+                "id": "MLB_A",
+                "inventory_id": "RLPS37208",
+                "available_quantity": 30,
+                "shipping": {"logistic_type": "fulfillment"},
+            },
+            {
+                "id": "MLB_B",
+                "inventory_id": "RLPS37208",
+                "available_quantity": 30,
+                "shipping": {"logistic_type": "fulfillment"},
+            },
+        ]
+    )
+
+    result = await stock_service._fetch_ml_full_qty("BUB-PRT-QUI-FLEX")
+
+    assert result == 30  # not 60 — same inventory_id deduplicates
+
+
+async def test_fetch_ml_full_qty_distinct_inventories_are_summed(
+    stock_service: StockSyncService, ml_client: AsyncMock
+) -> None:
+    """Two fulfillment listings with different inventory_ids are separate
+    physical stocks and must be summed."""
+    ml_client.list_items_by_sku = AsyncMock(return_value=["MLB_X", "MLB_Y"])
+    ml_client.get_item = AsyncMock(
+        side_effect=[
+            {
+                "id": "MLB_X",
+                "inventory_id": "INV_AAA",
+                "available_quantity": 20,
+                "shipping": {"logistic_type": "fulfillment"},
+            },
+            {
+                "id": "MLB_Y",
+                "inventory_id": "INV_BBB",
+                "available_quantity": 15,
+                "shipping": {"logistic_type": "fulfillment"},
+            },
+        ]
+    )
+
+    result = await stock_service._fetch_ml_full_qty("SKU-MULTI-INV")
+
+    assert result == 35  # 20 + 15 — different inventories
+
+
+async def test_fetch_ml_full_qty_takes_max_for_shared_inventory(
+    stock_service: StockSyncService, ml_client: AsyncMock
+) -> None:
+    """When two listings share inventory_id but report different quantities
+    (transient ML cache skew), the MAX is used."""
+    ml_client.list_items_by_sku = AsyncMock(return_value=["MLB_P", "MLB_Q"])
+    ml_client.get_item = AsyncMock(
+        side_effect=[
+            {
+                "id": "MLB_P",
+                "inventory_id": "INV_SKEW",
+                "available_quantity": 25,
+                "shipping": {"logistic_type": "fulfillment"},
+            },
+            {
+                "id": "MLB_Q",
+                "inventory_id": "INV_SKEW",
+                "available_quantity": 30,
+                "shipping": {"logistic_type": "fulfillment"},
+            },
+        ]
+    )
+
+    result = await stock_service._fetch_ml_full_qty("SKU-SKEW")
+
+    assert result == 30  # max(25, 30)
+
+
 # ---------------------------------------------------------------------------
 # StockSyncService(ml_client=None) — overlay disabled path
 # ---------------------------------------------------------------------------
