@@ -41,7 +41,7 @@ WITH non_kit AS (
       AND p.sku NOT LIKE 'KIT-%'
       AND p.sku NOT LIKE 'COM-%'
       AND p.sku NOT LIKE 'XU-%'
-      AND p.sku !~ '^[0-9]+U-'
+      AND p.sku !~ '^[0-9]'
 ),
 stock_dep AS (
     SELECT product_tiny_id,
