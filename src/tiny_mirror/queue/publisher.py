@@ -33,6 +33,7 @@ class QueuePublisher:
         "stock.full": (EXCHANGE_MAIN, "sync.stock.full"),
         "stock.item": (EXCHANGE_MAIN, "sync.stock.item"),
         "buckets.refresh": (EXCHANGE_MAIN, "sync.buckets.refresh"),
+        "invoices.full": (EXCHANGE_MAIN, "sync.invoices.full"),
         "webhooks.orders": (EXCHANGE_MAIN, "webhooks.orders"),
         "webhooks.stock": (EXCHANGE_MAIN, "webhooks.stock"),
     }
