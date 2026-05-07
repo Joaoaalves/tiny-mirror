@@ -21,18 +21,18 @@ class PostgreSQLInvoiceRepository:
         if not invoices:
             return 0
 
-        stmt = pg_insert(InvoiceORM).values(invoices)
+        insert_stmt = pg_insert(InvoiceORM).values(invoices)
         first = invoices[0]
-        update_cols = {
-            col: stmt.excluded[col] for col in first if col not in {"tiny_id", "created_at"}
+        update_cols: dict[str, Any] = {
+            col: insert_stmt.excluded[col] for col in first if col not in {"tiny_id", "created_at"}
         }
-        update_cols["updated_at"] = func.now()  # type: ignore[assignment]
+        update_cols["updated_at"] = func.now()
 
-        stmt = stmt.on_conflict_do_update(  # type: ignore[assignment]
+        upsert_stmt = insert_stmt.on_conflict_do_update(
             index_elements=["tiny_id"],
             set_=update_cols,
         )
-        await self._session.execute(stmt)
+        await self._session.execute(upsert_stmt)
         await self._session.commit()
         return len(invoices)
 

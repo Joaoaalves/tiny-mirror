@@ -40,7 +40,8 @@ class InvoiceFullSyncConsumer(BaseConsumer):
         )
 
         if message_body.get("is_cold_start"):
-            # Fan out historical date windows (one message per window).
+            if sync_log_id is None:
+                return
             await self._service.run_cold_start(sync_log_id)
             return
 
