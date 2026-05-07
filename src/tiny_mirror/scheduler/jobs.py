@@ -85,9 +85,7 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "sale_buckets_refresh": CronTrigger.from_crontab(
                 settings.sync_buckets_cron, timezone="UTC"
             ),
-            "invoices_sync": CronTrigger.from_crontab(
-                settings.sync_invoices_cron, timezone="UTC"
-            ),
+            "invoices_sync": CronTrigger.from_crontab(settings.sync_invoices_cron, timezone="UTC"),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),

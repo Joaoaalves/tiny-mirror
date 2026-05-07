@@ -232,8 +232,6 @@ async def _set_total_enqueued(sync_log_id: int, total: int) -> None:
         metadata = current.scalar_one_or_none() or {}
         metadata = {**metadata, "total_enqueued": total}
         await session.execute(
-            update(SyncLogORM)
-            .where(SyncLogORM.id == sync_log_id)
-            .values(sync_metadata=metadata)
+            update(SyncLogORM).where(SyncLogORM.id == sync_log_id).values(sync_metadata=metadata)
         )
         await session.commit()

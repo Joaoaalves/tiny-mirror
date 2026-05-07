@@ -24,9 +24,7 @@ class PostgreSQLInvoiceRepository:
         stmt = pg_insert(InvoiceORM).values(invoices)
         first = invoices[0]
         update_cols = {
-            col: stmt.excluded[col]
-            for col in first
-            if col not in {"tiny_id", "created_at"}
+            col: stmt.excluded[col] for col in first if col not in {"tiny_id", "created_at"}
         }
         update_cols["updated_at"] = func.now()  # type: ignore[assignment]
 
@@ -51,9 +49,7 @@ class PostgreSQLInvoiceRepository:
             return None
         return {col.name: getattr(row, col.name) for col in row.__table__.columns}
 
-    async def get_by_issue_date_range(
-        self, date_from: date, date_to: date
-    ) -> list[dict[str, Any]]:
+    async def get_by_issue_date_range(self, date_from: date, date_to: date) -> list[dict[str, Any]]:
         result = await self._session.execute(
             select(InvoiceORM)
             .where(InvoiceORM.issue_date >= date_from)
