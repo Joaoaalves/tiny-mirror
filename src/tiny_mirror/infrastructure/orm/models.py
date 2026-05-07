@@ -618,7 +618,7 @@ class SyncLogORM(Base):
     __tablename__ = "sync_logs"
     __table_args__ = (
         CheckConstraint(
-            "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation', 'invoices')",
+            "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation', 'mercadolivre_stock', 'invoices')",
             name="valid_sync_type",
         ),
         CheckConstraint(

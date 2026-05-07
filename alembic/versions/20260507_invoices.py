@@ -195,11 +195,12 @@ def upgrade() -> None:
     op.create_index("ix_invoices_origin_id", "invoices", ["origin_id"])
 
     # Extend the sync_logs valid_sync_type constraint to include 'invoices'.
+    # 'mercadolivre_stock' must be preserved — existing VPS rows carry that value.
     op.drop_constraint("valid_sync_type", "sync_logs", type_="check")
     op.create_check_constraint(
         "valid_sync_type",
         "sync_logs",
-        "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation', 'invoices')",
+        "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation', 'mercadolivre_stock', 'invoices')",
     )
 
 
@@ -208,7 +209,7 @@ def downgrade() -> None:
     op.create_check_constraint(
         "valid_sync_type",
         "sync_logs",
-        "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation')",
+        "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation', 'mercadolivre_stock')",
     )
 
     op.drop_index("ix_invoices_origin_id", table_name="invoices")
