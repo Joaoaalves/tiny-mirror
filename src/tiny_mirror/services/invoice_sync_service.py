@@ -37,7 +37,7 @@ logger = structlog.get_logger(__name__)
 PAGE_SIZE = 100
 INCREMENTAL_LOOKBACK_DAYS = 2
 COLD_START_WINDOW_DAYS = 30
-COLD_START_FROM = date(2020, 1, 1)
+COLD_START_FROM = date(2024, 5, 8)  # Tiny plan only allows queries from this date
 
 
 class InvoiceSyncService:
