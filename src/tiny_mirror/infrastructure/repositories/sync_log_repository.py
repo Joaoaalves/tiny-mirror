@@ -81,6 +81,17 @@ class SyncLogRepository:
         )
         await self._session.commit()
 
+    async def add_to_processed(self, sync_log_id: int, count: int) -> None:
+        """Atomically add ``count`` to items_processed in one SQL round-trip."""
+        if count <= 0:
+            return
+        await self._session.execute(
+            update(SyncLogORM)
+            .where(SyncLogORM.id == sync_log_id)
+            .values(items_processed=SyncLogORM.items_processed + count)
+        )
+        await self._session.commit()
+
     async def increment_failed(self, sync_log_id: int) -> None:
         await self._session.execute(
             update(SyncLogORM)

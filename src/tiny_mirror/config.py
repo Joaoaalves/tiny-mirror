@@ -83,6 +83,11 @@ class Settings(BaseSettings):
     # to 'failed'. Tiny rate limit is ~60 req/min, so a full product fan-out
     # of 661 items can legitimately take 11+ minutes; pick a generous bound
     # so genuinely-running jobs are not killed.
+    # Invoice sync. Runs daily at 05:00 UTC to pick up any NFs not yet mirrored.
+    # The incremental path (2-day lookback) also fires automatically after each
+    # order sync cycle to keep NF coverage fresh.
+    sync_invoices_cron: str = "0 5 * * *"
+
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90
 

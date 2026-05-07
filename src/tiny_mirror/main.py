@@ -37,6 +37,7 @@ from tiny_mirror.scheduler.jobs import (
     setup_scheduler,
     shutdown_scheduler,
 )
+from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
@@ -113,6 +114,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Stages 08-09 still ship stub services that raise
         # NotImplementedError; their messages go to their DLQs until the
         # matching stage lands.
+        invoice_sync = InvoiceSyncService(
+            tiny_client=tiny_client,
+            queue_publisher=app.state.queue_publisher,
+        )
+
         app.state.consumers = await start_consumers(
             channel,
             queue_publisher=app.state.queue_publisher,
@@ -123,6 +129,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             order_sync=OrderSyncService(
                 tiny_client=tiny_client,
                 queue_publisher=app.state.queue_publisher,
+                invoice_sync=invoice_sync,
             ),
             stock_sync=StockSyncService(
                 tiny_client=tiny_client,
@@ -130,6 +137,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ml_client=ml_api_client,
             ),
             sale_buckets=SaleBucketService(),
+            invoice_sync=invoice_sync,
         )
 
         scheduler = setup_scheduler(app)

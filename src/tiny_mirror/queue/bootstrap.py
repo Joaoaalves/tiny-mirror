@@ -10,6 +10,7 @@ from aio_pika.abc import AbstractChannel
 
 from tiny_mirror.queue.base_consumer import BaseConsumer
 from tiny_mirror.queue.consumers.bucket_consumer import BucketRefreshConsumer
+from tiny_mirror.queue.consumers.invoice_consumers import InvoiceFullSyncConsumer
 from tiny_mirror.queue.consumers.order_consumers import (
     OrderFullSyncConsumer,
     OrderItemConsumer,
@@ -27,6 +28,7 @@ from tiny_mirror.queue.consumers.webhook_consumers import (
     StockWebhookConsumer,
 )
 from tiny_mirror.queue.publisher import QueuePublisher
+from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
@@ -43,6 +45,7 @@ async def start_consumers(
     order_sync: OrderSyncService,
     stock_sync: StockSyncService,
     sale_buckets: SaleBucketService,
+    invoice_sync: InvoiceSyncService,
 ) -> list[BaseConsumer]:
     """Register every consumer on the shared channel and return the instances.
 
@@ -59,6 +62,7 @@ async def start_consumers(
         StockFullSyncConsumer(channel, queue_publisher, stock_sync),
         StockItemConsumer(channel, queue_publisher, stock_sync),
         BucketRefreshConsumer(channel, queue_publisher, sale_buckets),
+        InvoiceFullSyncConsumer(channel, queue_publisher, invoice_sync),
         OrderWebhookConsumer(channel, queue_publisher, order_sync, sale_buckets),
         StockWebhookConsumer(channel, queue_publisher, stock_sync),
     ]

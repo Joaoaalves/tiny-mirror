@@ -618,7 +618,7 @@ class SyncLogORM(Base):
     __tablename__ = "sync_logs"
     __table_args__ = (
         CheckConstraint(
-            "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation')",
+            "sync_type IN ('products', 'orders', 'stock', 'sale_buckets', 'token_rotation', 'invoices')",
             name="valid_sync_type",
         ),
         CheckConstraint(
@@ -691,6 +691,154 @@ class MLOAuthTokenORM(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# invoices
+# ---------------------------------------------------------------------------
+class InvoiceORM(Base):
+    __tablename__ = "invoices"
+    __table_args__ = (
+        Index("ix_invoices_issue_date", "issue_date"),
+        Index("ix_invoices_status", "status"),
+        Index("ix_invoices_type", "type"),
+        Index("ix_invoices_ecommerce_order_number", "ecommerce_order_number"),
+        Index("ix_invoices_origin_id", "origin_id"),
+        {
+            "comment": (
+                "Mirror of all Notas Fiscais from Tiny ERP. "
+                "The ecommerce_order_number column is denormalised from the ecommerce JSONB "
+                "for fast lookup when reconciling NFs against orders. "
+                "origin_id links back to orders.tiny_id for the originating sale."
+            ),
+        },
+    )
+
+    tiny_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=False,
+        comment="Unique NF identifier in Tiny ERP. Never changes.",
+    )
+    number: Mapped[str] = mapped_column(String(20), nullable=False, comment="NF number (numero).")
+    series: Mapped[str] = mapped_column(String(5), nullable=False, comment="NF series (serie).")
+    access_key: Mapped[str | None] = mapped_column(
+        String(50),
+        nullable=True,
+        comment="44-digit SEFAZ access key (chaveAcesso). NULL if not yet authorized.",
+    )
+    status: Mapped[str] = mapped_column(
+        String(5),
+        nullable=False,
+        comment="Tiny status code (situacao). '6'=authorized, '4'=cancelled.",
+    )
+    type: Mapped[str] = mapped_column(
+        String(5),
+        nullable=False,
+        comment="NF type (tipo). 'S'=sale (saída).",
+    )
+    issue_date: Mapped[date] = mapped_column(
+        Date, nullable=False, comment="Emission date (dataEmissao)."
+    )
+    forecast_date: Mapped[date | None] = mapped_column(
+        Date, nullable=True, comment="Forecast date (dataPrevista)."
+    )
+    customer: Mapped[dict[str, Any]] = mapped_column(
+        JSONB,
+        nullable=False,
+        server_default=text("'{}'::jsonb"),
+        comment="Full customer object (cliente) — name, CPF/CNPJ, address.",
+    )
+    delivery_address: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Delivery address (enderecoEntrega). NULL when same as customer address.",
+    )
+    seller: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB, nullable=True, comment="Seller object (vendedor)."
+    )
+    total_value: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+        server_default=text("0"),
+        comment="Total NF value (valor).",
+    )
+    products_value: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+        server_default=text("0"),
+        comment="Products subtotal (valorProdutos).",
+    )
+    freight_value: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+        server_default=text("0"),
+        comment="Freight value (valorFrete).",
+    )
+    shipping_method_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="Shipping method ID (idFormaEnvio)."
+    )
+    freight_type_id: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment="Freight type ID (idFormaFrete). 0 treated as NULL."
+    )
+    tracking_code: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, comment="Carrier tracking code (codigoRastreamento)."
+    )
+    tracking_url: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="Carrier tracking URL (urlRastreamento)."
+    )
+    freight_responsibility: Mapped[str | None] = mapped_column(
+        String(5),
+        nullable=True,
+        comment="Freight responsibility (fretePorConta). 'T'=carrier, 'R'=recipient.",
+    )
+    volume_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="Number of shipping volumes (qtdVolumes)."
+    )
+    gross_weight: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 4), nullable=True, comment="Gross weight in kg (pesoBruto)."
+    )
+    net_weight: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 4), nullable=True, comment="Net weight in kg (pesoLiquido)."
+    )
+    ecommerce: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Full ecommerce object: id, nome, numeroPedidoEcommerce, "
+            "numeroPedidoCanalVenda, canalVenda."
+        ),
+    )
+    ecommerce_order_number: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+        comment=(
+            "Denormalised ecommerce.numeroPedidoEcommerce. "
+            "For ML: may be the pack_id or the order_id stored by Tiny."
+        ),
+    )
+    origin_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment="Tiny order ID that originated this NF (origem.id cast to int).",
+    )
+    origin_type: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment="Origin document type (origem.tipo). Typically 'venda'."
+    )
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Last time this record was fetched from the Tiny API.",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

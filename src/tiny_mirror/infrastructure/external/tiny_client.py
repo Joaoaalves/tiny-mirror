@@ -102,6 +102,20 @@ class TinyAPIClient:
     async def get_stock(self, product_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/estoque/{product_id}")
 
+    async def list_invoices(
+        self,
+        date_initial: datetime | date | str | None = None,
+        date_final: datetime | date | str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": limit, "offset": offset}
+        if date_initial is not None:
+            params["dataInicial"] = _format_date_only(date_initial)
+        if date_final is not None:
+            params["dataFinal"] = _format_date_only(date_final)
+        return await self._request("GET", "/notas", params=params)
+
     # ------------------------------------------------------------------
     # Internal: request pipeline
     # ------------------------------------------------------------------

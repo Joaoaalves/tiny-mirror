@@ -31,6 +31,13 @@ from tiny_mirror.infrastructure.repositories.sync_log_repository import (
 from tiny_mirror.mappers.order_mapper import OrderMapper
 from tiny_mirror.queue.publisher import QueuePublisher
 
+# Avoid a circular import — InvoiceSyncService imports from queue.publisher too,
+# but the dependency is one-way: order_sync → invoice_sync (never the reverse).
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
+
 logger = structlog.get_logger(__name__)
 
 PAGE_SIZE = 100
@@ -43,9 +50,11 @@ class OrderSyncService:
         self,
         tiny_client: TinyAPIClient,
         queue_publisher: QueuePublisher,
+        invoice_sync: "InvoiceSyncService | None" = None,
     ) -> None:
         self._tiny = tiny_client
         self._publisher = queue_publisher
+        self._invoice_sync = invoice_sync
 
     # ------------------------------------------------------------------
     # Incremental — hourly scheduler entry point
@@ -99,6 +108,19 @@ class OrderSyncService:
         date_to = datetime.now(UTC).date()
         await self._publisher.publish_sync_message(
             "buckets.refresh",
+            {
+                "date_from": date_from.isoformat(),
+                "date_to": date_to.isoformat(),
+                "triggered_by": "order_sync",
+                "published_at": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        # Trigger an invoice sync for the same window so that NFs for newly
+        # synced orders are pulled without waiting for the daily invoice cron.
+        # sync_log_id is omitted — this lightweight sync runs untracked.
+        await self._publisher.publish_sync_message(
+            "invoices.full",
             {
                 "date_from": date_from.isoformat(),
                 "date_to": date_to.isoformat(),

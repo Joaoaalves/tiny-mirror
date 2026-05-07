@@ -23,6 +23,9 @@ from apscheduler.triggers.cron import CronTrigger
 
 from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
+from tiny_mirror.infrastructure.repositories.invoice_repository import (
+    PostgreSQLInvoiceRepository,
+)
 from tiny_mirror.infrastructure.repositories.product_repository import (
     PostgreSQLProductRepository,
 )
@@ -82,6 +85,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "sale_buckets_refresh": CronTrigger.from_crontab(
                 settings.sync_buckets_cron, timezone="UTC"
             ),
+            "invoices_sync": CronTrigger.from_crontab(
+                settings.sync_invoices_cron, timezone="UTC"
+            ),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
@@ -110,6 +116,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _sale_buckets_refresh() -> None:
         await sale_buckets_refresh_job(publisher)
+
+    async def _invoices_sync() -> None:
+        await invoices_sync_job(publisher)
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
@@ -151,6 +160,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         replace_existing=True,
     )
     scheduler.add_job(
+        _invoices_sync,
+        trigger=triggers["invoices_sync"],
+        id="invoices_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
         _sync_log_watchdog,
         trigger=triggers["sync_log_watchdog"],
         id="sync_log_watchdog",
@@ -177,73 +192,101 @@ async def check_and_trigger_initial_sync(app: FastAPI) -> None:
 
     async with AsyncSessionLocal() as session:
         product_count = await PostgreSQLProductRepository(session).count()
+        invoice_count = await PostgreSQLInvoiceRepository(session).count()
 
     if product_count > 0:
         logger.info(
-            "Database has existing data, skipping initial sync",
+            "Database has existing data, skipping orders/products/stock initial sync",
             product_count=product_count,
         )
-        return
-
-    logger.info(
-        "Empty database detected, triggering initial historical sync. " "This may take a while."
-    )
-
-    today = datetime.now(UTC).date()
-    history_start = today - timedelta(days=90)
-
-    async with AsyncSessionLocal() as session:
-        sync_logs = SyncLogRepository(session)
-        products_log = await sync_logs.create_sync_log(
-            "products", metadata={"triggered_by": "initial_sync"}
+    else:
+        logger.info(
+            "Empty database detected, triggering initial historical sync. This may take a while."
         )
-        orders_log = await sync_logs.create_sync_log(
-            "orders",
-            metadata={
+
+        today = datetime.now(UTC).date()
+        history_start = today - timedelta(days=90)
+
+        async with AsyncSessionLocal() as session:
+            sync_logs = SyncLogRepository(session)
+            products_log = await sync_logs.create_sync_log(
+                "products", metadata={"triggered_by": "initial_sync"}
+            )
+            orders_log = await sync_logs.create_sync_log(
+                "orders",
+                metadata={
+                    "triggered_by": "initial_sync",
+                    "days": 90,
+                    "date_from": history_start.isoformat(),
+                    "date_to": today.isoformat(),
+                },
+            )
+            stock_log = await sync_logs.create_sync_log(
+                "stock", metadata={"triggered_by": "initial_sync"}
+            )
+
+        await publisher.publish_sync_message(
+            "products.full",
+            {
                 "triggered_by": "initial_sync",
-                "days": 90,
-                "date_from": history_start.isoformat(),
-                "date_to": today.isoformat(),
+                "sync_log_id": products_log,
+                "published_at": datetime.now(UTC).isoformat(),
             },
         )
-        stock_log = await sync_logs.create_sync_log(
-            "stock", metadata={"triggered_by": "initial_sync"}
+        await publisher.publish_sync_message(
+            "orders.full",
+            {
+                "is_historical": True,
+                "date_from": history_start.isoformat(),
+                "date_to": today.isoformat(),
+                "lookback_hours": None,
+                "sync_log_id": orders_log,
+                "published_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        await publisher.publish_sync_message(
+            "stock.full",
+            {
+                "sync_log_id": stock_log,
+                "published_at": datetime.now(UTC).isoformat(),
+            },
         )
 
-    await publisher.publish_sync_message(
-        "products.full",
-        {
-            "triggered_by": "initial_sync",
-            "sync_log_id": products_log,
-            "published_at": datetime.now(UTC).isoformat(),
-        },
-    )
-    await publisher.publish_sync_message(
-        "orders.full",
-        {
-            "is_historical": True,
-            "date_from": history_start.isoformat(),
-            "date_to": today.isoformat(),
-            "lookback_hours": None,
-            "sync_log_id": orders_log,
-            "published_at": datetime.now(UTC).isoformat(),
-        },
-    )
-    await publisher.publish_sync_message(
-        "stock.full",
-        {
-            "sync_log_id": stock_log,
-            "published_at": datetime.now(UTC).isoformat(),
-        },
-    )
+        logger.info(
+            "Initial sync triggered. Products, orders (90 days) and stock are "
+            "being synchronized in the background.",
+            products_sync_log_id=products_log,
+            orders_sync_log_id=orders_log,
+            stock_sync_log_id=stock_log,
+        )
 
-    logger.info(
-        "Initial sync triggered. Products, orders (90 days) and stock are "
-        "being synchronized in the background.",
-        products_sync_log_id=products_log,
-        orders_sync_log_id=orders_log,
-        stock_sync_log_id=stock_log,
-    )
+    # Invoice cold start is independent of the orders/products check — it runs
+    # whenever the invoices table is empty, even on a redeploy against an
+    # existing DB that already has orders but was updated to add invoice sync.
+    if invoice_count == 0:
+        logger.info(
+            "Invoices table empty, triggering cold start. "
+            "This will sync all historical NFs and may take several minutes."
+        )
+        async with AsyncSessionLocal() as session:
+            invoices_log = await SyncLogRepository(session).create_sync_log(
+                "invoices",
+                metadata={"triggered_by": "cold_start"},
+            )
+        await publisher.publish_sync_message(
+            "invoices.full",
+            {
+                "is_cold_start": True,
+                "sync_log_id": invoices_log,
+                "published_at": datetime.now(UTC).isoformat(),
+            },
+        )
+        logger.info("Invoice cold start triggered", invoices_sync_log_id=invoices_log)
+    else:
+        logger.info(
+            "Invoices table has existing data, skipping cold start",
+            invoice_count=invoice_count,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +421,17 @@ async def sync_log_watchdog_job() -> None:
             count=closed,
             max_minutes=settings.sync_log_running_max_minutes,
         )
+
+
+async def invoices_sync_job(publisher: QueuePublisher) -> None:
+    logger.info("Invoices sync job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="invoices",
+        queue_type="invoices.full",
+        message_extra={},
+        log_metadata={"triggered_by": "scheduler"},
+    )
 
 
 async def sale_buckets_refresh_job(publisher: QueuePublisher) -> None:
