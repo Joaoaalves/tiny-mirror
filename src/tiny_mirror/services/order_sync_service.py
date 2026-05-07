@@ -14,6 +14,7 @@ share between long-lived consumer contexts.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy import select
@@ -31,10 +32,6 @@ from tiny_mirror.infrastructure.repositories.sync_log_repository import (
 from tiny_mirror.mappers.order_mapper import OrderMapper
 from tiny_mirror.queue.publisher import QueuePublisher
 
-# Avoid a circular import — InvoiceSyncService imports from queue.publisher too,
-# but the dependency is one-way: order_sync → invoice_sync (never the reverse).
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
     from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 
@@ -50,7 +47,7 @@ class OrderSyncService:
         self,
         tiny_client: TinyAPIClient,
         queue_publisher: QueuePublisher,
-        invoice_sync: "InvoiceSyncService | None" = None,
+        invoice_sync: InvoiceSyncService | None = None,
     ) -> None:
         self._tiny = tiny_client
         self._publisher = queue_publisher
