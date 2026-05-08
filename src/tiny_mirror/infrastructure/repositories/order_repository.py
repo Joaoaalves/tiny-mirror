@@ -45,28 +45,39 @@ class PostgreSQLOrderRepository(OrderRepository):
             return
 
         # The FK on product_tiny_id is nullable on purpose: an order may
-        # reference a product that hasn't been synced yet. Resolve every id
-        # against the products table and replace unknowns with NULL so the
-        # INSERT cannot raise ForeignKeyViolationError. product_sku stays as
-        # the stable identifier.
+        # reference a product that hasn't been synced yet. Resolution order:
+        # 1. Use the product_tiny_id from the API if it exists in our products table.
+        # 2. Fall back to a SKU lookup so orders synced before the product was
+        #    mirrored don't permanently lose their product link.
+        # product_sku is always stored as the stable text identifier.
         from tiny_mirror.infrastructure.orm.models import ProductORM
 
         candidate_ids = {
             item.get("product_tiny_id") for item in items if item.get("product_tiny_id") is not None
         }
+        candidate_skus = {
+            item.get("product_sku") for item in items if item.get("product_sku")
+        }
         existing_ids: set[int] = set()
+        sku_to_id: dict[str, int] = {}
         if candidate_ids:
             existing = await self._session.execute(
                 select(ProductORM.tiny_id).where(ProductORM.tiny_id.in_(candidate_ids))
             )
             existing_ids = {int(tid) for (tid,) in existing.all()}
+        if candidate_skus:
+            sku_rows = await self._session.execute(
+                select(ProductORM.sku, ProductORM.tiny_id).where(ProductORM.sku.in_(candidate_skus))
+            )
+            sku_to_id = {sku: int(tid) for sku, tid in sku_rows.all()}
 
         rows = []
         for item in items:
             raw_pid = item.get("product_tiny_id")
-            resolved = (
-                int(raw_pid) if raw_pid is not None and int(raw_pid) in existing_ids else None
-            )
+            if raw_pid is not None and int(raw_pid) in existing_ids:
+                resolved = int(raw_pid)
+            else:
+                resolved = sku_to_id.get(item.get("product_sku") or "")
             rows.append(
                 {
                     "order_tiny_id": order_tiny_id,
