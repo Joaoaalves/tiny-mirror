@@ -128,10 +128,16 @@ class ProductSyncService:
 
         product_data = ProductMapper.from_tiny_api(raw)
 
+        # Capture any error so the sync-log update always runs in a fresh
+        # session. If we re-raised inside the `async with` block the session
+        # would roll back, and a subsequent execute() on the same connection
+        # (still in the aborted-transaction state) would fail silently,
+        # leaving items_processed + items_failed stuck below total_enqueued
+        # and the sync_log running until the watchdog closes it.
+        processing_error: Exception | None = None
+        action = "unknown"
         async with AsyncSessionLocal() as session:
             products = PostgreSQLProductRepository(session)
-            sync_logs = SyncLogRepository(session)
-
             try:
                 action = await products.upsert(product_data)
 
@@ -145,9 +151,6 @@ class ProductSyncService:
                         sku=product_data["sku"],
                         components_count=len(components),
                     )
-
-                await sync_logs.increment_processed(sync_log_id)
-                await sync_logs.try_finalize(sync_log_id)
             except TinyAPIException as exc:
                 logger.error(
                     "Tiny API error while syncing product",
@@ -155,18 +158,26 @@ class ProductSyncService:
                     error=str(exc),
                     status_code=exc.status_code,
                 )
-                await sync_logs.increment_failed(sync_log_id)
-                await sync_logs.try_finalize(sync_log_id)
-                raise
+                processing_error = exc
             except Exception as exc:
                 logger.error(
                     "Database error while syncing product",
                     product_tiny_id=product_tiny_id,
                     error=str(exc),
                 )
+                processing_error = exc
+
+        # Fresh session: always commits regardless of what happened above.
+        async with AsyncSessionLocal() as log_session:
+            sync_logs = SyncLogRepository(log_session)
+            if processing_error is not None:
                 await sync_logs.increment_failed(sync_log_id)
-                await sync_logs.try_finalize(sync_log_id)
-                raise
+            else:
+                await sync_logs.increment_processed(sync_log_id)
+            await sync_logs.try_finalize(sync_log_id)
+
+        if processing_error is not None:
+            raise processing_error
 
         logger.info(
             "Product synced",

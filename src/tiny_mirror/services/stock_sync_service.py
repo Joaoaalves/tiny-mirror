@@ -152,6 +152,10 @@ class StockSyncService:
             if ml_qty is not None:
                 _overlay_ml_full_deposit(deposits, ml_qty)
 
+        # Same isolation pattern as product_sync_service: capture errors
+        # so the sync-log update always runs in a fresh session and never
+        # inherits an aborted-transaction state from the stock upsert.
+        processing_error: Exception | None = None
         async with AsyncSessionLocal() as session:
             # Stock rows have a FK -> products.tiny_id (CASCADE on delete).
             # If the product has not been mirrored yet, the FK insert would
@@ -169,14 +173,9 @@ class StockSyncService:
                 return
 
             stock_repo = PostgreSQLStockRepository(session)
-            sync_logs = SyncLogRepository(session)
-
             try:
                 await stock_repo.upsert(stock_data)
                 await stock_repo.upsert_deposits(product_tiny_id, deposits)
-                if sync_log_id is not None:
-                    await sync_logs.increment_processed(sync_log_id)
-                    await sync_logs.try_finalize(sync_log_id)
             except TinyAPIException as exc:
                 logger.error(
                     "Tiny API error while syncing stock",
@@ -184,20 +183,26 @@ class StockSyncService:
                     error=str(exc),
                     status_code=exc.status_code,
                 )
-                if sync_log_id is not None:
-                    await sync_logs.increment_failed(sync_log_id)
-                    await sync_logs.try_finalize(sync_log_id)
-                raise
+                processing_error = exc
             except Exception as exc:
                 logger.error(
                     "Database error while syncing stock",
                     product_tiny_id=product_tiny_id,
                     error=str(exc),
                 )
-                if sync_log_id is not None:
+                processing_error = exc
+
+        if sync_log_id is not None:
+            async with AsyncSessionLocal() as log_session:
+                sync_logs = SyncLogRepository(log_session)
+                if processing_error is not None:
                     await sync_logs.increment_failed(sync_log_id)
-                    await sync_logs.try_finalize(sync_log_id)
-                raise
+                else:
+                    await sync_logs.increment_processed(sync_log_id)
+                await sync_logs.try_finalize(sync_log_id)
+
+        if processing_error is not None:
+            raise processing_error
 
         logger.info(
             "Stock synced",
