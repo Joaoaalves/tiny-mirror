@@ -196,6 +196,8 @@ WITH DATA;
 
 _CREATE_INDEX = "CREATE UNIQUE INDEX mv_coverage_sku ON mv_coverage (sku);"
 
+_GRANT_PREFIX_TABLE = "GRANT SELECT ON sku_prefix_supplier TO tiny_mirror, tiny_readonly;"
+
 _GRANT = "GRANT SELECT ON mv_coverage TO tiny_readonly;"
 
 _COMMENT = (
@@ -206,6 +208,7 @@ _COMMENT = (
 
 
 def upgrade() -> None:
+    op.execute(_GRANT_PREFIX_TABLE)
     op.execute(_DROP_VIEW)
     op.execute(_CREATE_VIEW)
     op.execute(_CREATE_INDEX)
