@@ -171,6 +171,20 @@ class PostgreSQLProductRepository(ProductRepository):
             bucket.setdefault(int(row.kit_product_tiny_id), []).append(_row_to_dict(row))
         return bucket
 
+    async def get_parent_kits_for_sku(self, component_sku: str) -> list[tuple[str, int]]:
+        """Return (kit_sku, component_quantity) for every active kit that contains
+        this SKU as a component. Used to include kit fulfillment inventory in ML
+        stock counts — a kit with quantity=1 of this component adds available_quantity
+        units to the component's effective ML stock.
+        """
+        result = await self._session.execute(
+            select(ProductORM.sku, ProductKitComponentORM.quantity)
+            .join(ProductORM, ProductORM.tiny_id == ProductKitComponentORM.kit_product_tiny_id)
+            .where(ProductKitComponentORM.component_sku == component_sku)
+            .where(ProductORM.situation == "A")
+        )
+        return [(sku, int(qty)) for sku, qty in result.all()]
+
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
     return {col.name: getattr(row, col.name) for col in row.__table__.columns}
