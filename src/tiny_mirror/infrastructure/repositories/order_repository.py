@@ -55,9 +55,7 @@ class PostgreSQLOrderRepository(OrderRepository):
         candidate_ids = {
             item.get("product_tiny_id") for item in items if item.get("product_tiny_id") is not None
         }
-        candidate_skus = {
-            item.get("product_sku") for item in items if item.get("product_sku")
-        }
+        candidate_skus = {item.get("product_sku") for item in items if item.get("product_sku")}
         existing_ids: set[int] = set()
         sku_to_id: dict[str, int] = {}
         if candidate_ids:
@@ -74,6 +72,7 @@ class PostgreSQLOrderRepository(OrderRepository):
         rows = []
         for item in items:
             raw_pid = item.get("product_tiny_id")
+            resolved: int | None
             if raw_pid is not None and int(raw_pid) in existing_ids:
                 resolved = int(raw_pid)
             else:

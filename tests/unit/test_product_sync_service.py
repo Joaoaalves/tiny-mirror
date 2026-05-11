@@ -115,9 +115,7 @@ async def test_increments_failed_and_reraises_on_tiny_api_error(
     product_session = AsyncMock()
     log_session = AsyncMock()
     mock_product_repo = AsyncMock()
-    mock_product_repo.upsert = AsyncMock(
-        side_effect=TinyAPIException("API error", status_code=500)
-    )
+    mock_product_repo.upsert = AsyncMock(side_effect=TinyAPIException("API error", status_code=500))
     mock_sync_log_repo = AsyncMock()
 
     with (
@@ -146,14 +144,10 @@ async def test_increments_failed_and_reraises_on_tiny_api_error(
 # ---------------------------------------------------------------------------
 async def test_skips_silently_when_product_not_found(service: ProductSyncService) -> None:
     service._tiny.get_product = AsyncMock(
-        side_effect=TinyNotFoundException(
-            "not found", resource_type="produto", resource_id=42
-        )
+        side_effect=TinyNotFoundException("not found", resource_type="produto", resource_id=42)
     )
 
-    with patch(
-        "tiny_mirror.services.product_sync_service.AsyncSessionLocal"
-    ) as mock_sl:
+    with patch("tiny_mirror.services.product_sync_service.AsyncSessionLocal") as mock_sl:
         await service.process_product_item(42, sync_log_id=7)
 
     mock_sl.assert_not_called()
