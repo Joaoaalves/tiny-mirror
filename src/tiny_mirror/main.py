@@ -26,6 +26,7 @@ from tiny_mirror.database import AsyncSessionLocal, close_database, initialize_d
 from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
 from tiny_mirror.infrastructure.external.rate_limiter import RateLimiter
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
+from tiny_mirror.infrastructure.external.tiny_v2_client import TinyV2Client
 from tiny_mirror.logging_config import configure_logging
 from tiny_mirror.queue.bootstrap import start_consumers
 from tiny_mirror.queue.publisher import QueuePublisher
@@ -37,7 +38,6 @@ from tiny_mirror.scheduler.jobs import (
     setup_scheduler,
     shutdown_scheduler,
 )
-from tiny_mirror.infrastructure.external.tiny_v2_client import TinyV2Client
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.order_sync_service import OrderSyncService
