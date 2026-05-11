@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import urllib.parse
+from datetime import date
 from typing import Any
 
 import httpx
@@ -88,3 +89,64 @@ class TinyV2Client:
             saldo=retorno.get("registros", {}).get("registro", {}).get("saldoEstoque"),
         )
         return body
+
+    async def list_stock_updates(self, from_date: date) -> list[dict[str, Any]]:
+        """Return all products with stock changes since *from_date*.
+
+        Calls ``lista.atualizacoes.estoque`` with the given date as
+        ``dataAlteracao``. The API returns the *current* deposit balances
+        for every product that changed since that date — not a diff log.
+        The 30-day lookback is the API maximum.
+
+        Returns the inner list of product dicts (each has ``id``,
+        ``codigo``, ``depositos``). Empty list on no results.
+        """
+        date_str = from_date.strftime("%d/%m/%Y")
+        params = {
+            "token": self._token,
+            "formato": "json",
+            "dataAlteracao": date_str,
+        }
+        url = f"{BASE_URL}/lista.atualizacoes.estoque?{urllib.parse.urlencode(params)}"
+
+        try:
+            response = await self._http.get(url, timeout=60)
+        except httpx.TimeoutException as exc:
+            raise TinyAPIException("Tiny v2 list_stock_updates timed out") from exc
+        except (httpx.ConnectError, httpx.NetworkError) as exc:
+            raise TinyAPIException(f"Tiny v2 network error: {exc}") from exc
+
+        if response.status_code != 200:
+            raise TinyAPIException(
+                f"Tiny v2 returned HTTP {response.status_code}",
+                status_code=response.status_code,
+                response_body=response.text[:500],
+            )
+
+        try:
+            body: dict[str, Any] = response.json()
+        except ValueError as exc:
+            raise TinyAPIException(
+                "Tiny v2 returned invalid JSON",
+                response_body=response.text[:200],
+            ) from exc
+
+        retorno = body.get("retorno", {})
+        if retorno.get("status") != "OK":
+            error_msg = retorno.get("erros") or retorno.get("status", "")
+            if "nenhum" in str(error_msg).lower() or retorno.get("status_processamento") == "2":
+                return []
+            raise TinyAPIException(
+                f"Tiny v2 list_stock_updates failed: {error_msg}",
+                response_body=response.text[:500],
+            )
+
+        raw_products = retorno.get("produtos") or []
+        result: list[dict[str, Any]] = []
+        for item in raw_products:
+            p = item.get("produto") if isinstance(item, dict) else None
+            if p:
+                result.append(p)
+
+        logger.debug("Tiny v2 stock updates fetched", from_date=date_str, count=len(result))
+        return result

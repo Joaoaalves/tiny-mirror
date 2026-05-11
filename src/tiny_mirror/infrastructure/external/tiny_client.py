@@ -116,6 +116,17 @@ class TinyAPIClient:
             params["dataFinal"] = _format_date_only(date_final)
         return await self._request("GET", "/notas", params=params)
 
+    async def list_purchase_orders(self, offset: int = 0, limit: int = 100) -> dict[str, Any]:
+        """Return a page of Ordens de Compra from Tiny v3.
+
+        Response shape: ``{"itens": [...], "paginacao": {"total": N, ...}}``.
+        Each item contains id, numero, data, situacao, dataPrevista,
+        totalProdutos, totalPedidoCompra, and contato (supplier info).
+        """
+        return await self._request(
+            "GET", "/ordem-compra", params={"limit": limit, "offset": offset}
+        )
+
     # ------------------------------------------------------------------
     # Internal: request pipeline
     # ------------------------------------------------------------------

@@ -37,11 +37,14 @@ from tiny_mirror.scheduler.jobs import (
     setup_scheduler,
     shutdown_scheduler,
 )
+from tiny_mirror.infrastructure.external.tiny_v2_client import TinyV2Client
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
+from tiny_mirror.services.purchase_order_sync_service import PurchaseOrderSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
+from tiny_mirror.services.stock_history_sync_service import StockHistorySyncService
 from tiny_mirror.services.stock_sync_service import StockSyncService
 from tiny_mirror.services.token_service import TokenService
 
@@ -84,6 +87,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             http_client=app.state.http_client,
         )
         app.state.tiny_client = tiny_client
+
+        tiny_v2_client = TinyV2Client(
+            token=settings.tiny_v2_token,
+            http_client=app.state.http_client,
+        )
 
         # Mercado Livre overlay — optional. When ML_CLIENT_ID is set, every
         # per-product stock sync also pulls Full ML available_quantity from
@@ -138,6 +146,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
             sale_buckets=SaleBucketService(),
             invoice_sync=invoice_sync,
+            stock_history_sync=StockHistorySyncService(tiny_v2=tiny_v2_client),
+            purchase_order_sync=PurchaseOrderSyncService(tiny_client=tiny_client),
         )
 
         scheduler = setup_scheduler(app)

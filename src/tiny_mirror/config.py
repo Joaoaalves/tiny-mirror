@@ -31,6 +31,8 @@ class Settings(BaseSettings):
     tiny_client_secret: str
     tiny_access_token: str
     tiny_refresh_token: str
+    # Tiny v2 static API token (used for write ops and stock history sync)
+    tiny_v2_token: str = ""
     # Optional: when set, webhook handlers reject payloads whose `cnpj`
     # field does not match. Leave empty to accept any cnpj (still logged).
     tiny_expected_cnpj: str = ""
@@ -88,6 +90,10 @@ class Settings(BaseSettings):
     # The incremental path (2-day lookback) also fires automatically after each
     # order sync cycle to keep NF coverage fresh.
     sync_invoices_cron: str = "0 5 * * *"
+    # Stock history (deposit snapshots): daily at 01:00 UTC
+    sync_stock_history_cron: str = "0 1 * * *"
+    # Purchase orders: weekly on Sunday at 06:00 UTC
+    sync_purchase_orders_cron: str = "0 6 * * 0"
 
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90

@@ -19,6 +19,10 @@ from tiny_mirror.queue.consumers.product_consumers import (
     ProductFullSyncConsumer,
     ProductItemConsumer,
 )
+from tiny_mirror.queue.consumers.purchase_order_consumers import (
+    PurchaseOrderFullSyncConsumer,
+    StockHistoryFullSyncConsumer,
+)
 from tiny_mirror.queue.consumers.stock_consumers import (
     StockFullSyncConsumer,
     StockItemConsumer,
@@ -31,7 +35,9 @@ from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
+from tiny_mirror.services.purchase_order_sync_service import PurchaseOrderSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
+from tiny_mirror.services.stock_history_sync_service import StockHistorySyncService
 from tiny_mirror.services.stock_sync_service import StockSyncService
 
 logger = structlog.get_logger(__name__)
@@ -46,6 +52,8 @@ async def start_consumers(
     stock_sync: StockSyncService,
     sale_buckets: SaleBucketService,
     invoice_sync: InvoiceSyncService,
+    stock_history_sync: StockHistorySyncService,
+    purchase_order_sync: PurchaseOrderSyncService,
 ) -> list[BaseConsumer]:
     """Register every consumer on the shared channel and return the instances.
 
@@ -63,6 +71,8 @@ async def start_consumers(
         StockItemConsumer(channel, queue_publisher, stock_sync),
         BucketRefreshConsumer(channel, queue_publisher, sale_buckets),
         InvoiceFullSyncConsumer(channel, queue_publisher, invoice_sync),
+        StockHistoryFullSyncConsumer(channel, queue_publisher, stock_history_sync),
+        PurchaseOrderFullSyncConsumer(channel, queue_publisher, purchase_order_sync),
         OrderWebhookConsumer(channel, queue_publisher, order_sync, sale_buckets),
         StockWebhookConsumer(channel, queue_publisher, stock_sync),
     ]

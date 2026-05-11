@@ -26,6 +26,8 @@ QUEUE_BINDINGS: tuple[tuple[str, str], ...] = (
     ("tiny.sync.stock.item", "sync.stock.item"),
     ("tiny.sync.buckets.refresh", "sync.buckets.refresh"),
     ("tiny.sync.invoices.full", "sync.invoices.full"),
+    ("tiny.sync.stock_history.full", "sync.stock_history.full"),
+    ("tiny.sync.purchase_orders.full", "sync.purchase_orders.full"),
     ("tiny.webhooks.orders", "webhooks.orders"),
     ("tiny.webhooks.stock", "webhooks.stock"),
 )

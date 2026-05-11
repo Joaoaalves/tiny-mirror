@@ -86,6 +86,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
                 settings.sync_buckets_cron, timezone="UTC"
             ),
             "invoices_sync": CronTrigger.from_crontab(settings.sync_invoices_cron, timezone="UTC"),
+            "stock_history_sync": CronTrigger.from_crontab(
+                settings.sync_stock_history_cron, timezone="UTC"
+            ),
+            "purchase_orders_sync": CronTrigger.from_crontab(
+                settings.sync_purchase_orders_cron, timezone="UTC"
+            ),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
@@ -117,6 +123,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _invoices_sync() -> None:
         await invoices_sync_job(publisher)
+
+    async def _stock_history_sync() -> None:
+        await stock_history_sync_job(publisher)
+
+    async def _purchase_orders_sync() -> None:
+        await purchase_orders_sync_job(publisher)
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
@@ -161,6 +173,18 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _invoices_sync,
         trigger=triggers["invoices_sync"],
         id="invoices_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _stock_history_sync,
+        trigger=triggers["stock_history_sync"],
+        id="stock_history_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _purchase_orders_sync,
+        trigger=triggers["purchase_orders_sync"],
+        id="purchase_orders_sync",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -432,6 +456,28 @@ async def invoices_sync_job(publisher: QueuePublisher) -> None:
     )
 
 
+async def stock_history_sync_job(publisher: QueuePublisher) -> None:
+    logger.info("Stock history sync job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="stock_history",
+        queue_type="stock_history.full",
+        message_extra={"triggered_by": "scheduler"},
+        log_metadata={"triggered_by": "scheduler"},
+    )
+
+
+async def purchase_orders_sync_job(publisher: QueuePublisher) -> None:
+    logger.info("Purchase orders sync job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="purchase_orders",
+        queue_type="purchase_orders.full",
+        message_extra={"triggered_by": "scheduler"},
+        log_metadata={"triggered_by": "scheduler"},
+    )
+
+
 async def sale_buckets_refresh_job(publisher: QueuePublisher) -> None:
     logger.info("Sale buckets refresh job started")
     today: date = datetime.now(UTC).date()
@@ -516,10 +562,12 @@ __all__ = [
     "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",
+    "purchase_orders_sync_job",
     "sale_buckets_refresh_job",
     "setup_scheduler",
     "shutdown_scheduler",
     "stock_full_sync_job",
+    "stock_history_sync_job",
     "sync_log_watchdog_job",
     "token_rotation_job",
 ]
