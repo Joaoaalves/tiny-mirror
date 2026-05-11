@@ -30,10 +30,16 @@ class StockHistorySyncService:
     def __init__(self, tiny_v2: TinyV2Client) -> None:
         self._v2 = tiny_v2
 
-    async def run_sync(self, sync_log_id: int) -> None:
-        """Fetch stock updates since yesterday and upsert into stock_history."""
-        since = datetime.now(UTC).date() - timedelta(days=1)
-        logger.info("Starting stock history sync", since=since.isoformat(), sync_log_id=sync_log_id)
+    async def run_sync(self, sync_log_id: int, lookback_days: int = 1) -> None:
+        """Fetch stock updates since ``lookback_days`` ago and upsert into stock_history."""
+        lookback_days = max(1, min(lookback_days, 30))
+        since = datetime.now(UTC).date() - timedelta(days=lookback_days)
+        logger.info(
+            "Starting stock history sync",
+            since=since.isoformat(),
+            lookback_days=lookback_days,
+            sync_log_id=sync_log_id,
+        )
 
         try:
             products = await self._v2.list_stock_updates(since)

@@ -240,6 +240,66 @@ async def sync_orders(
     return SyncTriggerResponse(message="Order sync triggered", sync_log_id=sync_log_id)
 
 
+class StockHistorySyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    lookback_days: int = Field(default=1, ge=1, le=30)
+
+
+@router.post(
+    "/stock_history",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SyncTriggerResponse,
+)
+async def sync_stock_history(
+    body: StockHistorySyncRequest = Body(default_factory=StockHistorySyncRequest),
+    sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
+    publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> SyncTriggerResponse:
+    await _acquire_sync_lock(redis_client, "stock_history")
+    sync_log_id = await sync_logs.create_sync_log(
+        "stock_history",
+        metadata={"triggered_by": "manual", "lookback_days": body.lookback_days},
+    )
+    await publisher.publish_sync_message(
+        "stock_history.full",
+        {
+            "sync_log_id": sync_log_id,
+            "lookback_days": body.lookback_days,
+            "published_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return SyncTriggerResponse(
+        message=f"Stock history sync triggered (lookback_days={body.lookback_days})",
+        sync_log_id=sync_log_id,
+    )
+
+
+@router.post(
+    "/purchase_orders",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SyncTriggerResponse,
+)
+async def sync_purchase_orders(
+    sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
+    publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> SyncTriggerResponse:
+    await _acquire_sync_lock(redis_client, "purchase_orders")
+    sync_log_id = await sync_logs.create_sync_log(
+        "purchase_orders", metadata={"triggered_by": "manual"}
+    )
+    await publisher.publish_sync_message(
+        "purchase_orders.full",
+        {
+            "sync_log_id": sync_log_id,
+            "published_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return SyncTriggerResponse(message="Purchase orders sync triggered", sync_log_id=sync_log_id)
+
+
 @router.post(
     "/stock",
     status_code=status.HTTP_202_ACCEPTED,

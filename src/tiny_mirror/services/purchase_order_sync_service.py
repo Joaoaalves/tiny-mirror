@@ -205,19 +205,19 @@ class PurchaseOrderSyncService:
                     INSERT INTO supplier_lead_times (supplier_name, lead_time_days, sample_count, last_computed)
                     SELECT
                         supplier_name,
-                        PERCENTILE_CONT(0.5) WITHIN GROUP (
+                        GREATEST(1, PERCENTILE_CONT(0.5) WITHIN GROUP (
                             ORDER BY (
                                 COALESCE(completed_at::date, date_prevista) - data
                             )::float
-                        )::numeric(5,1) AS lead_time_days,
+                        ))::numeric(5,1) AS lead_time_days,
                         COUNT(*) AS sample_count,
                         NOW() AS last_computed
                     FROM purchase_orders
                     WHERE supplier_name IS NOT NULL
                       AND data IS NOT NULL
                       AND (
-                          (completed_at IS NOT NULL AND completed_at::date > data)
-                          OR (date_prevista IS NOT NULL AND date_prevista > data)
+                          (completed_at IS NOT NULL AND completed_at::date >= data)
+                          OR (date_prevista IS NOT NULL AND date_prevista >= data)
                       )
                       AND situacao != '5'
                     GROUP BY supplier_name

@@ -25,7 +25,8 @@ class StockHistoryFullSyncConsumer(BaseConsumer):
         self._service = stock_history_sync
 
     async def handle(self, message_body: dict[str, Any]) -> None:
-        await self._service.run_sync(int(message_body["sync_log_id"]))
+        lookback_days = int(message_body.get("lookback_days", 1))
+        await self._service.run_sync(int(message_body["sync_log_id"]), lookback_days=lookback_days)
 
 
 class PurchaseOrderFullSyncConsumer(BaseConsumer):
