@@ -32,7 +32,7 @@ class StockHistorySyncService:
 
     async def run_sync(self, sync_log_id: int) -> None:
         """Fetch stock updates since yesterday and upsert into stock_history."""
-        since = (datetime.now(UTC).date() - timedelta(days=1))
+        since = datetime.now(UTC).date() - timedelta(days=1)
         logger.info("Starting stock history sync", since=since.isoformat(), sync_log_id=sync_log_id)
 
         try:
