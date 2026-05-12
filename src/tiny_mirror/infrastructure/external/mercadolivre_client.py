@@ -80,12 +80,13 @@ class MercadoLivreAPIClient:
 
         Calls ``GET /users/{user_id}/items/search`` without a status filter
         so active, paused, and any other non-closed listings are included.
+        Uses ``search_type=scan`` for reliable deep pagination on large catalogs.
         Returns ``(mlb_ids, total)``.
         """
         data = await self._request(
             "GET",
             f"/users/{self._user_id}/items/search",
-            params={"limit": limit, "offset": offset},
+            params={"search_type": "scan", "limit": limit, "offset": offset},
         )
         results: list[str] = data.get("results") or []
         total: int = int((data.get("paging") or {}).get("total", 0))
