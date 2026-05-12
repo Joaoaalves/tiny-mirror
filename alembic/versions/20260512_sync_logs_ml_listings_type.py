@@ -16,26 +16,26 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.execute("""
-        ALTER TABLE sync_logs DROP CONSTRAINT IF EXISTS ck_sync_logs_valid_sync_type;
-        ALTER TABLE sync_logs ADD CONSTRAINT ck_sync_logs_valid_sync_type CHECK (
-            sync_type = ANY (ARRAY[
-                'products', 'orders', 'stock', 'sale_buckets',
-                'token_rotation', 'mercadolivre_stock', 'invoices',
-                'stock_history', 'purchase_orders', 'ml_listings'
-            ])
-        );
-    """)
+    op.execute("ALTER TABLE sync_logs DROP CONSTRAINT IF EXISTS ck_sync_logs_valid_sync_type")
+    op.execute(
+        "ALTER TABLE sync_logs ADD CONSTRAINT ck_sync_logs_valid_sync_type CHECK ("
+        " sync_type = ANY (ARRAY["
+        "   'products', 'orders', 'stock', 'sale_buckets',"
+        "   'token_rotation', 'mercadolivre_stock', 'invoices',"
+        "   'stock_history', 'purchase_orders', 'ml_listings'"
+        " ])"
+        ")"
+    )
 
 
 def downgrade() -> None:
-    op.execute("""
-        ALTER TABLE sync_logs DROP CONSTRAINT IF EXISTS ck_sync_logs_valid_sync_type;
-        ALTER TABLE sync_logs ADD CONSTRAINT ck_sync_logs_valid_sync_type CHECK (
-            sync_type = ANY (ARRAY[
-                'products', 'orders', 'stock', 'sale_buckets',
-                'token_rotation', 'mercadolivre_stock', 'invoices',
-                'stock_history', 'purchase_orders'
-            ])
-        );
-    """)
+    op.execute("ALTER TABLE sync_logs DROP CONSTRAINT IF EXISTS ck_sync_logs_valid_sync_type")
+    op.execute(
+        "ALTER TABLE sync_logs ADD CONSTRAINT ck_sync_logs_valid_sync_type CHECK ("
+        " sync_type = ANY (ARRAY["
+        "   'products', 'orders', 'stock', 'sale_buckets',"
+        "   'token_rotation', 'mercadolivre_stock', 'invoices',"
+        "   'stock_history', 'purchase_orders'"
+        " ])"
+        ")"
+    )
