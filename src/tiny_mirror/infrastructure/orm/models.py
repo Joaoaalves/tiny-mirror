@@ -846,3 +846,58 @@ class InvoiceORM(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+# ---------------------------------------------------------------------------
+# ml_listings
+# ---------------------------------------------------------------------------
+class MLListingORM(Base):
+    __tablename__ = "ml_listings"
+    __table_args__ = (
+        Index("ix_ml_listings_sku", "sku"),
+        Index("ix_ml_listings_logistic_type", "logistic_type"),
+        {
+            "comment": (
+                "One row per active ML listing, refreshed daily by the ml_listings sync. "
+                "Allows stock sync to look up MLB IDs from the DB instead of calling the "
+                "ML search API per product."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(50), primary_key=True)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    logistic_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    inventory_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    has_variations: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_listing_variations
+# ---------------------------------------------------------------------------
+class MLListingVariationORM(Base):
+    __tablename__ = "ml_listing_variations"
+    __table_args__ = (
+        Index("ix_ml_listing_variations_inventory_id", "inventory_id"),
+        {
+            "comment": (
+                "Per-variation inventory tracking for ML listings that have variations. "
+                "When a listing has variations, item-level inventory_id is null and each "
+                "variation carries its own inventory_id."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(
+        String(50),
+        ForeignKey("ml_listings.mlb_id", ondelete="CASCADE"),
+        primary_key=True,
+        nullable=False,
+    )
+    variation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, nullable=False)
+    inventory_id: Mapped[str | None] = mapped_column(String(50), nullable=True)

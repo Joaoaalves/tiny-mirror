@@ -301,6 +301,30 @@ async def sync_purchase_orders(
 
 
 @router.post(
+    "/ml_listings",
+    status_code=status.HTTP_202_ACCEPTED,
+    response_model=SyncTriggerResponse,
+)
+async def sync_ml_listings(
+    sync_logs: SyncLogRepository = Depends(get_sync_log_repository),
+    publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> SyncTriggerResponse:
+    await _acquire_sync_lock(redis_client, "ml_listings")
+    sync_log_id = await sync_logs.create_sync_log(
+        "ml_listings", metadata={"triggered_by": "manual"}
+    )
+    await publisher.publish_sync_message(
+        "ml_listings.full",
+        {
+            "sync_log_id": sync_log_id,
+            "published_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    return SyncTriggerResponse(message="ML listings sync triggered", sync_log_id=sync_log_id)
+
+
+@router.post(
     "/stock",
     status_code=status.HTTP_202_ACCEPTED,
     response_model=SyncTriggerResponse,

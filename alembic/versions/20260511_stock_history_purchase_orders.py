@@ -18,9 +18,8 @@ Create Date: 2026-05-11
 
 from __future__ import annotations
 
-from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import JSONB
+from alembic import op
 
 revision = "stock_history_purchase_orders"
 down_revision = "mv_coverage_v9"

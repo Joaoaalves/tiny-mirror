@@ -94,6 +94,8 @@ class Settings(BaseSettings):
     sync_stock_history_cron: str = "0 1 * * *"
     # Purchase orders: weekly on Sunday at 06:00 UTC
     sync_purchase_orders_cron: str = "0 6 * * 0"
+    # ML listings (full snapshot of seller's active listings): daily at 00:30 UTC
+    sync_ml_listings_cron: str = "30 0 * * *"
 
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90

@@ -303,9 +303,7 @@ async def audit_orders(client: TinyClient, days: int, refetch: bool) -> bool:
     tiny_records = read_jsonl(out_path)
     tiny_ids = {int(r["id"]) for r in tiny_records}
     db_ids = set(
-        vps_query_ints(
-            f"SELECT tiny_id FROM orders WHERE order_date >= '{date_from.isoformat()}'"
-        )
+        vps_query_ints(f"SELECT tiny_id FROM orders WHERE order_date >= '{date_from.isoformat()}'")
     )
     return report_diff("Orders", tiny_ids, db_ids)
 
@@ -324,11 +322,7 @@ async def audit_stock(client: TinyClient, refetch: bool) -> bool:
         return False
 
     active_ids = sorted(
-        {
-            int(r["id"])
-            for r in read_jsonl(products_path)
-            if r.get("situacao") == "A"
-        }
+        {int(r["id"]) for r in read_jsonl(products_path) if r.get("situacao") == "A"}
     )
     print(f"[stock] {len(active_ids)} active products to inspect")
 
@@ -349,6 +343,7 @@ async def audit_stock(client: TinyClient, refetch: bool) -> bool:
         print(f"[stock] using cached {out_path} (use --refetch to overwrite)")
 
     tiny_records = read_jsonl(out_path)
+
     # Tiny returns the id under several possible keys; coalesce.
     def _stock_id(r: dict[str, Any]) -> int | None:
         for key in ("_product_tiny_id", "idProduto", "id"):

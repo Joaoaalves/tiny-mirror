@@ -17,6 +17,18 @@ repos:
         types: [python]
         pass_filenames: false
 
+      - id: unit-tests
+        name: unit tests (mirrors CI job 2)
+        language: system
+        entry: >-
+          poetry run pytest tests/unit -m unit
+          --cov=src/tiny_mirror
+          --cov-report=term
+          --cov-fail-under=35
+          -q --tb=short
+        pass_filenames: false
+        always_run: true
+
       - id: e2e-tests
         name: E2E tests (if credentials available)
         language: system

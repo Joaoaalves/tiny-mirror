@@ -63,6 +63,4 @@ def downgrade() -> None:
         sa.PrimaryKeyConstraint("sku", "mlb_id"),
     )
     op.create_index("ix_mercadolivre_stock_sku", "mercadolivre_stock", ["sku"])
-    op.create_index(
-        "ix_mercadolivre_stock_logistic_type", "mercadolivre_stock", ["logistic_type"]
-    )
+    op.create_index("ix_mercadolivre_stock_logistic_type", "mercadolivre_stock", ["logistic_type"])

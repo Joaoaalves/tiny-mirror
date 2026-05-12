@@ -74,9 +74,7 @@ def upgrade() -> None:
         ),
     )
     op.create_index("ix_mercadolivre_stock_sku", "mercadolivre_stock", ["sku"])
-    op.create_index(
-        "ix_mercadolivre_stock_logistic_type", "mercadolivre_stock", ["logistic_type"]
-    )
+    op.create_index("ix_mercadolivre_stock_logistic_type", "mercadolivre_stock", ["logistic_type"])
 
     # Expand sync_logs.sync_type to include 'mercadolivre_stock'.
     # Pass type_="check" so the naming convention prefix (ck_<table>_) applies.

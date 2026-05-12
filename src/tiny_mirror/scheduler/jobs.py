@@ -92,6 +92,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "purchase_orders_sync": CronTrigger.from_crontab(
                 settings.sync_purchase_orders_cron, timezone="UTC"
             ),
+            "ml_listings_sync": CronTrigger.from_crontab(
+                settings.sync_ml_listings_cron, timezone="UTC"
+            ),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
@@ -129,6 +132,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _purchase_orders_sync() -> None:
         await purchase_orders_sync_job(publisher)
+
+    async def _ml_listings_sync() -> None:
+        await ml_listings_sync_job(publisher)
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
@@ -185,6 +191,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _purchase_orders_sync,
         trigger=triggers["purchase_orders_sync"],
         id="purchase_orders_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_listings_sync,
+        trigger=triggers["ml_listings_sync"],
+        id="ml_listings_sync",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -478,6 +490,17 @@ async def purchase_orders_sync_job(publisher: QueuePublisher) -> None:
     )
 
 
+async def ml_listings_sync_job(publisher: QueuePublisher) -> None:
+    logger.info("ML listings sync job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="ml_listings",
+        queue_type="ml_listings.full",
+        message_extra={"triggered_by": "scheduler"},
+        log_metadata={"triggered_by": "scheduler"},
+    )
+
+
 async def sale_buckets_refresh_job(publisher: QueuePublisher) -> None:
     logger.info("Sale buckets refresh job started")
     today: date = datetime.now(UTC).date()
@@ -559,6 +582,7 @@ __all__ = [
     "TOKEN_ROTATION_MAX_RETRIES",
     "TOKEN_ROTATION_RETRY_DELAY_SECONDS",
     "check_and_trigger_initial_sync",
+    "ml_listings_sync_job",
     "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",

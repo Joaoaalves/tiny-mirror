@@ -27,27 +27,27 @@ depends_on = None
 # exactly the value used in products.suppliers JSONB so grouping is stable.
 # ---------------------------------------------------------------------------
 _INITIAL_DATA = [
-    ("BRG",  "BURIGOTTO S/A IND. E COM."),
-    ("BUB",  "MOAS INDUSTRIA E COMERCIO IMPORTACAO E EXPORTACAO LTDA"),
+    ("BRG", "BURIGOTTO S/A IND. E COM."),
+    ("BUB", "MOAS INDUSTRIA E COMERCIO IMPORTACAO E EXPORTACAO LTDA"),
     ("CAMP", "CAMPINEIRA UTILIDADES LT"),
-    ("DEL",  "DELO INDUSTRIA E COMERCIO LTDA"),
-    ("EMB",  "M.N.Plast- Embalagens Ltda."),
-    ("EVA",  "MAXTATAME COMERCIO EIRELLI - EPP"),
+    ("DEL", "DELO INDUSTRIA E COMERCIO LTDA"),
+    ("EMB", "M.N.Plast- Embalagens Ltda."),
+    ("EVA", "MAXTATAME COMERCIO EIRELLI - EPP"),
     ("GALX", "SULD DISTRIBUIDORA DE PRODUTOS ELETRICOS LTDA"),
-    ("JAV",  "GERMAN COM. DE UTIL. DOMESTICAS LTDA EPP"),
+    ("JAV", "GERMAN COM. DE UTIL. DOMESTICAS LTDA EPP"),
     ("MAST", "GRUPO MASTER COMERCIO IMPORTACAO E EXPORTACAO LTDA"),
     ("MNPL", "M.N.Plast- Embalagens Ltda."),
-    ("MX",   "MAX EBERHARDT UTILIDADES DOMESTICAS, COMERCIO, IMPORTACAO"),
+    ("MX", "MAX EBERHARDT UTILIDADES DOMESTICAS, COMERCIO, IMPORTACAO"),
     ("MXCR", "MAXCRIL INDUSTRIA DE MATERIAIS PARA ESCRITORIO LTDA"),
-    ("NIT",  "NITRONPLAST INDUSTRIA E COMERCIO LTDA"),
-    ("OUR",  "OUROLUX COMERCIAL LTDA"),
-    ("POL",  "POLIBRAS MINAS PLASTICOS LTDA (CD)"),
-    ("PRE",  "DEOFORT COMERCIO DE PRODUTOS DE HIGIENE E LIMPEZA LTDA"),
-    ("RON",  "RONI GRILL INDÚSTRIA E COMÉRCIO  DE TÁBUAS ARTESANAIS EIRELI"),
-    ("RTA",  "RT AT MANU ORGANIZACAO E ARMAZENAMENTO LTDA"),
-    ("SLF",  "Artefatos de Madeira Stolf LTDA"),
-    ("SOZ",  "SOUZA PRODUTOS DE MADEIRA LTDA"),
-    ("UNI",  "UNINJET IND. E COM. DE PLASTICOS LTDA"),
+    ("NIT", "NITRONPLAST INDUSTRIA E COMERCIO LTDA"),
+    ("OUR", "OUROLUX COMERCIAL LTDA"),
+    ("POL", "POLIBRAS MINAS PLASTICOS LTDA (CD)"),
+    ("PRE", "DEOFORT COMERCIO DE PRODUTOS DE HIGIENE E LIMPEZA LTDA"),
+    ("RON", "RONI GRILL INDÚSTRIA E COMÉRCIO  DE TÁBUAS ARTESANAIS EIRELI"),
+    ("RTA", "RT AT MANU ORGANIZACAO E ARMAZENAMENTO LTDA"),
+    ("SLF", "Artefatos de Madeira Stolf LTDA"),
+    ("SOZ", "SOUZA PRODUTOS DE MADEIRA LTDA"),
+    ("UNI", "UNINJET IND. E COM. DE PLASTICOS LTDA"),
 ]
 
 _CREATE_TABLE = """
@@ -199,10 +199,7 @@ COMMENT ON MATERIALIZED VIEW mv_coverage IS
 def upgrade() -> None:
     op.execute(_CREATE_TABLE)
 
-    rows = ", ".join(
-        f"('{prefix}', '{name}')"
-        for prefix, name in _INITIAL_DATA
-    )
+    rows = ", ".join(f"('{prefix}', '{name}')" for prefix, name in _INITIAL_DATA)
     op.execute(f"INSERT INTO sku_prefix_supplier (prefix, supplier_name) VALUES {rows};")
 
     op.execute(_DROP_VIEW)

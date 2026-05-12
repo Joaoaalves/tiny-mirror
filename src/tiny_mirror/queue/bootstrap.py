@@ -11,6 +11,7 @@ from aio_pika.abc import AbstractChannel
 from tiny_mirror.queue.base_consumer import BaseConsumer
 from tiny_mirror.queue.consumers.bucket_consumer import BucketRefreshConsumer
 from tiny_mirror.queue.consumers.invoice_consumers import InvoiceFullSyncConsumer
+from tiny_mirror.queue.consumers.ml_listing_consumers import MLListingFullSyncConsumer
 from tiny_mirror.queue.consumers.order_consumers import (
     OrderFullSyncConsumer,
     OrderItemConsumer,
@@ -33,6 +34,7 @@ from tiny_mirror.queue.consumers.webhook_consumers import (
 )
 from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
+from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.purchase_order_sync_service import PurchaseOrderSyncService
@@ -54,6 +56,7 @@ async def start_consumers(
     invoice_sync: InvoiceSyncService,
     stock_history_sync: StockHistorySyncService,
     purchase_order_sync: PurchaseOrderSyncService,
+    ml_listing_sync: MLListingSyncService | None = None,
 ) -> list[BaseConsumer]:
     """Register every consumer on the shared channel and return the instances.
 
@@ -76,6 +79,8 @@ async def start_consumers(
         OrderWebhookConsumer(channel, queue_publisher, order_sync, sale_buckets),
         StockWebhookConsumer(channel, queue_publisher, stock_sync),
     ]
+    if ml_listing_sync is not None:
+        consumers.append(MLListingFullSyncConsumer(channel, queue_publisher, ml_listing_sync))
     for consumer in consumers:
         await consumer.start_consuming()
     logger.info("All consumers started", count=len(consumers))

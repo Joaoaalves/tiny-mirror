@@ -69,9 +69,71 @@ class MercadoLivreAPIClient:
         """Return the full item detail for a given MLB ID.
 
         Relevant fields: ``available_quantity``, ``shipping.logistic_type``,
-        ``status``.
+        ``inventory_id``, ``status``.
         """
         return await self._request("GET", f"/items/{mlb_id}")
+
+    async def list_active_item_ids(
+        self, *, offset: int = 0, limit: int = 100
+    ) -> tuple[list[str], int]:
+        """Return one page of active item IDs and the total count.
+
+        Calls ``GET /users/{user_id}/items/search?status=active``.
+        Returns ``(mlb_ids, total)``.
+        """
+        data = await self._request(
+            "GET",
+            f"/users/{self._user_id}/items/search",
+            params={"status": "active", "limit": limit, "offset": offset},
+        )
+        results: list[str] = data.get("results") or []
+        total: int = int((data.get("paging") or {}).get("total", 0))
+        return results, total
+
+    async def batch_get_items(self, mlb_ids: list[str]) -> list[dict[str, Any]]:
+        """Fetch full item details for up to 20 MLB IDs in one request.
+
+        ``GET /items?ids=MLB1,MLB2,...`` returns a JSON array where each
+        element is ``{"code": 200, "body": {...}}``. Only items with a
+        successful code and a non-null ``id`` in the body are returned.
+        """
+        if not mlb_ids:
+            return []
+
+        # The batch endpoint returns a list, not a dict; use the raw HTTP
+        # pipeline via _request which returns response.json() as-is.
+        raw: Any = await self._request(
+            "GET",
+            "/items",
+            params={"ids": ",".join(mlb_ids[:20])},
+        )
+        if not isinstance(raw, list):
+            return []
+        items: list[dict[str, Any]] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            body: dict[str, Any] = entry.get("body") or entry
+            if body.get("id"):
+                items.append(body)
+        return items
+
+    async def get_inventory_stock(self, inventory_id: str) -> dict[str, Any]:
+        """Return fulfillment stock for the given inventory_id.
+
+        Calls ``GET /inventories/{inventory_id}/stock/fulfillment``.
+        Relevant field: ``available_quantity`` (units available to sell in FL).
+        Returns an empty dict on 404 (inventory exists but has no FL stock).
+        """
+        try:
+            return await self._request(
+                "GET",
+                f"/inventories/{inventory_id}/stock/fulfillment",
+            )
+        except TinyAPIException as exc:
+            if exc.status_code == 404:
+                return {}
+            raise
 
     # ------------------------------------------------------------------
     # Internal: request pipeline

@@ -40,6 +40,7 @@ from tiny_mirror.scheduler.jobs import (
 )
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
+from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.purchase_order_sync_service import PurchaseOrderSyncService
@@ -119,9 +120,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         else:
             logger.info("ML_CLIENT_ID not set; Mercado Livre overlay disabled")
 
-        # Stages 08-09 still ship stub services that raise
-        # NotImplementedError; their messages go to their DLQs until the
-        # matching stage lands.
+        ml_listing_sync: MLListingSyncService | None = (
+            MLListingSyncService(ml_client=ml_api_client) if ml_api_client is not None else None
+        )
+
         invoice_sync = InvoiceSyncService(
             tiny_client=tiny_client,
             queue_publisher=app.state.queue_publisher,
@@ -148,6 +150,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             invoice_sync=invoice_sync,
             stock_history_sync=StockHistorySyncService(tiny_v2=tiny_v2_client),
             purchase_order_sync=PurchaseOrderSyncService(tiny_client=tiny_client),
+            ml_listing_sync=ml_listing_sync,
         )
 
         scheduler = setup_scheduler(app)
