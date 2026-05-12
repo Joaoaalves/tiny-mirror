@@ -216,7 +216,11 @@ _COMMENT = (
 )
 
 
+_GRANT_WRITE = "GRANT INSERT, UPDATE, DELETE ON sku_prefix_supplier TO tiny_mirror;"
+
+
 def upgrade() -> None:
+    op.execute(_GRANT_WRITE)
     op.execute(_UPDATE_EMB)
     op.execute(_INSERT_DGS)
     op.execute(_DROP_VIEW)
