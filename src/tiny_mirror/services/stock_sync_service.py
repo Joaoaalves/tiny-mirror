@@ -13,21 +13,41 @@ overwrites the (unreliable) Tiny "Full Mercado Livre" deposit row in
 so the coverage query just reads ``stock_deposits`` without special
 casing.
 
+FL stock computation rules (mirrors ml_fl_stock_dryrun.py):
+
+  Simple / variant (type S/V):
+      own FL inventory (Inventory API) +
+      sum(parent_kit FL inventory x component_qty_in_kit)
+
+  Quantity kit (type K, SKU ~ ^\\d+U-):
+      base_sku FL inventory ÷ X  (integer division)
+
+  Combo (type K, SKU not matching ^\\d+U-):
+      own FL inventory only
+
+Inventory stock is read from GET /inventories/{id}/stock/fulfillment
+(the authoritative FL warehouse count), not from item.available_quantity.
+ML listings are looked up via the ml_listings DB table (populated daily
+by MLListingSyncService) rather than per-SKU ML API searches.
+
 Each method opens its own ``AsyncSession`` so the service is safe to
 share between long-lived consumer contexts.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
+from sqlalchemy import select
 
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
 from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
+from tiny_mirror.infrastructure.orm.models import MLListingORM, MLListingVariationORM
 from tiny_mirror.infrastructure.repositories.product_repository import (
     PostgreSQLProductRepository,
 )
@@ -39,6 +59,8 @@ from tiny_mirror.infrastructure.repositories.sync_log_repository import (
 )
 from tiny_mirror.mappers.stock_mapper import StockMapper
 from tiny_mirror.queue.publisher import QueuePublisher
+
+_QUANTITY_KIT_RE = re.compile(r"^(\d+)U-(.+)$")
 
 logger = structlog.get_logger(__name__)
 
@@ -166,12 +188,10 @@ class StockSyncService:
             # Optionally pull Full ML stock straight from ML API and overlay it
             # onto the deposits list, replacing the unreliable Tiny row. None
             # means "we don't know" (skip mutation); 0 means "ML has no stock".
-            # Kit contributions: kits that contain this SKU as a component also
-            # hold fulfillment inventory for it — e.g. a kit with 8 units and
-            # component_qty=1 adds 8 more units of available stock.
             if self._ml is not None and sku:
+                ptype = (product_exists or {}).get("type") or "S"
                 parent_kits = await product_repo.get_parent_kits_for_sku(sku)
-                ml_qty = await self._fetch_ml_full_qty(sku, parent_kits=parent_kits)
+                ml_qty = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
                 if ml_qty is not None:
                     _overlay_ml_full_deposit(deposits, ml_qty)
 
@@ -217,88 +237,105 @@ class StockSyncService:
         )
 
     # ------------------------------------------------------------------
-    # ML helper — sums fulfillment available_quantity across all MLB IDs
-    # for a given SKU, including kits that contain the SKU as a component.
-    #
-    # parent_kits: list of (kit_sku, component_quantity) from product_kit_components.
-    #   A kit with available_quantity=8 and component_quantity=1 contributes 8
-    #   effective units of this component (8 kits x 1 unit each).
-    #
-    # Returns:
-    #   - None if no ML listings found at all (we don't know),
-    #   - int >= 0 otherwise (sum across logistic_type=='fulfillment' only).
-    # On API error it logs and returns None (preserves previous Tiny row).
-    #
-    # Deduplication: listings sharing the same inventory_id represent the same
-    # physical stock pool; we keep the max effective quantity per inventory_id
-    # and sum across distinct pools. Direct and kit inventories are typically
-    # separate physical pools at the ML warehouse, so they add up correctly.
+    # ML helper — computes the authoritative Full-ML stock for a SKU.
+    # Uses ml_listings DB (populated daily by MLListingSyncService) to
+    # look up inventory_ids, then calls GET /inventories/{id}/stock/fulfillment
+    # for the true warehouse count.  parent_kits comes from
+    # product_kit_components and lists kits whose FL stock contributes
+    # units of this SKU.  Returns None when no FL listing exists for the
+    # SKU (leaves the Tiny row untouched); int >= 0 otherwise.
     # ------------------------------------------------------------------
     async def _fetch_ml_full_qty(
         self,
         sku: str,
+        ptype: str = "S",
         parent_kits: list[tuple[str, int]] | None = None,
     ) -> int | None:
         if self._ml is None:
             return None
 
-        # Build list of (mlb_id, component_multiplier) to evaluate.
-        # multiplier=1 for direct listings; multiplier=component_qty for kits.
-        mlb_candidates: list[tuple[str, int]] = []
-
         try:
-            direct_mlb_ids = await self._ml.list_items_by_sku(sku)
+            # Quantity kit (e.g. "3U-BASE-SKU"): divide base SKU inventory by X.
+            m = _QUANTITY_KIT_RE.match(sku) if ptype == "K" else None
+            if ptype == "K" and m:
+                x = int(m.group(1))
+                base_sku = m.group(2)
+                if x <= 0:
+                    return 0
+                base_fl = await self._fl_for_sku(base_sku)
+                return (base_fl // x) if base_fl is not None else None
+
+            # Simple (S) / variant (V) / combo (K without qty-kit pattern):
+            # own FL inventory + sum of parent-kit contributions.
+            own_fl = await self._fl_for_sku(sku)
+            has_any = own_fl is not None
+            total = own_fl or 0
+
+            for kit_sku, component_qty in parent_kits or []:
+                kit_fl = await self._fl_for_sku(kit_sku)
+                if kit_fl is not None:
+                    has_any = True
+                    total += kit_fl * component_qty
+
+            return total if has_any else None
+
         except Exception as exc:
-            logger.warning("ML search failed for SKU, skipping ML overlay", sku=sku, error=str(exc))
+            logger.warning("ML FL fetch failed, skipping ML overlay", sku=sku, error=str(exc))
             return None
 
-        for mlb_id in direct_mlb_ids:
-            mlb_candidates.append((mlb_id, 1))
+    async def _fl_for_sku(self, sku: str) -> int | None:
+        """Return total FL fulfillment inventory for a SKU.
 
-        for kit_sku, component_qty in parent_kits or []:
-            try:
-                kit_mlb_ids = await self._ml.list_items_by_sku(kit_sku)
-            except Exception as exc:
-                logger.warning(
-                    "ML search failed for parent kit SKU, skipping kit contribution",
-                    sku=sku,
-                    kit_sku=kit_sku,
-                    error=str(exc),
+        Looks up ml_listings (populated by MLListingSyncService) for all
+        fulfillment listings matching the SKU, then calls the Inventory API for
+        each distinct inventory_id.  Returns None when no fulfillment listing
+        exists (caller should treat as "unknown"), or an int >= 0 otherwise.
+        """
+        async with AsyncSessionLocal() as session:
+            listing_rows = (
+                await session.execute(
+                    select(
+                        MLListingORM.mlb_id,
+                        MLListingORM.inventory_id,
+                        MLListingORM.has_variations,
+                    ).where(
+                        MLListingORM.sku == sku,
+                        MLListingORM.logistic_type == "fulfillment",
+                    )
                 )
-                continue
-            for mlb_id in kit_mlb_ids:
-                mlb_candidates.append((mlb_id, component_qty))
+            ).all()
 
-        if not mlb_candidates:
-            return None
+            if not listing_rows:
+                return None
 
-        # Group by inventory_id — same inventory_id = same physical pool.
-        # Keep the max effective quantity (available x multiplier) per pool.
-        inventory_qty: dict[str, int] = {}
-        any_fulfillment = False
-        for mlb_id, multiplier in mlb_candidates:
-            try:
-                item = await self._ml.get_item(mlb_id)
-            except Exception as exc:
-                logger.warning(
-                    "ML item fetch failed, skipping that listing",
-                    sku=sku,
-                    mlb_id=mlb_id,
-                    error=str(exc),
-                )
-                continue
-            shipping = item.get("shipping") or {}
-            if shipping.get("logistic_type") != "fulfillment":
-                continue
-            any_fulfillment = True
-            inv_key = item.get("inventory_id") or mlb_id
-            effective_qty = int(item.get("available_quantity") or 0) * multiplier
-            if inv_key not in inventory_qty or effective_qty > inventory_qty[inv_key]:
-                inventory_qty[inv_key] = effective_qty
+            inv_ids: set[str] = set()
+            for mlb_id, inventory_id, has_variations in listing_rows:
+                if has_variations:
+                    var_inv_ids = (
+                        (
+                            await session.execute(
+                                select(MLListingVariationORM.inventory_id).where(
+                                    MLListingVariationORM.mlb_id == mlb_id,
+                                    MLListingVariationORM.inventory_id.isnot(None),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    inv_ids.update(x for x in var_inv_ids if x is not None)
+                elif inventory_id:
+                    inv_ids.add(inventory_id)
 
-        # If no listing (direct or kit) is fulfillment, treat as None so the
-        # caller leaves the Tiny "Full Mercado Livre" row alone.
-        return sum(inventory_qty.values()) if any_fulfillment else None
+        if not inv_ids:
+            return 0
+
+        assert self._ml is not None
+        total = 0
+        for inv_id in inv_ids:
+            stock_data = await self._ml.get_inventory_stock(inv_id)
+            total += int(stock_data.get("available_quantity") or 0)
+        return total
 
     # ------------------------------------------------------------------
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
