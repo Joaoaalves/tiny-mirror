@@ -73,18 +73,19 @@ class MercadoLivreAPIClient:
         """
         return await self._request("GET", f"/items/{mlb_id}")
 
-    async def list_active_item_ids(
+    async def list_all_item_ids(
         self, *, offset: int = 0, limit: int = 100
     ) -> tuple[list[str], int]:
-        """Return one page of active item IDs and the total count.
+        """Return one page of item IDs (all statuses) and the total count.
 
-        Calls ``GET /users/{user_id}/items/search?status=active``.
+        Calls ``GET /users/{user_id}/items/search`` without a status filter
+        so active, paused, and any other non-closed listings are included.
         Returns ``(mlb_ids, total)``.
         """
         data = await self._request(
             "GET",
             f"/users/{self._user_id}/items/search",
-            params={"status": "active", "limit": limit, "offset": offset},
+            params={"limit": limit, "offset": offset},
         )
         results: list[str] = data.get("results") or []
         total: int = int((data.get("paging") or {}).get("total", 0))

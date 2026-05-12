@@ -684,8 +684,20 @@ def _run_report(
                 kit_fl = own_fl.get(kit_sku, 0)
                 contribution = kit_fl * component_qty
                 kit_contrib += contribution
+                kit_fl_listings = [
+                    e for e in own_listings.get(kit_sku, []) if e.logistic_type == "fulfillment"
+                ]
+                kit_mlbs_str = (
+                    "  "
+                    + ", ".join(
+                        f"{e.mlb_id}(inv={e.inventory_id or '?'},fl={e.fl_stock})"
+                        for e in kit_fl_listings
+                    )
+                    if kit_fl_listings
+                    else ""
+                )
                 kit_details.append(
-                    f"  parent kit {kit_sku}: FL={kit_fl} x {component_qty}u = +{contribution}"
+                    f"  parent kit {kit_sku}: FL={kit_fl} x {component_qty}u = +{contribution}{kit_mlbs_str}"
                 )
             computed = own + kit_contrib
             res = ProductResult(

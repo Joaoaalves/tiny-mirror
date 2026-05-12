@@ -24,7 +24,7 @@ pytestmark = pytest.mark.unit
 @pytest.fixture
 def mock_ml_client() -> AsyncMock:
     client = AsyncMock()
-    client.list_active_item_ids = AsyncMock(return_value=([], 0))
+    client.list_all_item_ids = AsyncMock(return_value=([], 0))
     client.batch_get_items = AsyncMock(return_value=[])
     return client
 
@@ -104,7 +104,7 @@ async def test_run_sync_simple_item(
     mock_ml_client: AsyncMock,
 ) -> None:
     """One active listing, simple item (no variations), FL logistic type."""
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB111"], 1))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB111"], 1))
     mock_ml_client.batch_get_items = AsyncMock(
         return_value=[_make_item("MLB111", sku="PROD-A", inventory_id="INV-A")]
     )
@@ -162,7 +162,7 @@ async def test_run_sync_variation_item(
         {"id": "111", "inventory_id": "VAR-INV-1"},
         {"id": "222", "inventory_id": "VAR-INV-2"},
     ]
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB222"], 1))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB222"], 1))
     mock_ml_client.batch_get_items = AsyncMock(
         return_value=[_make_item("MLB222", sku="PROD-B", inventory_id=None, variations=variations)]
     )
@@ -211,7 +211,7 @@ async def test_run_sync_non_fl_listing_stored(
     service: MLListingSyncService,
     mock_ml_client: AsyncMock,
 ) -> None:
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB333"], 1))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB333"], 1))
     mock_ml_client.batch_get_items = AsyncMock(
         return_value=[_make_item("MLB333", sku="PROD-C", logistic_type="me2", inventory_id=None)]
     )
@@ -251,11 +251,11 @@ async def test_run_sync_pagination(
     service: MLListingSyncService,
     mock_ml_client: AsyncMock,
 ) -> None:
-    """list_active_item_ids called repeatedly until offset >= total.
+    """list_all_item_ids called repeatedly until offset >= total.
 
     _PAGE_SIZE is patched to 2 so we can test multi-page behaviour with few items.
     """
-    mock_ml_client.list_active_item_ids = AsyncMock(
+    mock_ml_client.list_all_item_ids = AsyncMock(
         side_effect=[
             (["MLB001", "MLB002"], 3),
             (["MLB003"], 3),
@@ -302,7 +302,7 @@ async def test_run_sync_batch_failure_increments_failed_count(
     service: MLListingSyncService,
     mock_ml_client: AsyncMock,
 ) -> None:
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB111", "MLB222"], 2))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB111", "MLB222"], 2))
     # First batch raises; service logs and continues
     mock_ml_client.batch_get_items = AsyncMock(side_effect=Exception("network error"))
 
@@ -344,7 +344,7 @@ async def test_run_sync_empty_catalog(
     service: MLListingSyncService,
     mock_ml_client: AsyncMock,
 ) -> None:
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=([], 0))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=([], 0))
 
     mock_repo = AsyncMock()
     mock_sync_log_repo = AsyncMock()
@@ -384,7 +384,7 @@ async def test_run_sync_item_without_sku_stored_as_none(
     service: MLListingSyncService,
     mock_ml_client: AsyncMock,
 ) -> None:
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB444"], 1))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB444"], 1))
     mock_ml_client.batch_get_items = AsyncMock(
         return_value=[_make_item("MLB444", sku=None, inventory_id="INV-X")]
     )
@@ -426,7 +426,7 @@ async def test_run_sync_large_catalog_batches_correctly(
 ) -> None:
     """25 items should result in 2 batch calls (20 + 5)."""
     mlb_ids = [f"MLB{i:03d}" for i in range(25)]
-    mock_ml_client.list_active_item_ids = AsyncMock(
+    mock_ml_client.list_all_item_ids = AsyncMock(
         side_effect=[
             (mlb_ids, 25),
             ([], 25),
@@ -472,7 +472,7 @@ async def test_run_sync_item_without_id_is_skipped(
     service: MLListingSyncService,
     mock_ml_client: AsyncMock,
 ) -> None:
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB555"], 1))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB555"], 1))
     bad_item: dict[str, Any] = {"id": "", "status": "active", "shipping": {}}
     mock_ml_client.batch_get_items = AsyncMock(return_value=[bad_item])
 
@@ -518,7 +518,7 @@ async def test_run_sync_title_truncated_to_500_chars(
     item = _make_item("MLB666", sku="LONG-TITLE")
     item["title"] = long_title
 
-    mock_ml_client.list_active_item_ids = AsyncMock(return_value=(["MLB666"], 1))
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB666"], 1))
     mock_ml_client.batch_get_items = AsyncMock(return_value=[item])
 
     mock_repo = AsyncMock()

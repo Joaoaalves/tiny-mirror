@@ -33,9 +33,9 @@ class MLListingSyncService:
     async def run_sync(self, sync_log_id: int) -> None:
         logger.info("ML listings sync started", sync_log_id=sync_log_id)
 
-        # 1. Collect all active MLB IDs (paginated).
-        all_mlb_ids = await self._fetch_all_active_ids()
-        logger.info("Active ML listings fetched", count=len(all_mlb_ids))
+        # 1. Collect all MLB IDs across all statuses (paginated).
+        all_mlb_ids = await self._fetch_all_item_ids()
+        logger.info("ML listings fetched", count=len(all_mlb_ids))
 
         # 2. Batch-fetch item details (20 per call) and build DB rows.
         listings: list[dict[str, Any]] = []
@@ -115,11 +115,11 @@ class MLListingSyncService:
                 items_failed=items_failed,
             )
 
-    async def _fetch_all_active_ids(self) -> list[str]:
+    async def _fetch_all_item_ids(self) -> list[str]:
         all_ids: list[str] = []
         offset = 0
         while True:
-            ids, total = await self._ml.list_active_item_ids(offset=offset, limit=_PAGE_SIZE)
+            ids, total = await self._ml.list_all_item_ids(offset=offset, limit=_PAGE_SIZE)
             all_ids.extend(ids)
             offset += _PAGE_SIZE
             if offset >= total or not ids:
