@@ -1,8 +1,8 @@
 """RabbitMQ topology: exchanges, queues, dead-letter routing.
 
 Idempotent — safe to call on every startup. Declares the two exchanges
-(``tiny.sync`` topic + ``tiny.dlx`` direct), 9 main queues with their
-dead-letter arguments, 9 dead-letter queues, and binds everything together.
+(``tiny.sync`` topic + ``tiny.dlx`` direct), all main queues with their
+dead-letter arguments, matching dead-letter queues, and binds everything together.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ QUEUE_BINDINGS: tuple[tuple[str, str], ...] = (
     ("tiny.sync.invoices.full", "sync.invoices.full"),
     ("tiny.sync.stock_history.full", "sync.stock_history.full"),
     ("tiny.sync.purchase_orders.full", "sync.purchase_orders.full"),
+    ("tiny.sync.ml_listings.full", "sync.ml_listings.full"),
     ("tiny.webhooks.orders", "webhooks.orders"),
     ("tiny.webhooks.stock", "webhooks.stock"),
 )
