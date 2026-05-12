@@ -117,12 +117,13 @@ class MLListingSyncService:
 
     async def _fetch_all_item_ids(self) -> list[str]:
         all_ids: list[str] = []
-        offset = 0
+        scroll_id: str | None = None
         while True:
-            ids, total = await self._ml.list_all_item_ids(offset=offset, limit=_PAGE_SIZE)
+            ids, _total, scroll_id = await self._ml.list_all_item_ids(
+                scroll_id=scroll_id, limit=_PAGE_SIZE
+            )
             all_ids.extend(ids)
-            offset += _PAGE_SIZE
-            if offset >= total or not ids:
+            if not ids or not scroll_id:
                 break
         return all_ids
 

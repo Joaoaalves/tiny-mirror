@@ -74,23 +74,27 @@ class MercadoLivreAPIClient:
         return await self._request("GET", f"/items/{mlb_id}")
 
     async def list_all_item_ids(
-        self, *, offset: int = 0, limit: int = 100
-    ) -> tuple[list[str], int]:
-        """Return one page of item IDs (all statuses) and the total count.
+        self, *, scroll_id: str | None = None, limit: int = 100
+    ) -> tuple[list[str], int, str | None]:
+        """Return one page of item IDs (all statuses), the total count, and the next scroll cursor.
 
-        Calls ``GET /users/{user_id}/items/search`` without a status filter
-        so active, paused, and any other non-closed listings are included.
-        Uses ``search_type=scan`` for reliable deep pagination on large catalogs.
-        Returns ``(mlb_ids, total)``.
+        Uses ``search_type=scan`` for cursor-based pagination — pass the returned
+        ``scroll_id`` into the next call to advance the cursor.  Stop when the
+        returned results list is empty or ``scroll_id`` is None.
+        Returns ``(mlb_ids, total, next_scroll_id)``.
         """
+        params: dict[str, Any] = {"search_type": "scan", "limit": limit}
+        if scroll_id:
+            params["scroll_id"] = scroll_id
         data = await self._request(
             "GET",
             f"/users/{self._user_id}/items/search",
-            params={"search_type": "scan", "limit": limit, "offset": offset},
+            params=params,
         )
         results: list[str] = data.get("results") or []
         total: int = int((data.get("paging") or {}).get("total", 0))
-        return results, total
+        next_scroll_id: str | None = data.get("scroll_id") or None
+        return results, total, next_scroll_id
 
     async def batch_get_items(self, mlb_ids: list[str]) -> list[dict[str, Any]]:
         """Fetch full item details for up to 20 MLB IDs in one request.
