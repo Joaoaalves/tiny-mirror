@@ -7,7 +7,7 @@ from decimal import Decimal
 from typing import Literal
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from tiny_mirror.api.dependencies import get_tiny_client
@@ -17,6 +17,7 @@ from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.repositories.fulfillment_transfer_repository import (
     FulfillmentTransferRepository,
 )
+from tiny_mirror.services.fulfillment_reception_service import FulfillmentReceptionService
 from tiny_mirror.services.fulfillment_transfer_service import (
     FulfillmentTransferService,
     InsufficientStockError,
@@ -52,6 +53,13 @@ class TransferResponse(BaseModel):
 class TransferListResponse(BaseModel):
     items: list[TransferResponse]
     pagination: PaginationResponse
+
+
+class ReceptionScanResponse(BaseModel):
+    skus_scanned: int
+    transfers_received: int
+    skus_with_no_inventory: list[str]
+    errors: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -147,4 +155,36 @@ async def list_transfers(
             total=total,
             total_pages=total_pages,
         ),
+    )
+
+
+@router.post(
+    "/reception/scan",
+    status_code=status.HTTP_200_OK,
+    response_model=ReceptionScanResponse,
+    summary="Scan ML INBOUND_RECEPTION and reconcile pending transfers",
+)
+async def scan_reception(request: Request) -> ReceptionScanResponse:
+    """Manually trigger the INBOUND_RECEPTION scan (normally runs every 6h).
+
+    Polls the ML Fulfillment Operations API for each SKU with pending
+    transfers and marks them as received when stock arrival is confirmed.
+    Requires ML integration to be configured (ML_CLIENT_ID / ML_CLIENT_SECRET set).
+    """
+    from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
+
+    ml_client: MercadoLivreAPIClient | None = getattr(request.app.state, "ml_client", None)
+    if ml_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML integration not configured (ML_CLIENT_ID not set)",
+        )
+
+    service = FulfillmentReceptionService(ml_client=ml_client)
+    result = await service.scan_and_reconcile()
+    return ReceptionScanResponse(
+        skus_scanned=result.skus_scanned,
+        transfers_received=result.transfers_received,
+        skus_with_no_inventory=result.skus_with_no_inventory,
+        errors=result.errors,
     )

@@ -37,6 +37,7 @@ from tiny_mirror.queue.publisher import QueuePublisher
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
     from tiny_mirror.services.token_service import TokenService
 
 
@@ -98,6 +99,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
+            "fulfillment_reception_scan": CronTrigger.from_crontab(
+                settings.sync_fulfillment_reception_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -138,6 +142,14 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
+
+    ml_client: MercadoLivreAPIClient | None = getattr(app.state, "ml_client", None)
+
+    async def _fulfillment_reception_scan() -> None:
+        if ml_client is not None:
+            await fulfillment_reception_scan_job(ml_client)
+        else:
+            logger.debug("Fulfillment reception scan skipped: ML client not configured")
 
     scheduler.add_job(
         _token_rotation,
@@ -203,6 +215,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _sync_log_watchdog,
         trigger=triggers["sync_log_watchdog"],
         id="sync_log_watchdog",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _fulfillment_reception_scan,
+        trigger=triggers["fulfillment_reception_scan"],
+        id="fulfillment_reception_scan",
         replace_existing=True,
     )
 
@@ -571,6 +589,24 @@ async def _trigger_sync(
                 logger.exception("Failed to mark sync_log as failed", sync_log_id=sync_log_id)
 
 
+async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:
+    """Poll ML INBOUND_RECEPTION and mark pending fulfillment transfers as received."""
+    from tiny_mirror.services.fulfillment_reception_service import FulfillmentReceptionService
+
+    logger.info("Fulfillment reception scan job started")
+    try:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        result = await service.scan_and_reconcile()
+        logger.info(
+            "Fulfillment reception scan job completed",
+            skus_scanned=result.skus_scanned,
+            transfers_received=result.transfers_received,
+            errors=len(result.errors),
+        )
+    except Exception as exc:
+        logger.error("Fulfillment reception scan job failed", error=str(exc))
+
+
 # ---------------------------------------------------------------------------
 # Convenience for the order_sync_service which still imports from here.
 # ---------------------------------------------------------------------------
@@ -582,6 +618,7 @@ __all__ = [
     "TOKEN_ROTATION_MAX_RETRIES",
     "TOKEN_ROTATION_RETRY_DELAY_SECONDS",
     "check_and_trigger_initial_sync",
+    "fulfillment_reception_scan_job",
     "ml_listings_sync_job",
     "orders_reconciliation_job",
     "orders_sync_job",

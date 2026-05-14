@@ -99,6 +99,9 @@ class Settings(BaseSettings):
 
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90
+    # Fulfillment reception scan: poll ML INBOUND_RECEPTION every 6h to mark
+    # pending transfers as received once stock arrives at Full ML CD.
+    sync_fulfillment_reception_cron: str = "0 */6 * * *"
 
     @field_validator("database_url", mode="before")
     @classmethod

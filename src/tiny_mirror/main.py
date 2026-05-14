@@ -117,8 +117,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 http_client=app.state.http_client,
                 ml_user_id=settings.ml_user_id,
             )
+            app.state.ml_client = ml_api_client
             logger.info("Mercado Livre overlay enabled", ml_user_id=settings.ml_user_id)
         else:
+            app.state.ml_client = None
             logger.info("ML_CLIENT_ID not set; Mercado Livre overlay disabled")
 
         ml_listing_sync: MLListingSyncService | None = (

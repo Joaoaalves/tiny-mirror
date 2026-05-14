@@ -124,6 +124,42 @@ class MercadoLivreAPIClient:
                 items.append(body)
         return items
 
+    async def list_fulfillment_inbound_operations(
+        self,
+        inventory_id: str,
+        date_from: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return INBOUND_RECEPTION operations for a given inventory_id.
+
+        Calls ``GET /stock/fulfillment/operations/search`` filtering by
+        ``type=INBOUND_RECEPTION`` and the given ``inventory_id``.
+        ``date_from`` must be an ISO-8601 string (``YYYY-MM-DDTHH:MM:SS+00:00``).
+
+        Response shape:
+          ``{"paging": {"total": N}, "results": [{
+              "id": "...",
+              "type": "INBOUND_RECEPTION",
+              "date_created": "...",
+              "inventory_id": "...",
+              "quantities": {"received": Q, "damaged": 0},
+              "status": "PROCESSED"
+          }]}``
+        """
+        return await self._request(
+            "GET",
+            "/stock/fulfillment/operations/search",
+            params={
+                "seller_id": self._user_id,
+                "inventory_id": inventory_id,
+                "type": "INBOUND_RECEPTION",
+                "date_from": date_from,
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
     async def get_inventory_stock(self, inventory_id: str) -> dict[str, Any]:
         """Return fulfillment stock for the given inventory_id.
 
