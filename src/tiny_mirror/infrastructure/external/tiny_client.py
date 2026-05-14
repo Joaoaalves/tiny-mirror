@@ -102,6 +102,34 @@ class TinyAPIClient:
     async def get_stock(self, product_id: int) -> dict[str, Any]:
         return await self._request("GET", f"/estoque/{product_id}")
 
+    async def record_stock_movement(
+        self,
+        product_id: int,
+        deposit_id: int,
+        tipo: str,
+        quantity: int,
+        price_unit: float,
+        data: str,
+        observacoes: str = "",
+    ) -> dict[str, Any]:
+        """POST /estoque/{product_id} — record a stock entry (E) or exit (S).
+
+        tipo: "E" = entrada (stock in), "S" = saída (stock out).
+        data: "YYYY-MM-DD HH:MM:SS" format required by Tiny v3.
+        """
+        return await self._request(
+            "POST",
+            f"/estoque/{product_id}",
+            json={
+                "deposito": {"id": deposit_id},
+                "tipo": tipo,
+                "quantidade": quantity,
+                "precoUnitario": price_unit,
+                "data": data,
+                "observacoes": observacoes,
+            },
+        )
+
     async def list_invoices(
         self,
         date_initial: datetime | date | str | None = None,

@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from tiny_mirror.api.error_handlers import register_error_handlers
 from tiny_mirror.api.middleware import RequestIdMiddleware, RequestLoggingMiddleware
+from tiny_mirror.api.routers.fulfillment import router as fulfillment_router
 from tiny_mirror.api.routers.health import router as health_router
 from tiny_mirror.api.routers.orders import router as orders_router
 from tiny_mirror.api.routers.products import router as products_router
@@ -194,6 +195,7 @@ def create_app() -> FastAPI:
     app.include_router(orders_router, prefix="/orders", tags=["Orders"])
     app.include_router(sync_router, prefix="/sync", tags=["Sync"])
     app.include_router(webhooks_router, prefix="/webhooks", tags=["Webhooks"])
+    app.include_router(fulfillment_router, prefix="/fulfillment", tags=["Fulfillment"])
 
     return app
 

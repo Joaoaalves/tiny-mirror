@@ -878,6 +878,51 @@ class MLListingORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# fulfillment_transfers
+# ---------------------------------------------------------------------------
+class FulfillmentTransferORM(Base):
+    __tablename__ = "fulfillment_transfers"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'received', 'cancelled')",
+            name="valid_fulfillment_transfer_status",
+        ),
+        Index("ix_fulfillment_transfers_product_sku", "product_sku"),
+        Index("ix_fulfillment_transfers_status", "status"),
+        Index("ix_fulfillment_transfers_transferred_at", "transferred_at"),
+        {
+            "comment": (
+                "Tracks units transferred from Galpão to Full ML via Tiny API. "
+                "status=pending until ML INBOUND_RECEPTION confirms arrival. "
+                "Used to compute effective Full ML stock in mv_coverage so we "
+                "don't double-send while transfers are in transit."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_tiny_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("products.tiny_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    product_sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_per_unit: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
+    transferred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'pending'")
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_listing_variations
 # ---------------------------------------------------------------------------
 class MLListingVariationORM(Base):
