@@ -7,12 +7,14 @@ keeping handlers free of construction logic.
 
 from __future__ import annotations
 
+import secrets
 from collections.abc import AsyncGenerator
 
 import httpx
 import redis.asyncio as redis
+import structlog
 from aio_pika.abc import AbstractChannel
-from fastapi import Depends, Request
+from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.config import settings
@@ -42,6 +44,53 @@ from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
 from tiny_mirror.services.stock_sync_service import StockSyncService
 from tiny_mirror.services.token_service import TokenService
+
+_auth_logger = structlog.get_logger("tiny_mirror.api.auth")
+_LOOPBACK = frozenset({"127.0.0.1", "::1"})
+
+
+def _resolve_client_ip(request: Request) -> str:
+    """Best-effort client IP for the X-API-Key allowlist check.
+
+    Only honor X-Real-IP when the immediate peer is loopback — i.e. the
+    request actually traversed our local nginx, which is the only place
+    that sets that header (clients can't reach uvicorn directly because
+    it binds 127.0.0.1).
+    """
+    direct = request.client.host if request.client else ""
+    if direct in _LOOPBACK:
+        forwarded = request.headers.get("x-real-ip", "")
+        if forwarded:
+            return forwarded.strip()
+    return direct
+
+
+def verify_api_key(request: Request) -> None:
+    """Require X-API-Key header, with bypass for the configured IP allowlist.
+
+    Applied via ``app.include_router(..., dependencies=[Depends(verify_api_key)])``
+    on the routers that mutate state or expose data (sync, fulfillment,
+    products, orders). Webhooks and health endpoints are deliberately exempt.
+    """
+    client_ip = _resolve_client_ip(request)
+    if client_ip in settings.api_key_ip_allowlist_set:
+        return
+
+    provided = request.headers.get("x-api-key", "")
+    expected = settings.api_key
+    if not expected or not provided or not secrets.compare_digest(provided, expected):
+        _auth_logger.warning(
+            "Rejected unauthenticated request",
+            path=request.url.path,
+            client_ip=client_ip,
+            has_header=bool(provided),
+            api_key_configured=bool(expected),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid API key",
+            headers={"WWW-Authenticate": "X-API-Key"},
+        )
 
 
 # ---------------------------------------------------------------------------

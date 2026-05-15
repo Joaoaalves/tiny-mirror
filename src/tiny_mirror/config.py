@@ -41,6 +41,16 @@ class Settings(BaseSettings):
     app_port: int = 8000
     app_env: str = "development"
 
+    # API auth (X-API-Key header).
+    # Required in production. In development the empty default is accepted so
+    # local dev works without ceremony; production startup fails fast if unset.
+    api_key: str = ""
+    # Comma-separated IPs that bypass the X-API-Key check. The default covers
+    # loopback (uvicorn behind nginx on the same host) plus the VPS public IP
+    # (scripts on the VPS that curl via the public hostname). Add commas for
+    # extras; whitespace is trimmed. Set to empty string to disable bypass.
+    api_key_ip_allowlist: str = "127.0.0.1,::1,212.85.1.135"
+
     log_level: str = "INFO"
 
     # Optional Seq sink. Empty url disables shipping; the stdout handler
@@ -148,6 +158,35 @@ class Settings(BaseSettings):
     @property
     def is_development(self) -> bool:
         return self.app_env == "development"
+
+    @property
+    def api_key_ip_allowlist_set(self) -> frozenset[str]:
+        if not self.api_key_ip_allowlist:
+            return frozenset()
+        return frozenset(
+            entry.strip() for entry in self.api_key_ip_allowlist.split(",") if entry.strip()
+        )
+
+    def require_production_secrets(self) -> None:
+        """Abort startup in production if security-sensitive envs are unset.
+
+        Called from the FastAPI lifespan. Fails loud rather than silently
+        running with an unauthenticated API or a no-op CNPJ check.
+        """
+        if not self.is_production:
+            return
+        missing = []
+        if not self.api_key or len(self.api_key) < 32:
+            missing.append(
+                'API_KEY (>=32 chars; generate with `python -c "import secrets; print(secrets.token_urlsafe(32))"`)'
+            )
+        if not self.tiny_expected_cnpj:
+            missing.append("TINY_EXPECTED_CNPJ")
+        if missing:
+            raise RuntimeError(
+                "Refusing to start in production with missing security env vars: "
+                + ", ".join(missing)
+            )
 
 
 settings = Settings()  # type: ignore[call-arg]

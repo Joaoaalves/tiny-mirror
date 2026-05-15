@@ -12,8 +12,9 @@ from typing import Any
 
 import httpx
 import structlog
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
+from tiny_mirror.api.dependencies import verify_api_key
 from tiny_mirror.api.error_handlers import register_error_handlers
 from tiny_mirror.api.middleware import RequestIdMiddleware, RequestLoggingMiddleware
 from tiny_mirror.api.routers.fulfillment import router as fulfillment_router
@@ -57,6 +58,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger = structlog.get_logger(__name__)
     structlog.contextvars.bind_contextvars(service="tiny-mirror")
     logger.info("Starting tiny-mirror service", env=settings.app_env)
+
+    # Refuse to come up in production with security-critical envs unset.
+    settings.require_production_secrets()
 
     scheduler: Any = None
     app.state.consumers = []
@@ -192,12 +196,23 @@ def create_app() -> FastAPI:
 
     register_error_handlers(app)
 
+    # health/webhooks stay open — Tiny can't carry an API key and probes
+    # need anonymous access. Everything else requires X-API-Key (or an IP
+    # in settings.api_key_ip_allowlist).
+    protected = [Depends(verify_api_key)]
     app.include_router(health_router)
-    app.include_router(products_router, prefix="/products", tags=["Products"])
-    app.include_router(orders_router, prefix="/orders", tags=["Orders"])
-    app.include_router(sync_router, prefix="/sync", tags=["Sync"])
+    app.include_router(
+        products_router, prefix="/products", tags=["Products"], dependencies=protected
+    )
+    app.include_router(orders_router, prefix="/orders", tags=["Orders"], dependencies=protected)
+    app.include_router(sync_router, prefix="/sync", tags=["Sync"], dependencies=protected)
     app.include_router(webhooks_router, prefix="/webhooks", tags=["Webhooks"])
-    app.include_router(fulfillment_router, prefix="/fulfillment", tags=["Fulfillment"])
+    app.include_router(
+        fulfillment_router,
+        prefix="/fulfillment",
+        tags=["Fulfillment"],
+        dependencies=protected,
+    )
 
     return app
 
