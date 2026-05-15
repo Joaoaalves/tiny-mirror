@@ -1,13 +1,21 @@
+# Dev-only compose. NOT used in production — on the VPS, Postgres/Redis/
+# RabbitMQ run as native services. Ports are bound to 127.0.0.1 so a stray
+# `docker compose up` on any host with a public interface does not expose
+# the brokers. Credentials default to obvious placeholders that any caller
+# can override via env (POSTGRES_PASSWORD, RABBITMQ_DEFAULT_USER, etc.).
+
 services:
   postgres:
     image: postgres:16-alpine
     container_name: tiny-mirror-postgres
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
       POSTGRES_DB: tiny_mirror_db
-      POSTGRES_USER: tiny_mirror
-      POSTGRES_PASSWORD: senha_dev_local
+      POSTGRES_USER: ${POSTGRES_USER:-tiny_mirror}
+      # Default kept for back-compat with existing .env files. Override via
+      # POSTGRES_PASSWORD env when standing up a fresh dev box.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-senha_dev_local}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -20,7 +28,7 @@ services:
     image: redis:7-alpine
     container_name: tiny-mirror-redis
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes
@@ -31,14 +39,17 @@ services:
       retries: 5
 
   rabbitmq:
-    image: rabbitmq:3.12-management-alpine
+    image: rabbitmq:4.0-management-alpine
     container_name: tiny-mirror-rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      # Defaults kept (guest/guest) for back-compat with existing local
+      # .env files; binding is loopback so it cannot be reached externally.
+      # Override via env on a fresh box.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-guest}
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
