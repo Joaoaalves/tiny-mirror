@@ -48,9 +48,34 @@ TimeoutStopSec=30
 # Hardening — restrict the service to only what it needs.
 NoNewPrivileges=true
 PrivateTmp=true
+PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/tiny-mirror
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+# Network: app only needs TCP/IPv4-v6 + Unix sockets (asyncpg/redis/rabbit).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# Drop every Linux capability — the service runs as an unprivileged user
+# already and never needs to bind <1024 / load modules / change owner.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Block obscure syscalls; @system-service is the systemd-recommended
+# baseline for typical services.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

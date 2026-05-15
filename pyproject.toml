@@ -7,7 +7,7 @@ packages = [{include = "tiny_mirror", from = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-fastapi = "^0.115"
+fastapi = "^0.136"
 uvicorn = {extras = ["standard"], version = "^0.32"}
 gunicorn = "^23"
 sqlalchemy = "^2.0"
@@ -20,7 +20,7 @@ pydantic = "^2.10"
 pydantic-settings = "^2.7"
 structlog = "^24.4"
 apscheduler = "^3.10"
-python-multipart = "^0.0.20"
+python-multipart = "^0.0.27"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3"

@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Default GITHUB_TOKEN scope: read-only. The deploy job pushes nothing to
+# the repo (it ships via rsync over SSH), so no write scope is needed.
+permissions:
+  contents: read
+
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -18,14 +23,16 @@ jobs:
     name: "Lint & Type Check"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install Poetry
-        uses: snok/install-poetry@v1
+        # Pinned to commit SHA (v1 = 76e04a9, fetched 2026-05-15). Bump
+        # only after reviewing the new commit's contents.
+        uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1
         with:
           version: latest
           virtualenvs-create: true
@@ -33,7 +40,7 @@ jobs:
 
       - name: Cache virtualenv
         id: cached-poetry-dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
@@ -78,14 +85,16 @@ jobs:
       TINY_ACCESS_TOKEN: ci_test_access
       TINY_REFRESH_TOKEN: ci_test_refresh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       - name: Install Poetry
-        uses: snok/install-poetry@v1
+        # Pinned to commit SHA (v1 = 76e04a9, fetched 2026-05-15). Bump
+        # only after reviewing the new commit's contents.
+        uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1
         with:
           version: latest
           virtualenvs-create: true
@@ -93,7 +102,7 @@ jobs:
 
       - name: Cache virtualenv
         id: cached-poetry-dependencies
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('poetry.lock') }}
@@ -120,7 +129,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: coverage-xml
           path: coverage.xml
