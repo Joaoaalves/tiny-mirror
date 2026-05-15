@@ -174,7 +174,13 @@ jobs:
             --exclude '.venv' \
             --exclude 'htmlcov/' \
             --exclude 'coverage.xml' \
+            --exclude '.coverage' \
             --exclude '.github/' \
+            --exclude '.claude/' \
+            --exclude '.mcp.json' \
+            --exclude 'audit/' \
+            --exclude 'webhook_listener.py' \
+            --exclude 'webhook_log*.jsonl' \
             -e "ssh -i ~/.ssh/deploy_key -p ${{ secrets.VPS_PORT }}" \
             ./ ${{ secrets.VPS_USER }}@${{ secrets.VPS_HOST }}:/opt/tiny-mirror/current/
 

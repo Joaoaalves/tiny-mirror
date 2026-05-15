@@ -172,6 +172,12 @@ pyrightconfig.json
 
 .claude/**
 **CLAUDE**
+.mcp.json
 
 # Local Tiny audit dumps — never commit raw catalog data
 audit/
+
+# Dev webhook tooling — local-only, may contain PII (CNPJ, source IPs, headers)
+webhook_listener.py
+webhook_log.jsonl
+webhook_log*.jsonl
