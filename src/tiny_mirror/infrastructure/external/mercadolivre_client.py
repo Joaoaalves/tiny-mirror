@@ -128,24 +128,35 @@ class MercadoLivreAPIClient:
         self,
         inventory_id: str,
         date_from: str,
+        date_to: str,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
         """Return INBOUND_RECEPTION operations for a given inventory_id.
 
         Calls ``GET /stock/fulfillment/operations/search`` filtering by
-        ``type=INBOUND_RECEPTION`` and the given ``inventory_id``.
-        ``date_from`` must be an ISO-8601 string (``YYYY-MM-DDTHH:MM:SS+00:00``).
+        ``type=INBOUND_RECEPTION``, ``inventory_id``, ``date_from``, ``date_to``.
+        All four are required by the ML API. Date strings must be ISO-8601
+        UTC with milliseconds (``YYYY-MM-DDTHH:MM:SS.000Z``).
 
-        Response shape:
+        IMPORTANT: ML enforces a 60-day max range between date_from and
+        date_to. Callers must chunk requests for longer windows.
+
+        Response shape (verified against production ML API 2026-05):
           ``{"paging": {"total": N}, "results": [{
-              "id": "...",
+              "id": <int>,
               "type": "INBOUND_RECEPTION",
-              "date_created": "...",
+              "date_created": "2026-04-23T02:04:25Z",
               "inventory_id": "...",
-              "quantities": {"received": Q, "damaged": 0},
-              "status": "PROCESSED"
+              "detail": {"available_quantity": Q, "not_available_detail": []},
+              "result": {"total": T, "available_quantity": A, ...},
+              "external_references": [{"type": "inbound_id", "value": "..."}]
           }]}``
+
+        The ``detail.available_quantity`` is the units processed in THIS
+        operation event (a single inbound is often split across multiple
+        events). Summing across events in the date range gives the total
+        units actually received and made available in the period.
         """
         return await self._request(
             "GET",
@@ -155,6 +166,7 @@ class MercadoLivreAPIClient:
                 "inventory_id": inventory_id,
                 "type": "INBOUND_RECEPTION",
                 "date_from": date_from,
+                "date_to": date_to,
                 "limit": limit,
                 "offset": offset,
             },

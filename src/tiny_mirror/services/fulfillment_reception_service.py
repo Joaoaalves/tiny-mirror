@@ -15,7 +15,7 @@ This means:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import structlog
@@ -95,12 +95,11 @@ class FulfillmentReceptionService:
             # Sort transfers FIFO (oldest first)
             transfers_sorted = sorted(transfers, key=lambda t: t.transferred_at)
             oldest_date = transfers_sorted[0].transferred_at
-            date_from_str = oldest_date.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
             try:
                 received_qty = await self._fetch_total_received(
                     inventory_id=inventory_id,
-                    date_from=date_from_str,
+                    oldest_transfer_date=oldest_date,
                 )
             except Exception as exc:
                 logger.error(
@@ -172,28 +171,49 @@ class FulfillmentReceptionService:
         )
         return result
 
-    async def _fetch_total_received(self, inventory_id: str, date_from: str) -> int:
-        """Sum all INBOUND_RECEPTION received quantities for an inventory since date_from."""
+    async def _fetch_total_received(self, inventory_id: str, oldest_transfer_date: datetime) -> int:
+        """Sum all INBOUND_RECEPTION received quantities for an inventory.
+
+        Walks the time window from ``oldest_transfer_date`` to ``now`` in
+        chunks of <= 60 days (ML's max date range per request). For each
+        chunk, sums ``detail.available_quantity`` across all returned
+        events.
+        """
         total = 0
+        now_utc = datetime.now(UTC)
+        oldest_utc = oldest_transfer_date.astimezone(UTC)
+
+        chunk_start = oldest_utc
+        while chunk_start < now_utc:
+            chunk_end = min(chunk_start + timedelta(days=59), now_utc)
+            total += await self._sum_chunk(
+                inventory_id=inventory_id,
+                date_from=_format_ml_datetime(chunk_start),
+                date_to=_format_ml_datetime(chunk_end),
+            )
+            chunk_start = chunk_end + timedelta(milliseconds=1)
+
+        return total
+
+    async def _sum_chunk(self, inventory_id: str, date_from: str, date_to: str) -> int:
+        """Page through a single <=60d window and sum detail.available_quantity."""
+        chunk_total = 0
         offset = 0
         limit = 50
 
         while True:
-            try:
-                data = await self._ml.list_fulfillment_inbound_operations(
-                    inventory_id=inventory_id,
-                    date_from=date_from,
-                    limit=limit,
-                    offset=offset,
-                )
-            except Exception:
-                raise
-
+            data = await self._ml.list_fulfillment_inbound_operations(
+                inventory_id=inventory_id,
+                date_from=date_from,
+                date_to=date_to,
+                limit=limit,
+                offset=offset,
+            )
             results: list[dict[str, Any]] = data.get("results") or []
             for op in results:
                 qty = _extract_received_qty(op)
-                if qty > 0 and _is_processed(op):
-                    total += qty
+                if qty > 0:
+                    chunk_total += qty
 
             paging = data.get("paging") or {}
             fetched_so_far = offset + len(results)
@@ -202,24 +222,47 @@ class FulfillmentReceptionService:
                 break
             offset += limit
 
-        return total
+        return chunk_total
 
 
 # ---------------------------------------------------------------------------
-# Helpers — defensive extraction of ML API response fields
+# Helpers — extraction of ML INBOUND_RECEPTION fields
 # ---------------------------------------------------------------------------
-def _extract_received_qty(op: dict[str, Any]) -> int:
-    """Extract received quantity from an INBOUND_RECEPTION operation object.
+def _format_ml_datetime(dt: datetime) -> str:
+    """Format a UTC datetime for the ML operations search API.
 
-    ML returns the quantity under different keys in different API versions.
-    Try the known shapes in priority order.
+    ML accepts ISO-8601 with millisecond precision and trailing Z, e.g.
+    ``2026-05-01T00:00:00.000Z``.
     """
-    # Shape 1: {"quantities": {"received": N}}
+    return dt.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _extract_received_qty(op: dict[str, Any]) -> int:
+    """Extract units received in a single INBOUND_RECEPTION operation event.
+
+    Verified against production ML API (2026-05): the canonical field is
+    ``detail.available_quantity`` — the units processed and made available
+    in this specific event. A single physical inbound may be split across
+    multiple events, so summing this field across events in a date range
+    gives the total units actually received.
+
+    Fallbacks (``quantities.received``, ``quantity``) preserve forward
+    compatibility if ML adds new shapes.
+    """
+    detail = op.get("detail") or {}
+    if isinstance(detail, dict) and "available_quantity" in detail:
+        try:
+            return int(detail["available_quantity"])
+        except (TypeError, ValueError):
+            return 0
+
     quantities = op.get("quantities") or {}
     if isinstance(quantities, dict) and "received" in quantities:
-        return int(quantities["received"])
+        try:
+            return int(quantities["received"])
+        except (TypeError, ValueError):
+            return 0
 
-    # Shape 2: {"quantity": N} or {"units": N}
     for key in ("quantity", "units", "total_units"):
         val = op.get(key)
         if val is not None:
@@ -229,10 +272,3 @@ def _extract_received_qty(op: dict[str, Any]) -> int:
                 pass
 
     return 0
-
-
-def _is_processed(op: dict[str, Any]) -> bool:
-    """Return True if the operation status indicates the stock was actually received."""
-    status = (op.get("status") or "").upper()
-    # Accept PROCESSED, RECEIVED, COMPLETED, or empty (some versions omit status)
-    return status in {"PROCESSED", "RECEIVED", "COMPLETED", ""}
