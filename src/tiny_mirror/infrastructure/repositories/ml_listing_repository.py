@@ -77,3 +77,14 @@ class MLListingRepository:
             )
         )
         return [str(r) for r in result.scalars().all()]
+
+    async def get_all_active_mlb_ids(self) -> list[tuple[str, str]]:
+        """Return (mlb_id, sku) pairs for every active listing in the catalog."""
+        from sqlalchemy import select
+
+        result = await self._session.execute(
+            select(MLListingORM.mlb_id, MLListingORM.sku).where(
+                MLListingORM.status == "active",
+            )
+        )
+        return [(str(m), str(s)) for m, s in result.all()]

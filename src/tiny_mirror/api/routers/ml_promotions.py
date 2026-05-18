@@ -244,6 +244,36 @@ async def refresh_costs(
     return [CostSnapshotOut.model_validate(r) for r in rows]
 
 
+@router.post("/costs/refresh-all", response_model=dict[str, int])
+async def refresh_all_costs(
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, int]:
+    """Itera por todos os MLBs ativos e refresca o snapshot do GAS endpoint.
+
+    Idempotente; commit por batches de 25 pra não bloquear conexão.
+    Usado pelo cron diário ml-costs-refresh-daily.
+    """
+    listings = MLListingRepository(session)
+    pairs = await listings.get_all_active_mlb_ids()
+    ok = 0
+    errors = 0
+    for i, (mlb_id, _sku) in enumerate(pairs):
+        try:
+            result = await service.refresh_costs_for_mlb(session, mlb_id)
+            if result is None or (isinstance(result, dict) and result.get("error")):
+                errors += 1
+            else:
+                ok += 1
+        except Exception:
+            errors += 1
+        # Commit em batches de 25 para liberar locks
+        if (i + 1) % 25 == 0:
+            await session.commit()
+    await session.commit()
+    return {"total": len(pairs), "ok": ok, "errors": errors}
+
+
 # ---------------------------------------------------------------------------
 # ELIGIBLE — live ML API pass-through
 # ---------------------------------------------------------------------------
