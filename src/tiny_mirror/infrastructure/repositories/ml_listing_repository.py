@@ -65,3 +65,15 @@ class MLListingRepository:
     async def count(self) -> int:
         result = await self._session.execute(text("SELECT COUNT(*) FROM ml_listings"))
         return int(result.scalar_one())
+
+    async def get_active_mlb_ids_for_sku(self, sku: str) -> list[str]:
+        """Return all active MLB IDs (any logistic type) for a given seller SKU."""
+        from sqlalchemy import select
+
+        result = await self._session.execute(
+            select(MLListingORM.mlb_id).where(
+                MLListingORM.sku == sku,
+                MLListingORM.status == "active",
+            )
+        )
+        return [str(r) for r in result.scalars().all()]

@@ -1,0 +1,309 @@
+"""Repositories for ML promotion automation tables.
+
+Three logical surfaces:
+- MLPromoCapRepository — user-set caps per SKU (CRUD)
+- MLCostsSnapshotRepository — cached cost data from Google Apps Script
+- MLPromoActionRepository — audit log writer/reader
+- MLPromoAlertRepository — anomalies inbox
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from tiny_mirror.infrastructure.orm.models import (
+    MLCostsSnapshotORM,
+    MLPromoActionORM,
+    MLPromoAlertORM,
+    MLPromoCapORM,
+)
+
+
+# ---------------------------------------------------------------------------
+# Caps
+# ---------------------------------------------------------------------------
+class MLPromoCapRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, sku: str) -> MLPromoCapORM | None:
+        result = await self._session.execute(select(MLPromoCapORM).where(MLPromoCapORM.sku == sku))
+        return result.scalar_one_or_none()
+
+    async def list_all(
+        self,
+        *,
+        only_auto: bool | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[list[MLPromoCapORM], int]:
+        q = select(MLPromoCapORM)
+        count_q = select(func.count(MLPromoCapORM.sku))
+        if only_auto is not None:
+            q = q.where(MLPromoCapORM.auto_apply == only_auto)
+            count_q = count_q.where(MLPromoCapORM.auto_apply == only_auto)
+        q = q.order_by(MLPromoCapORM.sku).limit(limit).offset(offset)
+        rows = list((await self._session.execute(q)).scalars().all())
+        total = int((await self._session.execute(count_q)).scalar_one())
+        return rows, total
+
+    async def upsert(
+        self,
+        sku: str,
+        *,
+        max_seller_share_pct: Decimal,
+        margin_floor_price: Decimal | None = None,
+        auto_apply: bool | None = None,
+        freight_band_opt: bool | None = None,
+        excluded_promo_types: list[str] | None = None,
+        notes: str | None = None,
+        updated_by: str | None = None,
+    ) -> MLPromoCapORM:
+        """Insert or update a cap row. None-valued kwargs preserve current value on update."""
+        update_set: dict[str, Any] = {
+            "max_seller_share_pct": max_seller_share_pct,
+            "updated_at": func.now(),
+        }
+        insert_values: dict[str, Any] = {
+            "sku": sku,
+            "max_seller_share_pct": max_seller_share_pct,
+        }
+        for k, v in (
+            ("margin_floor_price", margin_floor_price),
+            ("auto_apply", auto_apply),
+            ("freight_band_opt", freight_band_opt),
+            ("excluded_promo_types", excluded_promo_types),
+            ("notes", notes),
+            ("updated_by", updated_by),
+        ):
+            if v is not None:
+                update_set[k] = v
+                insert_values[k] = v
+
+        stmt = (
+            pg_insert(MLPromoCapORM)
+            .values(**insert_values)
+            .on_conflict_do_update(index_elements=["sku"], set_=update_set)
+            .returning(MLPromoCapORM)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.scalar_one()
+
+    async def delete(self, sku: str) -> bool:
+        existing = await self.get(sku)
+        if existing is None:
+            return False
+        await self._session.delete(existing)
+        await self._session.flush()
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Costs snapshot
+# ---------------------------------------------------------------------------
+class MLCostsSnapshotRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get(self, mlb_id: str) -> MLCostsSnapshotORM | None:
+        result = await self._session.execute(
+            select(MLCostsSnapshotORM).where(MLCostsSnapshotORM.mlb_id == mlb_id)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_sku(self, sku: str) -> list[MLCostsSnapshotORM]:
+        result = await self._session.execute(
+            select(MLCostsSnapshotORM)
+            .where(MLCostsSnapshotORM.sku == sku)
+            .order_by(MLCostsSnapshotORM.fetched_at.desc())
+        )
+        return list(result.scalars().all())
+
+    async def upsert(
+        self,
+        mlb_id: str,
+        *,
+        sku: str,
+        active_on_sheet: bool,
+        base_cost: Decimal | None,
+        commission_pct: Decimal | None,
+        commission_label: str | None,
+        list_price: Decimal | None,
+        sheet_promo_price: Decimal | None,
+        sheet_discount_pct: Decimal | None,
+        sheet_margin_pct: Decimal | None,
+        sheet_margin_value: Decimal | None,
+        freight_bands: Any | None,
+        fetch_error: str | None = None,
+    ) -> MLCostsSnapshotORM:
+        values: dict[str, Any] = {
+            "mlb_id": mlb_id,
+            "sku": sku,
+            "active_on_sheet": active_on_sheet,
+            "base_cost": base_cost,
+            "commission_pct": commission_pct,
+            "commission_label": commission_label,
+            "list_price": list_price,
+            "sheet_promo_price": sheet_promo_price,
+            "sheet_discount_pct": sheet_discount_pct,
+            "sheet_margin_pct": sheet_margin_pct,
+            "sheet_margin_value": sheet_margin_value,
+            "freight_bands": freight_bands,
+            "fetch_error": fetch_error,
+            "fetched_at": func.now(),
+        }
+        stmt = (
+            pg_insert(MLCostsSnapshotORM)
+            .values(**values)
+            .on_conflict_do_update(
+                index_elements=["mlb_id"],
+                set_={k: v for k, v in values.items() if k != "mlb_id"},
+            )
+            .returning(MLCostsSnapshotORM)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.scalar_one()
+
+
+# ---------------------------------------------------------------------------
+# Actions audit log
+# ---------------------------------------------------------------------------
+class MLPromoActionRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def log(
+        self,
+        *,
+        sku: str,
+        mlb_id: str,
+        action: str,
+        promo_type: str | None = None,
+        promo_id: str | None = None,
+        price_before: Decimal | None = None,
+        price_after: Decimal | None = None,
+        total_pct: Decimal | None = None,
+        seller_pct: Decimal | None = None,
+        meli_pct: Decimal | None = None,
+        reason: str | None = None,
+        ml_response: Any | None = None,
+        dry_run: bool = False,
+    ) -> MLPromoActionORM:
+        row = MLPromoActionORM(
+            sku=sku,
+            mlb_id=mlb_id,
+            action=action,
+            promo_type=promo_type,
+            promo_id=promo_id,
+            price_before=price_before,
+            price_after=price_after,
+            total_pct=total_pct,
+            seller_pct=seller_pct,
+            meli_pct=meli_pct,
+            reason=reason,
+            ml_response=ml_response,
+            dry_run=dry_run,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def list_all(
+        self,
+        *,
+        sku: str | None = None,
+        action: str | None = None,
+        since: datetime | None = None,
+        include_dry_run: bool = True,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[MLPromoActionORM], int]:
+        q = select(MLPromoActionORM)
+        count_q = select(func.count(MLPromoActionORM.id))
+        if sku is not None:
+            q = q.where(MLPromoActionORM.sku == sku)
+            count_q = count_q.where(MLPromoActionORM.sku == sku)
+        if action is not None:
+            q = q.where(MLPromoActionORM.action == action)
+            count_q = count_q.where(MLPromoActionORM.action == action)
+        if since is not None:
+            q = q.where(MLPromoActionORM.at >= since)
+            count_q = count_q.where(MLPromoActionORM.at >= since)
+        if not include_dry_run:
+            q = q.where(MLPromoActionORM.dry_run.is_(False))
+            count_q = count_q.where(MLPromoActionORM.dry_run.is_(False))
+        q = q.order_by(MLPromoActionORM.at.desc()).limit(limit).offset(offset)
+        rows = list((await self._session.execute(q)).scalars().all())
+        total = int((await self._session.execute(count_q)).scalar_one())
+        return rows, total
+
+
+# ---------------------------------------------------------------------------
+# Alerts inbox
+# ---------------------------------------------------------------------------
+class MLPromoAlertRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(
+        self,
+        *,
+        sku: str,
+        mlb_id: str,
+        kind: str,
+        message: str,
+        data: Any | None = None,
+    ) -> MLPromoAlertORM:
+        row = MLPromoAlertORM(
+            sku=sku,
+            mlb_id=mlb_id,
+            kind=kind,
+            message=message,
+            data=data,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def list_all(
+        self,
+        *,
+        acknowledged: bool | None = False,
+        kind: str | None = None,
+        sku: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[MLPromoAlertORM], int]:
+        q = select(MLPromoAlertORM)
+        count_q = select(func.count(MLPromoAlertORM.id))
+        if acknowledged is not None:
+            q = q.where(MLPromoAlertORM.acknowledged.is_(acknowledged))
+            count_q = count_q.where(MLPromoAlertORM.acknowledged.is_(acknowledged))
+        if kind is not None:
+            q = q.where(MLPromoAlertORM.kind == kind)
+            count_q = count_q.where(MLPromoAlertORM.kind == kind)
+        if sku is not None:
+            q = q.where(MLPromoAlertORM.sku == sku)
+            count_q = count_q.where(MLPromoAlertORM.sku == sku)
+        q = q.order_by(MLPromoAlertORM.at.desc()).limit(limit).offset(offset)
+        rows = list((await self._session.execute(q)).scalars().all())
+        total = int((await self._session.execute(count_q)).scalar_one())
+        return rows, total
+
+    async def acknowledge(self, alert_id: int, by: str | None = None) -> bool:
+        row = await self._session.get(MLPromoAlertORM, alert_id)
+        if row is None or row.acknowledged:
+            return False
+        row.acknowledged = True
+        row.acknowledged_by = by
+        row.acknowledged_at = datetime.utcnow()
+        await self._session.flush()
+        return True

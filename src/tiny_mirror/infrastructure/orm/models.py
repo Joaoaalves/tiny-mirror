@@ -946,3 +946,157 @@ class MLListingVariationORM(Base):
     )
     variation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, nullable=False)
     inventory_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# ml_promo_caps
+# ---------------------------------------------------------------------------
+class MLPromoCapORM(Base):
+    __tablename__ = "ml_promo_caps"
+    __table_args__ = {
+        "comment": (
+            "User-set cap on Mercado Livre promotion automation, per SKU. "
+            "auto_apply=true means the daily cron may activate/upgrade promotions for "
+            "this SKU within the cap; freight_band_opt=true lets the algorithm drop "
+            "the price by 1 cent if it crosses a freight band and net gain is positive."
+        ),
+    }
+
+    sku: Mapped[str] = mapped_column(String(100), primary_key=True)
+    max_seller_share_pct: Mapped[Decimal] = mapped_column(
+        Numeric(5, 2),
+        nullable=False,
+        comment="Cap on the % SELLER pays (excludes ML's meli_percentage co-funding share).",
+    )
+    margin_floor_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
+        comment="Override floor price. NULL means use ml_costs_snapshot.sheet_promo_price.",
+    )
+    auto_apply: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    freight_band_opt: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    excluded_promo_types: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_costs_snapshot
+# ---------------------------------------------------------------------------
+class MLCostsSnapshotORM(Base):
+    __tablename__ = "ml_costs_snapshot"
+    __table_args__ = (
+        Index("ix_ml_costs_snapshot_sku", "sku"),
+        {
+            "comment": (
+                "Cached cost data fetched from the Google Apps Script endpoint backed "
+                "by the planilha MERCADO LIVRE. Refreshed daily by the ml-costs-refresh "
+                "cron. Used as the source of truth for freight bands, base cost, "
+                "commission %, and the floor price (sheet_promo_price) in the promotion "
+                "decision algorithm."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    active_on_sheet: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    base_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    commission_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    commission_label: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    list_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    sheet_promo_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    sheet_discount_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    sheet_margin_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    sheet_margin_value: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    freight_bands: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    fetch_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_promo_actions
+# ---------------------------------------------------------------------------
+class MLPromoActionORM(Base):
+    __tablename__ = "ml_promo_actions"
+    __table_args__ = (
+        Index("ix_ml_promo_actions_sku_at", "sku", text("at DESC")),
+        Index("ix_ml_promo_actions_at", text("at DESC")),
+        {
+            "comment": (
+                "Audit log of every promotion decision. Includes dry-runs (dry_run=true) "
+                "so the operator can see what would have been done before the auto-apply "
+                "flag flips."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    action: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        comment="activated|created|removed|no_change|freight_opt|dry_run|error",
+    )
+    promo_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    promo_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    price_before: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    price_after: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    total_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    seller_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    meli_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ml_response: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    dry_run: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_promo_alerts
+# ---------------------------------------------------------------------------
+class MLPromoAlertORM(Base):
+    __tablename__ = "ml_promo_alerts"
+    __table_args__ = (
+        Index("ix_ml_promo_alerts_sku_kind_ack", "sku", "kind", "acknowledged"),
+        Index("ix_ml_promo_alerts_open", "acknowledged", text("at DESC")),
+        {
+            "comment": (
+                "Operator-actionable anomalies detected during scans: promotion already "
+                "active below the planilha floor, pending freight-band opt opportunities, "
+                "missing cost data, etc. Acknowledge to hide from dashboard list."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    kind: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        comment="floor_violation|freight_opt_pending|anomaly|no_cost_data|over_cap_existing",
+    )
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    data: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    acknowledged: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    acknowledged_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
