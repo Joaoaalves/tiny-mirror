@@ -199,15 +199,20 @@ class StockSyncService:
                 )
                 return
 
-            # Optionally pull Full ML stock straight from ML API and overlay it
-            # onto the deposits list, replacing the unreliable Tiny row. None
-            # means "we don't know" (skip mutation); 0 means "ML has no stock".
+            # The Tiny "Full Mercado Livre" deposit is operationally
+            # meaningless — kept by the operator only so the Tiny saída
+            # flow has a target deposit. The mv_coverage stock_full_ml
+            # column MUST come from Mercado Livre: ML.available_quantity
+            # when the SKU has an active FL listing, zero otherwise.
+            # Transient ML failures also force zero — see
+            # _fetch_ml_full_qty's docstring for the rationale.
+            ml_qty = 0
             if self._ml is not None and sku:
                 ptype = (product_data or {}).get("type") or "S"
                 parent_kits = await product_repo.get_parent_kits_for_sku(sku)
-                ml_qty = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
-                if ml_qty is not None:
-                    _overlay_ml_full_deposit(deposits, ml_qty)
+                fetched = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
+                ml_qty = fetched or 0
+            _overlay_ml_full_deposit(deposits, ml_qty)
 
             stock_repo = PostgreSQLStockRepository(session)
             try:
@@ -351,10 +356,18 @@ class StockSyncService:
     # ML helper — computes the authoritative Full-ML stock for a SKU.
     # Uses ml_listings DB (populated daily by MLListingSyncService) to
     # look up inventory_ids, then calls GET /inventories/{id}/stock/fulfillment
-    # for the true warehouse count.  parent_kits comes from
+    # for the true warehouse count. parent_kits comes from
     # product_kit_components and lists kits whose FL stock contributes
-    # units of this SKU.  Returns None when no FL listing exists for the
-    # SKU (leaves the Tiny row untouched); int >= 0 otherwise.
+    # units of this SKU.
+    #
+    # Returns ``int >= 0`` when ML responded successfully (the sum of
+    # ``available_quantity`` across all relevant inventories, or zero
+    # when the SKU has no FL listing). Returns ``None`` only on a
+    # transient ML API failure — the caller treats that as zero too, so
+    # the Tiny FL deposit never leaks into mv_coverage. The trade-off:
+    # during an ML outage a daily sync zeroes everyone out; the next
+    # sync recovers. This is preferred over trusting Tiny's view, which
+    # is operationally meaningless.
     # ------------------------------------------------------------------
     async def _fetch_ml_full_qty(
         self,
