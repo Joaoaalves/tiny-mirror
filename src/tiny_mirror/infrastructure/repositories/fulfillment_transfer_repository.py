@@ -23,6 +23,7 @@ class FulfillmentTransferRepository:
         cost_per_unit: Decimal,
         transferred_at: datetime,
         notes: str | None = None,
+        source: str = "api",
     ) -> FulfillmentTransferORM:
         row = FulfillmentTransferORM(
             product_tiny_id=product_tiny_id,
@@ -31,12 +32,31 @@ class FulfillmentTransferRepository:
             cost_per_unit=cost_per_unit,
             transferred_at=transferred_at,
             status="pending",
+            source=source,
             notes=notes,
         )
         self._session.add(row)
         await self._session.flush()
         await self._session.refresh(row)
         return row
+
+    async def has_recent_pending(self, product_sku: str, since: datetime) -> bool:
+        """Return True if there is a pending transfer for ``product_sku``
+        created at or after ``since``. Idempotency guard for the webhook
+        delta path — Tiny retries on 5xx and the stock cron may race the
+        webhook.
+        """
+        from sqlalchemy import func
+
+        result = await self._session.execute(
+            select(func.count(FulfillmentTransferORM.id)).where(
+                FulfillmentTransferORM.product_sku == product_sku,
+                FulfillmentTransferORM.status == "pending",
+                FulfillmentTransferORM.created_at >= since,
+            )
+        )
+        count = int(result.scalar_one() or 0)
+        return count > 0
 
     async def list_pending_by_sku(self, sku: str) -> list[FulfillmentTransferORM]:
         result = await self._session.execute(

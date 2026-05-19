@@ -37,17 +37,22 @@ share between long-lived consumer contexts.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import structlog
 from sqlalchemy import select
 
+from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
 from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.orm.models import MLListingORM, MLListingVariationORM
+from tiny_mirror.infrastructure.repositories.fulfillment_transfer_repository import (
+    FulfillmentTransferRepository,
+)
 from tiny_mirror.infrastructure.repositories.product_repository import (
     PostgreSQLProductRepository,
 )
@@ -56,6 +61,9 @@ from tiny_mirror.infrastructure.repositories.stock_repository import (
 )
 from tiny_mirror.infrastructure.repositories.sync_log_repository import (
     SyncLogRepository,
+)
+from tiny_mirror.infrastructure.repositories.tiny_fl_stock_snapshot_repository import (
+    TinyFLStockSnapshotRepository,
 )
 from tiny_mirror.mappers.stock_mapper import StockMapper
 from tiny_mirror.queue.publisher import QueuePublisher
@@ -166,10 +174,16 @@ class StockSyncService:
         deposits = StockMapper.extract_deposits(raw)
         sku = stock_data.get("sku") or ""
 
+        # Raw Tiny FL value BEFORE any ML overlay. Drives the webhook
+        # delta path so we don't compare the ML-overlaid stock_deposits
+        # row against the next raw Tiny reading.
+        new_tiny_fl_qty = _sum_tiny_fl_available(deposits)
+
         # Same isolation pattern as product_sync_service: capture errors
         # so the sync-log update always runs in a fresh session and never
         # inherits an aborted-transaction state from the stock upsert.
         processing_error: Exception | None = None
+        product_data: dict[str, Any] | None = None
         async with AsyncSessionLocal() as session:
             # Stock rows have a FK -> products.tiny_id (CASCADE on delete).
             # If the product has not been mirrored yet, the FK insert would
@@ -177,8 +191,8 @@ class StockSyncService:
             # daily product sync will pick the product up and the next
             # stock pass will succeed.
             product_repo = PostgreSQLProductRepository(session)
-            product_exists = await product_repo.get_by_tiny_id(product_tiny_id)
-            if product_exists is None:
+            product_data = await product_repo.get_by_tiny_id(product_tiny_id)
+            if product_data is None:
                 logger.warning(
                     "Skipping stock for product not yet synced",
                     product_tiny_id=product_tiny_id,
@@ -189,7 +203,7 @@ class StockSyncService:
             # onto the deposits list, replacing the unreliable Tiny row. None
             # means "we don't know" (skip mutation); 0 means "ML has no stock".
             if self._ml is not None and sku:
-                ptype = (product_exists or {}).get("type") or "S"
+                ptype = (product_data or {}).get("type") or "S"
                 parent_kits = await product_repo.get_parent_kits_for_sku(sku)
                 ml_qty = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
                 if ml_qty is not None:
@@ -215,6 +229,29 @@ class StockSyncService:
                 )
                 processing_error = exc
 
+        # Delta-driven pending transfer detection. Done in its own session
+        # so a failure here can never poison the upsert above. Only runs
+        # when the stock upsert succeeded (processing_error is None) — we
+        # don't want to invent transfers off a half-applied state.
+        if processing_error is None and sku:
+            try:
+                await self._maybe_record_webhook_transfer(
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    new_tiny_fl_qty=new_tiny_fl_qty,
+                    product_data=product_data,
+                )
+            except Exception as exc:
+                # Never raise — the snapshot/transfer side is best-effort.
+                # If it fails repeatedly we'll see it in Seq; the regular
+                # reception scan keeps the system self-correcting.
+                logger.warning(
+                    "Webhook delta detection failed, ignoring",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    error=str(exc),
+                )
+
         if sync_log_id is not None:
             async with AsyncSessionLocal() as log_session:
                 sync_logs = SyncLogRepository(log_session)
@@ -235,6 +272,80 @@ class StockSyncService:
             available=stock_data["available"],
             deposits_count=len(deposits),
         )
+
+    # ------------------------------------------------------------------
+    # Webhook delta path — compares the raw Tiny FL value vs the previous
+    # snapshot. On a positive delta with no overlapping pending transfer
+    # in the idempotency window, insert a pending row marked
+    # source='tiny_webhook'. This catches manual Tiny transfers we'd
+    # otherwise miss (operator skipped POST /fulfillment/transfer).
+    # ------------------------------------------------------------------
+    async def _maybe_record_webhook_transfer(
+        self,
+        product_tiny_id: int,
+        sku: str,
+        new_tiny_fl_qty: int,
+        product_data: dict[str, Any] | None,
+    ) -> None:
+        async with AsyncSessionLocal() as session:
+            snapshots = TinyFLStockSnapshotRepository(session)
+            previous = await snapshots.get(product_tiny_id)
+            await snapshots.upsert(product_tiny_id, new_tiny_fl_qty)
+
+            # First time we see this product → seed the snapshot only.
+            # We have no prior reference value, so we cannot infer a
+            # transfer happened. The next webhook with a positive delta
+            # will trigger the path.
+            if previous is None:
+                logger.debug(
+                    "FL snapshot seeded (first observation)",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    tiny_fl_qty=new_tiny_fl_qty,
+                )
+                return
+
+            delta = new_tiny_fl_qty - previous
+            if delta <= 0:
+                return
+
+            transfers = FulfillmentTransferRepository(session)
+            now = datetime.now(UTC)
+            window_start = now - timedelta(minutes=settings.fl_webhook_delta_idempotency_minutes)
+            if await transfers.has_recent_pending(sku, since=window_start):
+                logger.info(
+                    "FL positive delta detected but a recent pending transfer "
+                    "already exists — skipping duplicate",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    delta=delta,
+                    new_tiny_fl_qty=new_tiny_fl_qty,
+                )
+                return
+
+            cost = _extract_cost_price(product_data)
+            await transfers.create(
+                product_tiny_id=product_tiny_id,
+                product_sku=sku,
+                quantity=delta,
+                cost_per_unit=cost,
+                transferred_at=now,
+                notes=(
+                    "Detected via Tiny stock webhook: Full ML deposit grew "
+                    f"from {previous} to {new_tiny_fl_qty}."
+                ),
+                source="tiny_webhook",
+            )
+            await session.commit()
+
+            logger.info(
+                "FL pending transfer recorded from webhook delta",
+                product_tiny_id=product_tiny_id,
+                sku=sku,
+                previous_tiny_fl=previous,
+                new_tiny_fl=new_tiny_fl_qty,
+                delta=delta,
+            )
 
     # ------------------------------------------------------------------
     # ML helper — computes the authoritative Full-ML stock for a SKU.
@@ -360,6 +471,41 @@ class StockSyncService:
 
 
 # ---------------------------------------------------------------------------
+def _sum_tiny_fl_available(deposits: list[dict[str, Any]]) -> int:
+    """Sum of ``available`` across Tiny's 'Full Mercado Livre' deposits.
+
+    Matches by name (case-insensitive) so we are insulated from Tiny
+    deposit-id renames. Floors at 0 because Tiny occasionally returns
+    negative balances on the FL row (desync between Tiny and ML), which
+    are not meaningful as a "qty in transit" baseline.
+    """
+    total = 0.0
+    for d in deposits:
+        name = (d.get("deposit_name") or "").lower()
+        if "full mercado livre" in name:
+            total += float(d.get("available") or 0)
+    return max(0, int(total))
+
+
+def _extract_cost_price(product_data: dict[str, Any] | None) -> Decimal:
+    """Best-effort cost lookup for the webhook transfer row.
+
+    Reads ``prices.cost_price`` from the products table (ProductORM.prices
+    JSONB). Returns Decimal('0') when missing — fulfillment_transfers
+    requires NOT NULL and the cost is only informational on the
+    webhook-inferred row (the operator already booked the real cost on
+    the Tiny saída/entrada movements).
+    """
+    if not product_data:
+        return Decimal("0")
+    prices = product_data.get("prices") or {}
+    raw = prices.get("cost_price") or prices.get("price") or 0
+    try:
+        return Decimal(str(raw))
+    except Exception:
+        return Decimal("0")
+
+
 def _overlay_ml_full_deposit(deposits: list[dict[str, Any]], ml_qty: int) -> None:
     """Mutate `deposits` so the Full ML row reflects the authoritative ML
     quantity and counts in coverage (``ignore=False``).

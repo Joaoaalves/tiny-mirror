@@ -2,12 +2,15 @@
 
 Focus areas:
 - _overlay_ml_full_deposit (pure function)
+- _sum_tiny_fl_available + _extract_cost_price (pure helpers)
+- _maybe_record_webhook_transfer — webhook delta detection
 - _fetch_ml_full_qty — FL computation logic (mocks _fl_for_sku)
 - _fl_for_sku — DB + Inventory API integration (mocks session + ML client)
 """
 
 from __future__ import annotations
 
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,7 +19,9 @@ from tiny_mirror.services.stock_sync_service import (
     ML_FULL_DEPOSIT_NAME,
     ML_FULL_DEPOSIT_SENTINEL_ID,
     StockSyncService,
+    _extract_cost_price,
     _overlay_ml_full_deposit,
+    _sum_tiny_fl_available,
 )
 
 pytestmark = pytest.mark.unit
@@ -404,3 +409,240 @@ async def test_fl_for_sku_no_inventory_ids_returns_zero(
 
     assert result == 0
     ml_client.get_inventory_stock.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# _sum_tiny_fl_available (pure helper)
+# ---------------------------------------------------------------------------
+def test_sum_tiny_fl_available_matches_by_name_case_insensitive() -> None:
+    deposits = [
+        {"deposit_name": "Galpão", "available": 100.0},
+        {"deposit_name": "Full Mercado Livre", "available": 12.0},
+    ]
+    assert _sum_tiny_fl_available(deposits) == 12
+
+
+def test_sum_tiny_fl_available_floors_negatives_at_zero() -> None:
+    """Tiny occasionally returns negative balances on the FL row (desync)."""
+    deposits = [
+        {"deposit_name": "Full Mercado Livre", "available": -5.0},
+    ]
+    assert _sum_tiny_fl_available(deposits) == 0
+
+
+def test_sum_tiny_fl_available_returns_zero_when_no_fl_row() -> None:
+    deposits = [
+        {"deposit_name": "Galpão", "available": 7.0},
+    ]
+    assert _sum_tiny_fl_available(deposits) == 0
+
+
+def test_sum_tiny_fl_available_handles_missing_available_key() -> None:
+    deposits = [
+        {"deposit_name": "Full Mercado Livre"},
+    ]
+    assert _sum_tiny_fl_available(deposits) == 0
+
+
+# ---------------------------------------------------------------------------
+# _extract_cost_price (pure helper)
+# ---------------------------------------------------------------------------
+def test_extract_cost_price_reads_cost_price_from_prices_jsonb() -> None:
+    product = {"prices": {"cost_price": "4.20", "price": "9.90"}}
+    assert _extract_cost_price(product) == Decimal("4.20")
+
+
+def test_extract_cost_price_falls_back_to_price_when_cost_missing() -> None:
+    product = {"prices": {"price": "9.90"}}
+    assert _extract_cost_price(product) == Decimal("9.90")
+
+
+def test_extract_cost_price_returns_zero_when_product_is_none() -> None:
+    assert _extract_cost_price(None) == Decimal("0")
+
+
+def test_extract_cost_price_returns_zero_when_prices_missing() -> None:
+    assert _extract_cost_price({}) == Decimal("0")
+
+
+# ---------------------------------------------------------------------------
+# _maybe_record_webhook_transfer — webhook delta path
+# ---------------------------------------------------------------------------
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_seeds_snapshot_on_first_observation(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """No previous snapshot → record it and skip transfer creation."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=None)
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock()
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=1234,
+        sku="FAKE-SKU",
+        new_tiny_fl_qty=20,
+        product_data={"prices": {"cost_price": "5.00"}},
+    )
+
+    snapshot_repo.upsert.assert_awaited_once_with(1234, 20)
+    transfer_repo.create.assert_not_awaited()
+    transfer_repo.has_recent_pending.assert_not_awaited()
+
+
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_creates_pending_on_positive_delta(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """Previous=3, new=23 → insert pending transfer of qty=20, source=tiny_webhook."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=3)
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock(return_value=False)
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=42,
+        sku="CAMP-FITADUPLA-12-2",
+        new_tiny_fl_qty=23,
+        product_data={"prices": {"cost_price": "12.32"}},
+    )
+
+    transfer_repo.create.assert_awaited_once()
+    kwargs = transfer_repo.create.call_args.kwargs
+    assert kwargs["product_tiny_id"] == 42
+    assert kwargs["product_sku"] == "CAMP-FITADUPLA-12-2"
+    assert kwargs["quantity"] == 20
+    assert kwargs["cost_per_unit"] == Decimal("12.32")
+    assert kwargs["source"] == "tiny_webhook"
+
+
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_skips_on_zero_delta(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=10)
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock()
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=1,
+        sku="X",
+        new_tiny_fl_qty=10,
+        product_data={},
+    )
+
+    transfer_repo.create.assert_not_awaited()
+
+
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_skips_on_negative_delta(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """Negative delta = sale shipped from FL; do not create transfer."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=15)
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock()
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=1,
+        sku="X",
+        new_tiny_fl_qty=12,
+        product_data={},
+    )
+
+    transfer_repo.create.assert_not_awaited()
+    snapshot_repo.upsert.assert_awaited_once_with(1, 12)
+
+
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_idempotent_when_recent_pending_exists(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """Positive delta but recent pending exists → skip duplicate."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=2)
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock(return_value=True)
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=1,
+        sku="X",
+        new_tiny_fl_qty=22,
+        product_data={},
+    )
+
+    transfer_repo.has_recent_pending.assert_awaited_once()
+    transfer_repo.create.assert_not_awaited()
+    snapshot_repo.upsert.assert_awaited_once_with(1, 22)

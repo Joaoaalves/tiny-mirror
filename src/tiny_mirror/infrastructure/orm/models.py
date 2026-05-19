@@ -887,9 +887,14 @@ class FulfillmentTransferORM(Base):
             "status IN ('pending', 'received', 'cancelled')",
             name="valid_fulfillment_transfer_status",
         ),
+        CheckConstraint(
+            "source IN ('api', 'tiny_webhook', 'manual')",
+            name="valid_fulfillment_transfer_source",
+        ),
         Index("ix_fulfillment_transfers_product_sku", "product_sku"),
         Index("ix_fulfillment_transfers_status", "status"),
         Index("ix_fulfillment_transfers_transferred_at", "transferred_at"),
+        Index("ix_fulfillment_transfers_source", "source"),
         {
             "comment": (
                 "Tracks units transferred from Galpão to Full ML via Tiny API. "
@@ -916,8 +921,35 @@ class FulfillmentTransferORM(Base):
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default=text("'pending'")
     )
+    source: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'api'"))
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# tiny_fl_stock_snapshots
+# ---------------------------------------------------------------------------
+class TinyFLStockSnapshotORM(Base):
+    __tablename__ = "tiny_fl_stock_snapshots"
+    __table_args__ = (
+        {
+            "comment": (
+                "Per-product memory of Tiny's raw Full ML deposit value "
+                "(pre-overlay). Used purely for delta detection on the "
+                "stock webhook path."
+            ),
+        },
+    )
+
+    product_tiny_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("products.tiny_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    tiny_fl_qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 

@@ -113,6 +113,14 @@ class Settings(BaseSettings):
     # pending transfers as received once stock arrives at Full ML CD.
     sync_fulfillment_reception_cron: str = "0 */6 * * *"
 
+    # Webhook-driven FL transfer detection. When a Tiny stock webhook arrives
+    # and the raw 'Full Mercado Livre' deposit value grew vs the previous
+    # snapshot, we infer the operator did a manual Tiny transfer and insert
+    # a pending fulfillment_transfers row (source='tiny_webhook'). The
+    # idempotency window prevents duplicate rows if Tiny retries on 5xx or
+    # the stock cron races the webhook.
+    fl_webhook_delta_idempotency_minutes: int = 30
+
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, v: str) -> str:
