@@ -102,6 +102,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "fulfillment_reception_scan": CronTrigger.from_crontab(
                 settings.sync_fulfillment_reception_cron, timezone="UTC"
             ),
+            "manual_status_sync": CronTrigger.from_crontab(
+                settings.sync_manual_status_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -150,6 +153,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             await fulfillment_reception_scan_job(ml_client)
         else:
             logger.debug("Fulfillment reception scan skipped: ML client not configured")
+
+    async def _manual_status_sync() -> None:
+        await manual_status_sync_job()
 
     scheduler.add_job(
         _token_rotation,
@@ -221,6 +227,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _fulfillment_reception_scan,
         trigger=triggers["fulfillment_reception_scan"],
         id="fulfillment_reception_scan",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _manual_status_sync,
+        trigger=triggers["manual_status_sync"],
+        id="manual_status_sync",
         replace_existing=True,
     )
 
@@ -589,6 +601,36 @@ async def _trigger_sync(
                 logger.exception("Failed to mark sync_log as failed", sync_log_id=sync_log_id)
 
 
+async def manual_status_sync_job() -> None:
+    """Pull operator's manual SKU classification from the GAS Web App and
+    upsert into ``products.manual_status``. No-ops if not configured.
+    """
+    if not settings.gas_manual_status_url or not settings.gas_manual_status_token:
+        logger.debug("Manual status sync skipped: GAS URL/token not configured")
+        return
+    import httpx
+
+    from tiny_mirror.services.manual_status_sync_service import (
+        ManualStatusSyncError,
+        ManualStatusSyncService,
+    )
+
+    logger.info("Manual status sync job started")
+    async with httpx.AsyncClient() as http:
+        service = ManualStatusSyncService(
+            http=http,
+            gas_url=settings.gas_manual_status_url,
+            gas_token=settings.gas_manual_status_token,
+            timeout_seconds=settings.manual_status_http_timeout_seconds,
+        )
+        try:
+            async with AsyncSessionLocal() as session:
+                stats = await service.run(session)
+            logger.info("Manual status sync job completed", **stats)
+        except ManualStatusSyncError as exc:
+            logger.error("Manual status sync job failed", error=str(exc))
+
+
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:
     """Poll ML INBOUND_RECEPTION and mark pending fulfillment transfers as received."""
     from tiny_mirror.services.fulfillment_reception_service import FulfillmentReceptionService
@@ -619,6 +661,7 @@ __all__ = [
     "TOKEN_ROTATION_RETRY_DELAY_SECONDS",
     "check_and_trigger_initial_sync",
     "fulfillment_reception_scan_job",
+    "manual_status_sync_job",
     "ml_listings_sync_job",
     "orders_reconciliation_job",
     "orders_sync_job",

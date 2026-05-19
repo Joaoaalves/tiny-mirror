@@ -97,10 +97,15 @@ class ProductORM(Base):
     __table_args__ = (
         CheckConstraint("type IN ('P', 'S', 'K', 'V', 'F')", name="valid_type"),
         CheckConstraint("situation IN ('A', 'I', 'E')", name="valid_situation"),
+        CheckConstraint(
+            "manual_status IS NULL OR manual_status IN ('queima', 'analise', 'normal')",
+            name="valid_manual_status",
+        ),
         Index("ix_products_type", "type"),
         Index("ix_products_situation", "situation"),
         Index("ix_products_updated_at_tiny", "updated_at_tiny"),
         Index("ix_products_brand_name", "brand_name"),
+        Index("ix_products_manual_status", "manual_status"),
         {
             "comment": (
                 "Mirror of all products from Tiny ERP. Products of type K (kit) have "
@@ -199,6 +204,17 @@ class ProductORM(Base):
         comment=(
             "Last time this record was fetched from the Tiny API. " "Used to detect stale data."
         ),
+    )
+    manual_status: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        comment=(
+            "Operator's manual classification from the GERAL spreadsheet. "
+            "'queima' / 'analise' / 'normal'. NULL = never synced or not on the sheet."
+        ),
+    )
+    manual_status_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

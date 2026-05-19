@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     # pending transfers as received once stock arrives at Full ML CD.
     sync_fulfillment_reception_cron: str = "0 */6 * * *"
 
+    # Manual SKU status sync (GAS Web App that reads GERAL spreadsheet cell
+    # background colors and exposes worst-of(B, C) as queima/analise/normal).
+    # Empty URL disables the daily job entirely.
+    gas_manual_status_url: str = ""
+    gas_manual_status_token: str = ""
+    # Daily at 04:30 UTC — after products_sync (02:00) and stock_full_sync (03:00).
+    sync_manual_status_cron: str = "30 4 * * *"
+    # HTTP timeout for the GAS call. GAS cold-start can be 2-5s.
+    manual_status_http_timeout_seconds: float = 30.0
+
     # Webhook-driven FL transfer detection. When a Tiny stock webhook arrives
     # and the raw 'Full Mercado Livre' deposit value grew vs the previous
     # snapshot, we infer the operator did a manual Tiny transfer and insert
