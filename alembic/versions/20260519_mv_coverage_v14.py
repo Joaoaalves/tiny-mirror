@@ -14,7 +14,7 @@ Changes vs v13:
 - Keeps sold_7d and momentum_7v30 for any consumer that still wants
   them; will be removed in a later cleanup migration if unused.
 
-Revises: fl_webhook_delta_v1
+Revises: manual_status_v1
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "mv_coverage_v14"
-down_revision = "fl_webhook_delta_v1"
+down_revision = "manual_status_v1"
 branch_labels = None
 depends_on = None
 
