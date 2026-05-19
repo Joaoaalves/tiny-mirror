@@ -149,7 +149,9 @@ async def receive_stock_webhook(
 
     message = {
         "cnpj": payload.cnpj,
-        "id_ecommerce": str(payload.id_ecommerce),
+        # Tiny v3 stock webhooks omit idEcommerce; preserve None instead of
+        # serializing it to the literal string "None".
+        "id_ecommerce": (str(payload.id_ecommerce) if payload.id_ecommerce is not None else None),
         "tipo": payload.tipo,
         "versao": payload.versao,
         "dados": {

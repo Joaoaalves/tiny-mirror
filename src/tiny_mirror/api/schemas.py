@@ -243,7 +243,12 @@ class OrderWebhookPayload(_WebhookBase):
 
 
 class StockWebhookData(_WebhookBase):
-    tipo_estoque: str = Field(alias="tipoEstoque")
+    # Tiny v3 stock webhooks send only: idProduto, sku, nome, saldo. Older
+    # formats also carried tipoEstoque/skuMapeamento*; keep them optional so
+    # both shapes validate. None of these are load-bearing downstream — the
+    # consumer only uses id_produto + sku to re-fetch the full stock from
+    # the Tiny API.
+    tipo_estoque: str | None = Field(default=None, alias="tipoEstoque")
     saldo: float
     id_produto: int = Field(alias="idProduto")
     sku: str
@@ -252,7 +257,9 @@ class StockWebhookData(_WebhookBase):
 
     @field_validator("tipo_estoque")
     @classmethod
-    def _validate_tipo_estoque(cls, value: str) -> str:
+    def _validate_tipo_estoque(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         if value not in ("F", "D"):
             raise ValueError(f"tipoEstoque must be 'F' (Físico) or 'D' (Disponível); got {value!r}")
         return value
@@ -260,7 +267,10 @@ class StockWebhookData(_WebhookBase):
 
 class StockWebhookPayload(_WebhookBase):
     cnpj: str
-    id_ecommerce: str | int = Field(alias="idEcommerce")
+    # Tiny v3 stock webhooks omit idEcommerce. Default None so the schema
+    # accepts both the v3 payload and the legacy/order-style shape that
+    # carries it. Echoed back into the queue message as-is.
+    id_ecommerce: str | int | None = Field(default=None, alias="idEcommerce")
     tipo: str
     versao: str
     dados: StockWebhookData
