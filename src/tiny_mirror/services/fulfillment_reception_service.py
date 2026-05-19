@@ -1,15 +1,33 @@
-"""Detects ML INBOUND_RECEPTION events and marks pending fulfillment transfers as received.
+"""Detects ML fulfillment reception events and marks pending transfers received.
 
 Runs on a schedule (every 6h by default). For each SKU with pending transfers:
-1. Looks up the inventory_id in ml_listings.
-2. Calls GET /stock/fulfillment/operations/search?type=INBOUND_RECEPTION for that inventory.
-3. Totals received quantity from all events after the oldest pending transfer date.
-4. Marks transfers as received FIFO until the received total is exhausted.
 
-This means:
-- 1 transfer of 10 + 1 INBOUND_RECEPTION of 10 → transfer marked received.
-- 2 transfers of 5 each + 1 INBOUND_RECEPTION of 10 → both marked received.
-- 1 transfer of 10 + INBOUND_RECEPTION of 8 (partial) → stays pending until ≥ 10 arrive.
+1. Looks up ALL fulfillment ``inventory_id`` values for the SKU — from
+   ``ml_listings`` and (when the listing has variations) from
+   ``ml_listing_variations``. A SKU split across multiple MLBs / variations
+   maps to multiple inventories; counting only one would under-credit
+   receptions.
+2. For each inventory, lists fulfillment operations from ``oldest_pending``
+   to now (chunked at ≤59 days, ML's 60d hard limit).
+3. Keeps only events whose type is ``INBOUND_RECEPTION`` (batch barcode
+   receptions) or ``TRANSFER_DELIVERY`` (unit-by-unit seller-managed
+   inbounds) and whose ``detail.available_quantity`` is positive — both
+   represent units physically arriving at the FL CD.
+4. FIFO-matches transfers (oldest first) against events. **Chronology
+   guard**: an event is eligible to fulfill a transfer only when its
+   ``date_created`` ≥ the transfer's ``transferred_at``; otherwise newer
+   transfers would steal credit from older, post-event arrivals.
+
+Examples:
+- 1 transfer of 10 + 1 INBOUND_RECEPTION of 10 → marked received.
+- 2 transfers of 5 each + 17 TRANSFER_DELIVERY events of 1 each → both
+  received (TRANSFER_DELIVERY flow now counts).
+- 1 transfer of 10 (2026-05-15) + 5 events of 2 each, all dated
+  2026-05-10 → stays pending (events older than transfer can't fulfill).
+
+This module owns the ``Decision`` shape (no separate domain layer). The
+scan persists ``received_at`` to the timestamp of the event that finally
+covered the transfer's quantity.
 """
 
 from __future__ import annotations
@@ -32,6 +50,14 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
+# Event types ML emits that represent units physically arriving at the FL CD.
+# Both carry ``detail.available_quantity > 0`` when the event ADDS stock.
+# INBOUND_RECEPTION = batch barcode receptions (older flow).
+# TRANSFER_DELIVERY = unit-by-unit seller-managed transfer flow (newer flow,
+# used for example by POL-PSTABA-OFCSFT-CRST in 2026-05).
+INBOUND_EVENT_TYPES = frozenset({"INBOUND_RECEPTION", "TRANSFER_DELIVERY"})
+
+
 @dataclass
 class ReconciliationResult:
     skus_scanned: int = 0
@@ -45,10 +71,13 @@ class FulfillmentReceptionService:
         self._ml = ml_client
 
     async def scan_and_reconcile(self) -> ReconciliationResult:
-        """Scan all pending transfers and mark as received when ML confirms arrival."""
+        """Scan all pending transfers and mark them received when ML confirms arrival."""
         from sqlalchemy import select
 
-        from tiny_mirror.infrastructure.orm.models import MLListingORM
+        from tiny_mirror.infrastructure.orm.models import (
+            MLListingORM,
+            MLListingVariationORM,
+        )
 
         result = ReconciliationResult()
 
@@ -60,31 +89,64 @@ class FulfillmentReceptionService:
             logger.info("No pending fulfillment transfers to reconcile")
             return result
 
-        # Group transfers by SKU
+        # Group transfers by SKU.
         by_sku: dict[str, list[FulfillmentTransferORM]] = {}
         for row in pending_rows:
             by_sku.setdefault(row.product_sku, []).append(row)
 
-        # Look up inventory_ids for all SKUs in one query
+        # Build a SKU -> [inventory_id] map covering BOTH main listings and
+        # their variations. A SKU split across multiple MLBs and/or
+        # variations maps to multiple inventories.
+        sku_list = list(by_sku.keys())
+        inventory_map: dict[str, list[str]] = {}
         async with AsyncSessionLocal() as session:
-            sku_list = list(by_sku.keys())
-            q_result = await session.execute(
-                select(MLListingORM.sku, MLListingORM.inventory_id)
-                .where(
-                    MLListingORM.sku.in_(sku_list),
-                    MLListingORM.logistic_type == "fulfillment",
-                    MLListingORM.inventory_id.isnot(None),
+            main_rows = (
+                await session.execute(
+                    select(
+                        MLListingORM.sku,
+                        MLListingORM.mlb_id,
+                        MLListingORM.inventory_id,
+                        MLListingORM.has_variations,
+                    ).where(
+                        MLListingORM.sku.in_(sku_list),
+                        MLListingORM.logistic_type == "fulfillment",
+                    )
                 )
-                .distinct(MLListingORM.sku)
-            )
-            inventory_map: dict[str, str] = {
-                row.sku: row.inventory_id for row in q_result if row.sku and row.inventory_id
-            }
+            ).all()
+
+            variation_mlb_ids: list[str] = []
+            for sku, mlb_id, inventory_id, has_variations in main_rows:
+                if has_variations:
+                    variation_mlb_ids.append(mlb_id)
+                elif inventory_id:
+                    inventory_map.setdefault(sku, []).append(inventory_id)
+
+            if variation_mlb_ids:
+                var_rows = (
+                    await session.execute(
+                        select(
+                            MLListingORM.sku,
+                            MLListingVariationORM.inventory_id,
+                        )
+                        .join(MLListingORM, MLListingORM.mlb_id == MLListingVariationORM.mlb_id)
+                        .where(
+                            MLListingVariationORM.mlb_id.in_(variation_mlb_ids),
+                            MLListingVariationORM.inventory_id.isnot(None),
+                        )
+                    )
+                ).all()
+                for sku, inventory_id in var_rows:
+                    if inventory_id:
+                        inventory_map.setdefault(sku, []).append(inventory_id)
+
+        # Deduplicate inventory_ids per SKU (two listings can share an inventory).
+        for sku in list(inventory_map.keys()):
+            inventory_map[sku] = sorted(set(inventory_map[sku]))
 
         for sku, transfers in by_sku.items():
             result.skus_scanned += 1
-            inventory_id = inventory_map.get(sku)
-            if not inventory_id:
+            inventory_ids = inventory_map.get(sku) or []
+            if not inventory_ids:
                 logger.warning(
                     "No fulfillment inventory_id found for SKU, skipping",
                     sku=sku,
@@ -92,74 +154,66 @@ class FulfillmentReceptionService:
                 result.skus_with_no_inventory.append(sku)
                 continue
 
-            # Sort transfers FIFO (oldest first)
             transfers_sorted = sorted(transfers, key=lambda t: t.transferred_at)
             oldest_date = transfers_sorted[0].transferred_at
 
             try:
-                received_qty = await self._fetch_total_received(
-                    inventory_id=inventory_id,
+                events = await self._fetch_inbound_events(
+                    inventory_ids=inventory_ids,
                     oldest_transfer_date=oldest_date,
                 )
             except Exception as exc:
                 logger.error(
-                    "Failed to fetch INBOUND_RECEPTION for SKU",
+                    "Failed to fetch fulfillment operations for SKU",
                     sku=sku,
-                    inventory_id=inventory_id,
+                    inventory_ids=inventory_ids,
                     error=str(exc),
                 )
                 result.errors.append(f"{sku}: {exc}")
                 continue
 
-            if received_qty <= 0:
+            if not events:
                 logger.debug(
-                    "No INBOUND_RECEPTION events found for SKU",
+                    "No INBOUND_RECEPTION/TRANSFER_DELIVERY events found for SKU",
                     sku=sku,
-                    inventory_id=inventory_id,
+                    inventory_ids=inventory_ids,
+                )
+                continue
+
+            decisions = _fifo_match_with_chronology(transfers_sorted, events)
+            received_decisions = [d for d in decisions if d.received_at is not None]
+
+            if not received_decisions:
+                logger.debug(
+                    "Events present but none eligible (date filter) or "
+                    "insufficient qty to cover oldest pending transfer",
+                    sku=sku,
+                    inventory_ids=inventory_ids,
+                    events_count=len(events),
                 )
                 continue
 
             logger.info(
-                "INBOUND_RECEPTION total for SKU",
+                "Reception events found for SKU",
                 sku=sku,
-                inventory_id=inventory_id,
-                received_qty=received_qty,
-                pending_transfers=len(transfers_sorted),
+                inventory_ids=inventory_ids,
+                event_count=len(events),
+                received_count=len(received_decisions),
             )
 
-            # FIFO matching: consume received_qty across transfers oldest-first
-            remaining = received_qty
-            ids_to_mark: list[int] = []
-            for transfer in transfers_sorted:
-                if remaining >= transfer.quantity:
-                    ids_to_mark.append(transfer.id)
-                    remaining -= transfer.quantity
-                else:
-                    break  # Not enough received to cover this transfer yet
-
-            if not ids_to_mark:
-                logger.debug(
-                    "Received quantity insufficient to cover oldest pending transfer",
-                    sku=sku,
-                    received_qty=received_qty,
-                    oldest_transfer_qty=transfers_sorted[0].quantity,
-                )
-                continue
-
-            # Persist received status
-            now = datetime.now(UTC)
             async with AsyncSessionLocal() as session:
                 repo = FulfillmentTransferRepository(session)
-                for transfer_id in ids_to_mark:
-                    await repo.mark_received(transfer_id, now)
+                for d in received_decisions:
+                    assert d.received_at is not None  # narrow for mypy
+                    await repo.mark_received(d.transfer_id, d.received_at)
                 await session.commit()
 
-            result.transfers_received += len(ids_to_mark)
+            result.transfers_received += len(received_decisions)
             logger.info(
                 "Marked fulfillment transfers as received",
                 sku=sku,
-                transfer_ids=ids_to_mark,
-                count=len(ids_to_mark),
+                transfer_ids=[d.transfer_id for d in received_decisions],
+                count=len(received_decisions),
             )
 
         logger.info(
@@ -171,49 +225,58 @@ class FulfillmentReceptionService:
         )
         return result
 
-    async def _fetch_total_received(self, inventory_id: str, oldest_transfer_date: datetime) -> int:
-        """Sum all INBOUND_RECEPTION received quantities for an inventory.
-
-        Walks the time window from ``oldest_transfer_date`` to ``now`` in
-        chunks of <= 60 days (ML's max date range per request). For each
-        chunk, sums ``detail.available_quantity`` across all returned
-        events.
+    async def _fetch_inbound_events(
+        self,
+        inventory_ids: list[str],
+        oldest_transfer_date: datetime,
+    ) -> list[dict[str, Any]]:
+        """Return all inbound-positive events (INBOUND_RECEPTION +
+        TRANSFER_DELIVERY) across every inventory, from oldest_transfer_date
+        to now. Chunks at <= 59 days because ML caps the date range at 60d.
         """
-        total = 0
         now_utc = datetime.now(UTC)
         oldest_utc = oldest_transfer_date.astimezone(UTC)
 
-        chunk_start = oldest_utc
-        while chunk_start < now_utc:
-            chunk_end = min(chunk_start + timedelta(days=59), now_utc)
-            total += await self._sum_chunk(
-                inventory_id=inventory_id,
-                date_from=_format_ml_datetime(chunk_start),
-                date_to=_format_ml_datetime(chunk_end),
-            )
-            chunk_start = chunk_end + timedelta(milliseconds=1)
+        collected: list[dict[str, Any]] = []
+        for inventory_id in inventory_ids:
+            chunk_start = oldest_utc
+            while chunk_start < now_utc:
+                chunk_end = min(chunk_start + timedelta(days=59), now_utc)
+                collected.extend(
+                    await self._fetch_chunk_inbound(
+                        inventory_id=inventory_id,
+                        date_from=_format_ml_datetime(chunk_start),
+                        date_to=_format_ml_datetime(chunk_end),
+                    )
+                )
+                chunk_start = chunk_end + timedelta(milliseconds=1)
+        return collected
 
-        return total
-
-    async def _sum_chunk(self, inventory_id: str, date_from: str, date_to: str) -> int:
-        """Page through a single <=60d window and sum detail.available_quantity."""
-        chunk_total = 0
+    async def _fetch_chunk_inbound(
+        self,
+        inventory_id: str,
+        date_from: str,
+        date_to: str,
+    ) -> list[dict[str, Any]]:
+        """Page through a single <=59d window and return inbound-positive events."""
+        out: list[dict[str, Any]] = []
         offset = 0
         limit = 50
-
         while True:
-            data = await self._ml.list_fulfillment_inbound_operations(
+            data = await self._ml.list_fulfillment_operations(
                 inventory_id=inventory_id,
                 date_from=date_from,
                 date_to=date_to,
+                operation_type=None,  # no type filter → all event types
                 limit=limit,
                 offset=offset,
             )
             results: list[dict[str, Any]] = data.get("results") or []
             for op in results:
-                qty = _extract_received_qty(op)
-                if qty > 0:
-                    chunk_total += qty
+                if op.get("type") not in INBOUND_EVENT_TYPES:
+                    continue
+                if _extract_received_qty(op) > 0:
+                    out.append(op)
 
             paging = data.get("paging") or {}
             fetched_so_far = offset + len(results)
@@ -221,12 +284,63 @@ class FulfillmentReceptionService:
             if fetched_so_far >= api_total or not results:
                 break
             offset += limit
-
-        return chunk_total
+        return out
 
 
 # ---------------------------------------------------------------------------
-# Helpers — extraction of ML INBOUND_RECEPTION fields
+# Decision shape used by scan_and_reconcile to drive the persistence step.
+# Decoupled from FulfillmentTransferORM so the FIFO matcher stays a pure
+# function and is straightforward to unit-test.
+# ---------------------------------------------------------------------------
+@dataclass
+class _MatchDecision:
+    transfer_id: int
+    received_at: datetime | None  # None means still pending
+
+
+def _fifo_match_with_chronology(
+    transfers: list[FulfillmentTransferORM],
+    events: list[dict[str, Any]],
+) -> list[_MatchDecision]:
+    """Match transfers (oldest first) against events (oldest first), where
+    an event can only fulfill a transfer whose ``transferred_at`` is at or
+    before the event's ``date_created``. Events are consumed greedily; an
+    event with leftover quantity carries over to younger transfers.
+    """
+    transfers_sorted = sorted(transfers, key=lambda t: t.transferred_at)
+    events_sorted = sorted(
+        events,
+        key=lambda e: _extract_received_at(e) or datetime.min.replace(tzinfo=UTC),
+    )
+    remaining_per_event = [_extract_received_qty(e) for e in events_sorted]
+
+    decisions: list[_MatchDecision] = []
+    for t in transfers_sorted:
+        needed = int(t.quantity)
+        last_event_date: datetime | None = None
+        transfer_at = t.transferred_at.astimezone(UTC)
+        for i, e in enumerate(events_sorted):
+            if remaining_per_event[i] <= 0:
+                continue
+            evt_date = _extract_received_at(e)
+            if evt_date is None or evt_date < transfer_at:
+                continue
+            take = min(needed, remaining_per_event[i])
+            remaining_per_event[i] -= take
+            needed -= take
+            if take > 0:
+                last_event_date = evt_date
+            if needed <= 0:
+                break
+        if needed <= 0:
+            decisions.append(_MatchDecision(transfer_id=int(t.id), received_at=last_event_date))
+        else:
+            decisions.append(_MatchDecision(transfer_id=int(t.id), received_at=None))
+    return decisions
+
+
+# ---------------------------------------------------------------------------
+# Helpers — event-shape extraction
 # ---------------------------------------------------------------------------
 def _format_ml_datetime(dt: datetime) -> str:
     """Format a UTC datetime for the ML operations search API.
@@ -238,13 +352,12 @@ def _format_ml_datetime(dt: datetime) -> str:
 
 
 def _extract_received_qty(op: dict[str, Any]) -> int:
-    """Extract units received in a single INBOUND_RECEPTION operation event.
+    """Extract units received in a single fulfillment operation event.
 
-    Verified against production ML API (2026-05): the canonical field is
-    ``detail.available_quantity`` — the units processed and made available
-    in this specific event. A single physical inbound may be split across
-    multiple events, so summing this field across events in a date range
-    gives the total units actually received.
+    Verified against production ML API (2026-05): canonical field is
+    ``detail.available_quantity`` — the units processed in this event.
+    Positive for inbound types (INBOUND_RECEPTION, TRANSFER_DELIVERY);
+    negative for sales/reservations. Returns 0 when the field is absent.
 
     Fallbacks (``quantities.received``, ``quantity``) preserve forward
     compatibility if ML adds new shapes.
@@ -272,3 +385,19 @@ def _extract_received_qty(op: dict[str, Any]) -> int:
                 pass
 
     return 0
+
+
+def _extract_received_at(op: dict[str, Any]) -> datetime | None:
+    """Parse ``date_created`` (ISO-8601, e.g. ``2026-05-14T12:15:00Z``) into a
+    timezone-aware UTC datetime. Returns ``None`` when the field is missing
+    or unparseable.
+    """
+    raw = op.get("date_created")
+    if not raw or not isinstance(raw, str):
+        return None
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(raw).astimezone(UTC)
+    except (ValueError, TypeError):
+        return None

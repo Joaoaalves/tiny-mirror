@@ -124,20 +124,23 @@ class MercadoLivreAPIClient:
                 items.append(body)
         return items
 
-    async def list_fulfillment_inbound_operations(
+    async def list_fulfillment_operations(
         self,
         inventory_id: str,
         date_from: str,
         date_to: str,
+        operation_type: str | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> dict[str, Any]:
-        """Return INBOUND_RECEPTION operations for a given inventory_id.
+        """Return fulfillment stock operations for an inventory.
 
-        Calls ``GET /stock/fulfillment/operations/search`` filtering by
-        ``type=INBOUND_RECEPTION``, ``inventory_id``, ``date_from``, ``date_to``.
-        All four are required by the ML API. Date strings must be ISO-8601
-        UTC with milliseconds (``YYYY-MM-DDTHH:MM:SS.000Z``).
+        Calls ``GET /stock/fulfillment/operations/search``. When
+        ``operation_type`` is ``None`` (default) ML returns events of every
+        type — INBOUND_RECEPTION, TRANSFER_DELIVERY, TRANSFER_RESERVATION,
+        SALE_CONFIRMATION, ADJUSTMENT, etc. Pass a specific type to filter
+        server-side. Date strings must be ISO-8601 UTC with milliseconds
+        (``YYYY-MM-DDTHH:MM:SS.000Z``).
 
         IMPORTANT: ML enforces a 60-day max range between date_from and
         date_to. Callers must chunk requests for longer windows.
@@ -145,31 +148,35 @@ class MercadoLivreAPIClient:
         Response shape (verified against production ML API 2026-05):
           ``{"paging": {"total": N}, "results": [{
               "id": <int>,
-              "type": "INBOUND_RECEPTION",
+              "type": "INBOUND_RECEPTION" | "TRANSFER_DELIVERY" | ...,
               "date_created": "2026-04-23T02:04:25Z",
               "inventory_id": "...",
               "detail": {"available_quantity": Q, "not_available_detail": []},
-              "result": {"total": T, "available_quantity": A, ...},
-              "external_references": [{"type": "inbound_id", "value": "..."}]
+              "result": {"total": T, "available_quantity": A, ...}
           }]}``
 
-        The ``detail.available_quantity`` is the units processed in THIS
-        operation event (a single inbound is often split across multiple
-        events). Summing across events in the date range gives the total
-        units actually received and made available in the period.
+        ``detail.available_quantity`` is the units processed in THIS event
+        (positive for inbounds, negative for sales/reservations). Summing
+        positive values across INBOUND_RECEPTION + TRANSFER_DELIVERY in
+        the window gives the total units physically received at the CD —
+        ML uses TRANSFER_DELIVERY for the unit-by-unit seller-managed
+        flow (e.g. POL-PSTABA-OFCSFT-CRST 2026-05) whose receptions are
+        invisible if filtered to INBOUND_RECEPTION only.
         """
+        params: dict[str, Any] = {
+            "seller_id": self._user_id,
+            "inventory_id": inventory_id,
+            "date_from": date_from,
+            "date_to": date_to,
+            "limit": limit,
+            "offset": offset,
+        }
+        if operation_type is not None:
+            params["type"] = operation_type
         return await self._request(
             "GET",
             "/stock/fulfillment/operations/search",
-            params={
-                "seller_id": self._user_id,
-                "inventory_id": inventory_id,
-                "type": "INBOUND_RECEPTION",
-                "date_from": date_from,
-                "date_to": date_to,
-                "limit": limit,
-                "offset": offset,
-            },
+            params=params,
         )
 
     async def get_inventory_stock(self, inventory_id: str) -> dict[str, Any]:

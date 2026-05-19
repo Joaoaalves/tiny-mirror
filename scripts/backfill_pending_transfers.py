@@ -98,6 +98,47 @@ BACKFILL: list[tuple[str, int, str, str]] = [
     ("SLF-SUP-PHIGREQ-CR", 5, "2026-05-07T13:11:00+00:00", "72.32"),
     # SOZ-APOI-BLKPIANO — cost 66,00
     ("SOZ-APOI-BLKPIANO", 90, "2026-05-18T16:28:00+00:00", "66.00"),
+    # ------------------------------------------------------------------
+    # Batch 2 — added 2026-05-19. SLF-SUP-PHIGREQ-CR's 3 dates already in
+    # batch 1 are deduped automatically by the row-level idempotency check
+    # (only the new 29/04 row gets inserted).
+    # ------------------------------------------------------------------
+    # DEL-PSTSFUM-31D-A4
+    ("DEL-PSTSFUM-31D-A4", 20, "2026-05-18T16:10:00+00:00", "0"),
+    ("DEL-PSTSFUM-31D-A4", 24, "2026-05-15T17:29:00+00:00", "0"),
+    ("DEL-PSTSFUM-31D-A4", 9, "2026-04-27T12:20:00+00:00", "0"),
+    # EMB-ETQ-TERM-60X40
+    ("EMB-ETQ-TERM-60X40", 5, "2026-05-11T12:35:00+00:00", "0"),
+    ("EMB-ETQ-TERM-60X40", 10, "2026-04-30T19:05:00+00:00", "0"),
+    # EVA-AIMP240-70CM-PRT
+    ("EVA-AIMP240-70CM-PRT", 25, "2026-05-18T16:15:00+00:00", "0"),
+    ("EVA-AIMP240-70CM-PRT", 28, "2026-05-11T18:56:00+00:00", "0"),
+    # MAST-PLAST-125-A4100
+    ("MAST-PLAST-125-A4100", 3, "2026-05-15T17:32:00+00:00", "0"),
+    # MXCR-PRANCH-A4-PRET
+    ("MXCR-PRANCH-A4-PRET", 10, "2026-04-30T19:03:00+00:00", "0"),
+    # NIT-CST-ORG-RTT-G-CZ
+    ("NIT-CST-ORG-RTT-G-CZ", 6, "2026-05-13T12:00:00+00:00", "0"),
+    ("NIT-CST-ORG-RTT-G-CZ", 5, "2026-05-11T12:33:00+00:00", "0"),
+    ("NIT-CST-ORG-RTT-G-CZ", 3, "2026-04-30T19:00:00+00:00", "0"),
+    # POL-PSTRTCLIP-NLP-CRST
+    ("POL-PSTRTCLIP-NLP-CRST", 5, "2026-05-11T19:01:00+00:00", "0"),
+    ("POL-PSTRTCLIP-NLP-CRST", 2, "2026-04-30T18:57:00+00:00", "0"),
+    # PRE-SBT-EBLU-LAVN-5L
+    ("PRE-SBT-EBLU-LAVN-5L", 56, "2026-05-05T12:28:00+00:00", "0"),
+    ("PRE-SBT-EBLU-LAVN-5L", 32, "2026-04-30T18:52:00+00:00", "0"),
+    # SLF-PTALHER-PR
+    ("SLF-PTALHER-PR", 14, "2026-05-11T12:36:00+00:00", "0"),
+    ("SLF-PTALHER-PR", 7, "2026-05-07T13:13:00+00:00", "0"),
+    # SLF-SUP-PHIGREQ-CR — only the 29/04 row is new (other 3 dedup'd)
+    ("SLF-SUP-PHIGREQ-CR", 10, "2026-05-13T11:46:00+00:00", "72.32"),
+    ("SLF-SUP-PHIGREQ-CR", 12, "2026-05-11T12:30:00+00:00", "72.32"),
+    ("SLF-SUP-PHIGREQ-CR", 5, "2026-05-07T13:11:00+00:00", "72.32"),
+    ("SLF-SUP-PHIGREQ-CR", 35, "2026-04-29T18:47:00+00:00", "72.32"),
+    # SOZ-CAV-PIN75CM
+    ("SOZ-CAV-PIN75CM", 20, "2026-05-13T11:47:00+00:00", "0"),
+    ("SOZ-CAV-PIN75CM", 40, "2026-05-11T18:55:00+00:00", "0"),
+    ("SOZ-CAV-PIN75CM", 10, "2026-05-05T12:29:00+00:00", "0"),
 ]
 
 BACKFILL_TAG = "[BACKFILL 2026-05-19]"
@@ -281,22 +322,53 @@ async def _lookup_tiny_ids(skus: set[str]) -> dict[str, int]:
         return dict(rows)
 
 
-async def _existing_backfill_skus() -> set[str]:
-    """Return SKUs that already have BACKFILL_TAG rows so we don't double-insert."""
+async def _lookup_cost_prices(skus: set[str]) -> dict[str, Decimal]:
+    """Return ``products.prices.cost_price`` per SKU, used as a fallback when
+    the BACKFILL entry omits the cost (passed as ``'0'``). Defaults to 0 if
+    the product row lacks ``cost_price``.
+    """
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(ProductORM.sku, ProductORM.prices).where(ProductORM.sku.in_(list(skus)))
+            )
+        ).all()
+        out: dict[str, Decimal] = {}
+        for sku, prices in rows:
+            raw = (prices or {}).get("cost_price") or 0
+            try:
+                out[sku] = Decimal(str(raw))
+            except Exception:
+                out[sku] = Decimal("0")
+        return out
+
+
+async def _existing_backfill_keys() -> set[tuple[str, int, datetime]]:
+    """Return the set of (sku, quantity, transferred_at) tuples that already
+    have a BACKFILL_TAG row, so we can skip them at the row level.
+
+    Row-level idempotency lets a subsequent run add NEW rows for a SKU that
+    already had earlier backfill rows — useful when more historical
+    transfers surface later for the same product.
+    """
     from sqlalchemy import literal
 
     async with AsyncSessionLocal() as session:
-        # Simple LIKE check on notes prefix.
         from tiny_mirror.infrastructure.orm.models import FulfillmentTransferORM
 
         rows = (
             await session.execute(
-                select(FulfillmentTransferORM.product_sku.distinct()).where(
-                    FulfillmentTransferORM.notes.like(literal(f"{BACKFILL_TAG}%"))
-                )
+                select(
+                    FulfillmentTransferORM.product_sku,
+                    FulfillmentTransferORM.quantity,
+                    FulfillmentTransferORM.transferred_at,
+                ).where(FulfillmentTransferORM.notes.like(literal(f"{BACKFILL_TAG}%")))
             )
         ).all()
-        return {sku for (sku,) in rows}
+        return {
+            (sku, int(qty), ts.astimezone(UTC) if ts.tzinfo else ts.replace(tzinfo=UTC))
+            for sku, qty, ts in rows
+        }
 
 
 def _parse_transfers() -> list[Transfer]:
@@ -393,23 +465,32 @@ async def _run(apply: bool) -> None:
         raise RuntimeError("ML_CLIENT_ID is empty — script must run on the VPS")
 
     transfers = _parse_transfers()
-    skus = {t.sku for t in transfers}
 
-    already = await _existing_backfill_skus()
-    if already & skus:
-        print(f"⚠ SKUs already have BACKFILL rows, skipping them: {sorted(already & skus)}")
-        transfers = [t for t in transfers if t.sku not in already]
-        skus = {t.sku for t in transfers}
-        if not transfers:
-            print("Nothing left to backfill.")
-            return
+    # Row-level idempotency: skip only the exact (sku, qty, transferred_at)
+    # tuples already inserted by a previous BACKFILL run.
+    already = await _existing_backfill_keys()
+    pre_count = len(transfers)
+    transfers = [t for t in transfers if (t.sku, t.qty, t.transferred_at) not in already]
+    skipped = pre_count - len(transfers)
+    if skipped:
+        print(f"⚠ Skipping {skipped} rows that already exist with the {BACKFILL_TAG} tag.")
+    skus = {t.sku for t in transfers}
+    if not transfers:
+        print("Nothing left to backfill.")
+        return
 
     tiny_ids = await _lookup_tiny_ids(skus)
     missing = skus - set(tiny_ids.keys())
     if missing:
         raise RuntimeError(f"SKUs not found in products: {sorted(missing)}")
+
+    # Fallback costs from products.prices.cost_price for entries that came
+    # in with cost == 0 in the BACKFILL list (user didn't have the value).
+    fallback_costs = await _lookup_cost_prices(skus)
     for t in transfers:
         t.tiny_id = tiny_ids[t.sku]
+        if t.cost <= 0:
+            t.cost = fallback_costs.get(t.sku, Decimal("0"))
 
     await initialize_redis()
     http_client = httpx.AsyncClient(timeout=30.0)
