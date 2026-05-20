@@ -33,7 +33,7 @@ async def test_refresh_upserts_every_item_and_returns_stats(monkeypatch) -> None
         "difalPct": 0.115,
         "count": 2,
         "items": {
-            "MLB1": {
+            "MLB3884049149": {
                 "sku": "A",
                 "active": True,
                 "baseCost": 10,
@@ -46,7 +46,7 @@ async def test_refresh_upserts_every_item_and_returns_stats(monkeypatch) -> None
                 "currentMarginValue": 4.2,
                 "freightBands": [{"min": 0, "max": 18.99, "cost": 5.65}],
             },
-            "MLB2": {
+            "MLB3644929145": {
                 "sku": "B",
                 "active": False,
                 "baseCost": None,
@@ -79,17 +79,52 @@ async def test_refresh_upserts_every_item_and_returns_stats(monkeypatch) -> None
     session = MagicMock()
     session.commit = AsyncMock()
     stats = await refresh_all_from_bulk(session, _fake_gas(payload))
-    assert stats == {"received": 2, "upserted": 2, "skipped_no_data": 0}
-    assert {c["mlb_id"] for c in upsert_calls} == {"MLB1", "MLB2"}
-    # check Decimal conversion happened
-    mlb1 = next(c for c in upsert_calls if c["mlb_id"] == "MLB1")
+    assert stats == {
+        "received": 2,
+        "upserted": 2,
+        "skipped_no_data": 0,
+        "skipped_invalid_id": 0,
+    }
+    assert {c["mlb_id"] for c in upsert_calls} == {"MLB3884049149", "MLB3644929145"}
+    mlb1 = next(c for c in upsert_calls if c["mlb_id"] == "MLB3884049149")
     assert mlb1["base_cost"] == Decimal("10")
     assert mlb1["commission_pct"] == Decimal("11.5")
     assert mlb1["sku"] == "A"
-    # MLB2 had baseCost=None; should be persisted as None
-    mlb2 = next(c for c in upsert_calls if c["mlb_id"] == "MLB2")
+    mlb2 = next(c for c in upsert_calls if c["mlb_id"] == "MLB3644929145")
     assert mlb2["base_cost"] is None
     session.commit.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_skips_malformed_mlb_ids(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Spreadsheet sometimes has cells like 'MLB123 / 456' that must not
+    reach the DB (mlb_id is varchar(20))."""
+    payload = {
+        "items": {
+            "MLB3884049149": {"sku": "OK", "active": True, "baseCost": 10},
+            "MLB4078501557 / 4078501557": {"sku": "BAD", "active": True, "baseCost": 5},
+            "not-an-mlb": {"sku": "WORSE", "active": True, "baseCost": 1},
+        }
+    }
+    calls: list[str] = []
+
+    class FakeRepo:
+        def __init__(self, _s: Any) -> None:
+            pass
+
+        async def upsert(self, mlb_id: str, **_: Any) -> None:
+            calls.append(mlb_id)
+
+    monkeypatch.setattr(
+        "tiny_mirror.services.cost_refresh_service.MLCostsSnapshotRepository",
+        FakeRepo,
+    )
+    session = MagicMock()
+    session.commit = AsyncMock()
+    stats = await refresh_all_from_bulk(session, _fake_gas(payload))
+    assert calls == ["MLB3884049149"]
+    assert stats["skipped_invalid_id"] == 2
+    assert stats["upserted"] == 1
 
 
 @pytest.mark.asyncio

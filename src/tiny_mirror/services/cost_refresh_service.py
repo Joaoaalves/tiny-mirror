@@ -11,6 +11,7 @@ around for ad-hoc one-MLB refreshes.
 
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +24,11 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
 from tiny_mirror.services.gas_client import GASClient, GASClientError
 
 logger = structlog.get_logger(__name__)
+
+# Real ML listing ids look like "MLB" + 10-13 digits. The spreadsheet
+# occasionally has malformed cells ("MLB123 / 456", "MLB-pending", etc.)
+# that must not reach the DB — products.mlb_id is varchar(20).
+_VALID_MLB_RE = re.compile(r"^MLB\d{6,16}$")
 
 
 class CostRefreshError(Exception):
@@ -59,11 +65,16 @@ async def refresh_all_from_bulk(
     snap_repo = MLCostsSnapshotRepository(session)
     ok = 0
     skipped_no_data = 0
+    skipped_invalid_id = 0
     batch_size = 50
 
     for i, (mlb_id, row) in enumerate(items.items()):
         if not isinstance(row, dict):
             skipped_no_data += 1
+            continue
+        if not _VALID_MLB_RE.match(mlb_id):
+            skipped_invalid_id += 1
+            logger.warning("cost_refresh_invalid_mlb_id", mlb_id=mlb_id)
             continue
         await snap_repo.upsert(
             mlb_id=mlb_id,
@@ -90,6 +101,7 @@ async def refresh_all_from_bulk(
         "received": len(items),
         "upserted": ok,
         "skipped_no_data": skipped_no_data,
+        "skipped_invalid_id": skipped_invalid_id,
     }
     logger.info(
         "cost_refresh_bulk_ok",
