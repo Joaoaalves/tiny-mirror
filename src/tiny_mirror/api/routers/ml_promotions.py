@@ -83,6 +83,9 @@ class CostSnapshotOut(BaseModel):
     freight_bands: Any | None
     fetch_error: str | None
     fetched_at: datetime
+    # DIFAL (sheet-wide constant). Sent on every snapshot so the frontend
+    # can mirror the margin formula locally without a separate config call.
+    difal_pct: Decimal | None = None
 
 
 class ActionOut(BaseModel):
@@ -216,6 +219,17 @@ async def delete_cap(
 # ---------------------------------------------------------------------------
 # COSTS
 # ---------------------------------------------------------------------------
+def _snapshot_out(row: Any) -> CostSnapshotOut:
+    """Build a CostSnapshotOut and attach the DIFAL constant so the
+    frontend can mirror the margin formula without an extra config call.
+    """
+    from tiny_mirror.config import settings
+
+    out = CostSnapshotOut.model_validate(row)
+    out.difal_pct = Decimal(str(settings.margin_difal_pct))
+    return out
+
+
 @router.get("/costs/{sku}", response_model=list[CostSnapshotOut])
 async def get_costs(
     sku: str,
@@ -223,7 +237,7 @@ async def get_costs(
 ) -> list[CostSnapshotOut]:
     repo = MLCostsSnapshotRepository(session)
     rows = await repo.get_by_sku(sku)
-    return [CostSnapshotOut.model_validate(r) for r in rows]
+    return [_snapshot_out(r) for r in rows]
 
 
 @router.post("/costs/refresh/{sku}", response_model=list[CostSnapshotOut])
@@ -241,7 +255,7 @@ async def refresh_costs(
     await session.commit()
     repo = MLCostsSnapshotRepository(session)
     rows = await repo.get_by_sku(sku)
-    return [CostSnapshotOut.model_validate(r) for r in rows]
+    return [_snapshot_out(r) for r in rows]
 
 
 @router.post("/costs/refresh-all", response_model=dict[str, int])
