@@ -65,6 +65,17 @@ class CapOut(BaseModel):
     notes: str | None
     updated_by: str | None
     updated_at: datetime
+    # Joined from ml_costs_snapshot (latest active one) so the dashboard
+    # table can show profitability without a per-SKU round-trip.
+    list_price: Decimal | None = None
+    margin_at_floor_value: Decimal | None = None
+    margin_at_floor_pct: Decimal | None = None
+    # Full pricing inputs so the dashboard can recompute margin live
+    # while the operator drags the cap slider in the table.
+    base_cost: Decimal | None = None
+    commission_pct: Decimal | None = None
+    difal_pct: Decimal | None = None
+    freight_bands: Any | None = None
 
 
 class CostSnapshotOut(BaseModel):
@@ -157,6 +168,65 @@ def _service_dep(request: Request) -> MLPromotionService:
 # ---------------------------------------------------------------------------
 # CAPS
 # ---------------------------------------------------------------------------
+async def _enrich_cap(
+    session: AsyncSession,
+    cap: Any,
+) -> CapOut:
+    """Attach list_price + margin-at-floor to a cap row.
+
+    The margin uses the same pricing formula as the recompute job so
+    numbers shown in the dashboard match the engine exactly. Snapshot
+    lookup is by SKU; if multiple MLBs exist we use the most expensive
+    base_cost (the worst-case MLB the cap has to protect).
+    """
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.pricing_service import PricingDataError, margin_at_price
+
+    snap_repo = MLCostsSnapshotRepository(session)
+    snaps = await snap_repo.get_by_sku(cap.sku)
+
+    out = CapOut.model_validate(cap)
+    if not snaps:
+        return out
+
+    # Pick the worst-case MLB (highest base_cost) — the same conservative
+    # choice cap_recompute_service makes.
+    usable = [
+        s
+        for s in snaps
+        if s.base_cost is not None
+        and s.commission_pct is not None
+        and s.list_price is not None
+        and s.freight_bands
+    ]
+    if not usable:
+        return out
+    snap = max(usable, key=lambda s: s.base_cost or Decimal(0))
+    out.list_price = snap.list_price
+    out.base_cost = snap.base_cost
+    out.commission_pct = snap.commission_pct
+    out.freight_bands = snap.freight_bands
+    out.difal_pct = Decimal(str(settings.margin_difal_pct))
+
+    floor_price = cap.margin_floor_price
+    if floor_price is None:
+        floor_price = snap.sheet_promo_price
+    if floor_price is None or snap.base_cost is None or snap.commission_pct is None:
+        return out
+    try:
+        breakdown = margin_at_price(
+            price=floor_price,
+            base_cost=snap.base_cost,
+            commission_pct=snap.commission_pct,
+            freight_bands=snap.freight_bands,
+        )
+    except PricingDataError:
+        return out
+    out.margin_at_floor_value = breakdown.margin_value
+    out.margin_at_floor_pct = breakdown.margin_pct
+    return out
+
+
 @router.get("/caps", response_model=list[CapOut])
 async def list_caps(
     only_auto: Annotated[bool | None, Query(description="filter by auto_apply")] = None,
@@ -166,7 +236,7 @@ async def list_caps(
 ) -> list[CapOut]:
     repo = MLPromoCapRepository(session)
     rows, _ = await repo.list_all(only_auto=only_auto, limit=limit, offset=offset)
-    return [CapOut.model_validate(r) for r in rows]
+    return [await _enrich_cap(session, r) for r in rows]
 
 
 @router.get("/caps/{sku}", response_model=CapOut)
@@ -178,7 +248,7 @@ async def get_cap(
     row = await repo.get(sku)
     if row is None:
         raise HTTPException(status_code=404, detail=f"no cap for sku={sku}")
-    return CapOut.model_validate(row)
+    return await _enrich_cap(session, row)
 
 
 @router.put("/caps", response_model=list[CapOut])
