@@ -26,6 +26,7 @@ import httpx
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from tiny_mirror.config import settings as _settings
 from tiny_mirror.infrastructure.repositories.ml_listing_repository import (
     MLListingRepository,
 )
@@ -40,10 +41,6 @@ from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenSer
 logger = structlog.get_logger(__name__)
 
 ML_API_BASE = "https://api.mercadolibre.com"
-GAS_COSTS_URL = (
-    "https://script.google.com/macros/s/"
-    "AKfycbwxPfntOoIJ7tRnIlrOQZrBNdMSN7a9CJl1QQtsghCHmO-CKB3vT_8KhviRAS0mJnvPSw/exec"
-)
 
 
 # ===========================================================================
@@ -350,11 +347,22 @@ class MLPromotionService:
 
     # -- GAS costs --------------------------------------------------------
     async def fetch_gas_costs(self, mlb_id: str) -> dict[str, Any] | None:
+        """Single-MLB cost lookup via the unified GAS endpoint.
+
+        Prefer ``CostRefreshService.refresh_all_from_bulk`` for batch use
+        — this method exists for ad-hoc one-offs only.
+        """
+        if not _settings.gas_base_url or not _settings.gas_token:
+            return {"error": "GAS not configured"}
         try:
             resp = await self._http.get(
-                GAS_COSTS_URL,
-                params={"mlbid": mlb_id},
-                timeout=30.0,
+                _settings.gas_base_url,
+                params={
+                    "action": "cost",
+                    "mlbid": mlb_id,
+                    "token": _settings.gas_token,
+                },
+                timeout=_settings.gas_http_timeout_seconds,
                 follow_redirects=True,
             )
             if resp.status_code >= 400:

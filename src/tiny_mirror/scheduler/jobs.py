@@ -160,11 +160,10 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
     async def _manual_status_sync() -> None:
         await manual_status_sync_job()
 
-    ml_token_service = getattr(app.state, "ml_token_service", None)
     http_client = getattr(app.state, "http_client", None)
 
     async def _ml_promo_recompute() -> None:
-        await ml_promo_recompute_job(http_client, ml_token_service)
+        await ml_promo_recompute_job(http_client)
 
     scheduler.add_job(
         _token_rotation,
@@ -620,11 +619,12 @@ async def manual_status_sync_job() -> None:
     """Pull operator's manual SKU classification from the GAS Web App and
     upsert into ``products.manual_status``. No-ops if not configured.
     """
-    if not settings.gas_manual_status_url or not settings.gas_manual_status_token:
+    if not settings.gas_base_url or not settings.gas_token:
         logger.debug("Manual status sync skipped: GAS URL/token not configured")
         return
     import httpx
 
+    from tiny_mirror.services.gas_client import GASClient
     from tiny_mirror.services.manual_status_sync_service import (
         ManualStatusSyncError,
         ManualStatusSyncService,
@@ -632,12 +632,13 @@ async def manual_status_sync_job() -> None:
 
     logger.info("Manual status sync job started")
     async with httpx.AsyncClient() as http:
-        service = ManualStatusSyncService(
+        gas = GASClient(
             http=http,
-            gas_url=settings.gas_manual_status_url,
-            gas_token=settings.gas_manual_status_token,
-            timeout_seconds=settings.manual_status_http_timeout_seconds,
+            base_url=settings.gas_base_url,
+            token=settings.gas_token,
+            timeout_seconds=settings.gas_http_timeout_seconds,
         )
+        service = ManualStatusSyncService(gas=gas)
         try:
             async with AsyncSessionLocal() as session:
                 stats = await service.run(session)
@@ -646,48 +647,42 @@ async def manual_status_sync_job() -> None:
             logger.error("Manual status sync job failed", error=str(exc))
 
 
-async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any) -> None:
-    """Daily: refresh GAS cost snapshots for every active MLB, then
-    recompute ml_promo_caps targeting 10% margin / 30% absolute cap.
+async def ml_promo_recompute_job(http_client: Any) -> None:
+    """Daily: pull the full ml_costs_snapshot from the GAS bulk endpoint
+    (one HTTP call instead of N), then recompute ml_promo_caps targeting
+    10% margin / 30% absolute cap.
 
-    Both phases share the same DB session so failures abort cleanly. The
-    job no-ops when the ML token service is not configured.
+    No-ops when the GAS endpoint is not configured.
     """
-    if ml_token_service is None or http_client is None:
-        logger.debug("ML promo recompute skipped: ML token service or http client missing")
+    if not settings.gas_base_url or not settings.gas_token or http_client is None:
+        logger.debug("ML promo recompute skipped: GAS or http client not configured")
         return
 
-    from tiny_mirror.infrastructure.repositories.ml_listing_repository import (
-        MLListingRepository,
-    )
     from tiny_mirror.services.cap_recompute_service import recompute_all_caps
-    from tiny_mirror.services.ml_promotion_service import MLPromotionService
+    from tiny_mirror.services.cost_refresh_service import (
+        CostRefreshError,
+        refresh_all_from_bulk,
+    )
+    from tiny_mirror.services.gas_client import GASClient
 
     logger.info("ML promo recompute job started")
-    service = MLPromotionService(token_service=ml_token_service, http_client=http_client)
+    gas = GASClient(
+        http=http_client,
+        base_url=settings.gas_base_url,
+        token=settings.gas_token,
+        timeout_seconds=settings.gas_http_timeout_seconds,
+    )
     async with AsyncSessionLocal() as session:
-        listings = MLListingRepository(session)
-        pairs = await listings.get_all_active_mlb_ids()
-        refreshed_ok = 0
-        refreshed_err = 0
-        for i, (mlb_id, _sku) in enumerate(pairs):
-            try:
-                result = await service.refresh_costs_for_mlb(session, mlb_id)
-                if result is None or (isinstance(result, dict) and result.get("error")):
-                    refreshed_err += 1
-                else:
-                    refreshed_ok += 1
-            except Exception:  # pragma: no cover — per-row failures are tracked
-                refreshed_err += 1
-            if (i + 1) % 25 == 0:
-                await session.commit()
-        await session.commit()
-        stats = await recompute_all_caps(session, actor="scheduler-daily")
+        try:
+            refresh_stats = await refresh_all_from_bulk(session, gas)
+        except CostRefreshError as exc:
+            logger.error("ML promo recompute aborted: cost refresh failed", error=str(exc))
+            return
+        cap_stats = await recompute_all_caps(session, actor="scheduler-daily")
         logger.info(
             "ML promo recompute job completed",
-            refreshed_ok=refreshed_ok,
-            refreshed_err=refreshed_err,
-            **{k: v for k, v in stats.items() if k != "examples"},
+            **refresh_stats,
+            **{k: v for k, v in cap_stats.items() if k != "examples"},
         )
 
 

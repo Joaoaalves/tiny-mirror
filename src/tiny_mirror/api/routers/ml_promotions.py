@@ -281,27 +281,50 @@ async def refresh_all_costs(
 async def recompute_caps(
     refresh_costs_first: bool = Query(
         default=False,
-        description="when true, pulls fresh GAS costs for every MLB before recomputing",
+        description=(
+            "when true, pulls a fresh bulk dump of all costs from the GAS "
+            "Web App (single HTTP call) before recomputing"
+        ),
     ),
+    request: Request = None,  # type: ignore[assignment]
     session: AsyncSession = Depends(db_session),
-    service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, Any]:
-    """Recompute every ``ml_promo_caps`` row from the current
-    ``ml_costs_snapshot`` data, targeting a 10% minimum margin and clipping
-    at 30% absolute. Returns per-bucket stats + first 10 examples for QA.
+    """Recompute every ``ml_promo_caps`` row from ``ml_costs_snapshot``,
+    targeting a 10% minimum margin and clipping at 30% absolute. With
+    ``refresh_costs_first=true`` the bulk GAS endpoint is called once
+    to refresh all snapshots first (≈ 30s, vs. ~30 min for the legacy
+    per-MLB loop).
     """
+    from tiny_mirror.config import settings
     from tiny_mirror.services.cap_recompute_service import recompute_all_caps
+    from tiny_mirror.services.cost_refresh_service import (
+        CostRefreshError,
+        refresh_all_from_bulk,
+    )
+    from tiny_mirror.services.gas_client import GASClient
 
+    refresh_stats: dict[str, int] | None = None
     if refresh_costs_first:
-        listings = MLListingRepository(session)
-        pairs = await listings.get_all_active_mlb_ids()
-        for i, (mlb_id, _sku) in enumerate(pairs):
-            await service.refresh_costs_for_mlb(session, mlb_id)
-            if (i + 1) % 25 == 0:
-                await session.commit()
-        await session.commit()
+        if not settings.gas_base_url or not settings.gas_token:
+            raise HTTPException(
+                status_code=503,
+                detail="GAS base URL / token not configured in env",
+            )
+        http_client = request.app.state.http_client
+        gas = GASClient(
+            http=http_client,
+            base_url=settings.gas_base_url,
+            token=settings.gas_token,
+            timeout_seconds=settings.gas_http_timeout_seconds,
+        )
+        try:
+            refresh_stats = await refresh_all_from_bulk(session, gas)
+        except CostRefreshError as exc:
+            raise HTTPException(status_code=502, detail=f"GAS bulk refresh failed: {exc}") from exc
 
     stats = await recompute_all_caps(session)
+    if refresh_stats is not None:
+        stats = {"refresh": refresh_stats, **stats}
     return stats
 
 

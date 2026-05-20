@@ -1,26 +1,25 @@
 """Manual SKU status sync.
 
-Pulls the operator's manual classification of SKUs from a Google Apps
-Script Web App (see ``gas/manual_status/``) and writes it into
-``products.manual_status``. The GAS endpoint reads cell background
-colors on the GERAL tab of the Controle 4.0 spreadsheet (columns B and
-C) and returns ``queima`` / ``analise`` / ``normal`` per SKU.
+Pulls the operator's manual SKU classification from the unified Controle
+4.0 GAS Web App (action=manual_status) and writes it onto
+``products.manual_status``. The GAS endpoint reads cell background colors
+on the GERAL tab (columns B/C) and returns ``queima`` / ``analise`` /
+``normal`` per SKU.
 
-Run as a daily scheduler job. The downstream queima / reposição / FL
-crons can then ``WHERE manual_status IS NULL OR manual_status =
-'normal'`` to skip SKUs the operator already marked.
+Runs as a daily scheduler job. Downstream queima / reposição / FL crons
+then filter ``WHERE manual_status IS NULL OR manual_status = 'normal'``.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from typing import Any, Final
 
-import httpx
 import structlog
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from tiny_mirror.services.gas_client import GASClient, GASClientError
 
 logger = structlog.get_logger(__name__)
 
@@ -34,50 +33,24 @@ class ManualStatusSyncError(Exception):
 class ManualStatusSyncService:
     """Fetches manual SKU classifications and upserts onto ``products``.
 
-    Stateless aside from the injected ``httpx.AsyncClient``. Safe to
-    instantiate per call; the scheduler job creates a fresh one each
-    run because the cadence is daily.
+    Stateless aside from the injected ``GASClient``. Safe to instantiate
+    per call.
     """
 
-    def __init__(
-        self,
-        http: httpx.AsyncClient,
-        gas_url: str,
-        gas_token: str,
-        timeout_seconds: float = 30.0,
-    ) -> None:
-        self._http = http
-        self._url = gas_url
-        self._token = gas_token
-        self._timeout = timeout_seconds
+    def __init__(self, gas: GASClient) -> None:
+        self._gas = gas
 
     async def fetch(self) -> dict[str, str]:
         """Call the GAS endpoint and return a ``{sku: status}`` mapping.
 
-        Raises ``ManualStatusSyncError`` if the endpoint is unreachable,
-        returns non-JSON, or signals an error in the payload.
+        Raises ``ManualStatusSyncError`` if the endpoint is unreachable
+        or returns an error payload.
         """
-        if not self._url or not self._token:
-            raise ManualStatusSyncError("GAS URL/token not configured")
         try:
-            resp = await self._http.get(
-                self._url,
-                params={"token": self._token},
-                timeout=self._timeout,
-                follow_redirects=True,
-            )
-        except httpx.RequestError as exc:
-            raise ManualStatusSyncError(f"GAS request failed: {exc}") from exc
-        if resp.status_code >= 400:
-            raise ManualStatusSyncError(f"GAS returned HTTP {resp.status_code}: {resp.text[:200]}")
-        try:
-            body = resp.json()
-        except json.JSONDecodeError as exc:
-            raise ManualStatusSyncError(f"GAS returned non-JSON: {exc}") from exc
-        if not isinstance(body, dict) or "error" in body:
-            raise ManualStatusSyncError(
-                f"GAS payload error: {body.get('error') if isinstance(body, dict) else body!r}"
-            )
+            body = await self._gas.manual_status()
+        except GASClientError as exc:
+            raise ManualStatusSyncError(str(exc)) from exc
+
         skus_obj = body.get("skus")
         if not isinstance(skus_obj, dict):
             raise ManualStatusSyncError("GAS payload missing 'skus' object")
@@ -111,10 +84,6 @@ class ManualStatusSyncService:
         SKUs missing from the payload but present on ``products`` are
         explicitly reset to ``'normal'`` — once the operator clears a
         cell, the next sync must un-flag the SKU.
-
-        Returns a stats dict with per-status counts and the unmatched
-        SKU count (rows in the GAS response that do not exist in the
-        products table).
         """
         if not statuses:
             logger.warning("manual_status_apply_empty")
@@ -126,7 +95,6 @@ class ManualStatusSyncService:
                 "unmatched_in_db": 0,
             }
 
-        # Pre-bucket by status to issue one UPDATE per bucket.
         buckets: dict[str, list[str]] = {"queima": [], "analise": [], "normal": []}
         for sku, status in statuses.items():
             buckets[status].append(sku)
@@ -155,10 +123,6 @@ class ManualStatusSyncService:
             stats[status] = len(updated)
             matched_skus.update(updated)
 
-        # Clear any product that was previously marked but no longer present
-        # in the GAS payload — operator un-coloured the cell. We keep the
-        # cleared-by-default semantics ("missing == normal") but explicit so
-        # the audit trail (manual_status_synced_at) reflects the sync.
         clear_stmt = text(
             """
             UPDATE products

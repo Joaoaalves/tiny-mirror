@@ -181,3 +181,5 @@ audit/
 webhook_listener.py
 webhook_log.jsonl
 webhook_log*.jsonl
+# Apps Script source lives outside the repo (operator-managed in Google).
+gas/

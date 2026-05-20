@@ -113,9 +113,10 @@ class Settings(BaseSettings):
     # pending transfers as received once stock arrives at Full ML CD.
     sync_fulfillment_reception_cron: str = "0 */6 * * *"
 
-    # DIFAL (Diferencial de Alíquota) tax — sheet-wide constant applied to
-    # every ML sale alongside the ML commission. Currently 11.5%; override
-    # only when the operator changes the tax regime in the spreadsheet.
+    # DIFAL (Diferencial de Alíquota) tax — fallback when the GAS payload
+    # does not include `difalPct` (legacy single-MLB endpoint). Currently
+    # 11.5%; the GAS bulk endpoint sends the live value as part of the
+    # response so this value is only used in degraded/legacy paths.
     margin_difal_pct: float = 0.115
 
     # Daily job that (1) refreshes GAS cost snapshots for every active MLB
@@ -124,15 +125,19 @@ class Settings(BaseSettings):
     # (04:30) so caps are based on the freshest cost data of the day.
     sync_ml_promo_recompute_cron: str = "0 5 * * *"
 
-    # Manual SKU status sync (GAS Web App that reads GERAL spreadsheet cell
-    # background colors and exposes worst-of(B, C) as queima/analise/normal).
-    # Empty URL disables the daily job entirely.
-    gas_manual_status_url: str = ""
-    gas_manual_status_token: str = ""
-    # Daily at 04:30 UTC — after products_sync (02:00) and stock_full_sync (03:00).
+    # Controle 4.0 GAS Web App. Single deployment URL with action routing:
+    #   ?action=manual_status         → SKU color tags from GERAL B+C
+    #   ?action=costs_all             → bulk dump of every MLB cost row
+    #   ?action=cost&mlbid=MLB...     → single-MLB cost (legacy)
+    # Empty URL disables every dependent job.
+    gas_base_url: str = ""
+    gas_token: str = ""
+    # HTTP timeout for the GAS call (cold start can be ~5s; bulk dump may be ~20s).
+    gas_http_timeout_seconds: float = 60.0
+
+    # Daily at 04:30 UTC — manual_status sync runs after products (02:00)
+    # and stock_full_sync (03:00).
     sync_manual_status_cron: str = "30 4 * * *"
-    # HTTP timeout for the GAS call. GAS cold-start can be 2-5s.
-    manual_status_http_timeout_seconds: float = 30.0
 
     # Webhook-driven FL transfer detection. When a Tiny stock webhook arrives
     # and the raw 'Full Mercado Livre' deposit value grew vs the previous
