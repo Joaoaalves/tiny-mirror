@@ -113,6 +113,11 @@ class Settings(BaseSettings):
     # pending transfers as received once stock arrives at Full ML CD.
     sync_fulfillment_reception_cron: str = "0 */6 * * *"
 
+    # DIFAL (Diferencial de Alíquota) tax — sheet-wide constant applied to
+    # every ML sale alongside the ML commission. Currently 11.5%; override
+    # only when the operator changes the tax regime in the spreadsheet.
+    margin_difal_pct: float = 0.115
+
     # Manual SKU status sync (GAS Web App that reads GERAL spreadsheet cell
     # background colors and exposes worst-of(B, C) as queima/analise/normal).
     # Empty URL disables the daily job entirely.

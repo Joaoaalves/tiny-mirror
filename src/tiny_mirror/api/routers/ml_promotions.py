@@ -275,6 +275,113 @@ async def refresh_all_costs(
 
 
 # ---------------------------------------------------------------------------
+# PROFITABILITY — real-time margin math (no ML API call)
+# ---------------------------------------------------------------------------
+@router.get("/profitability/{sku}")
+async def profitability(
+    sku: str,
+    price: Annotated[Decimal | None, Query(gt=0, description="margin AT this price")] = None,
+    max_discount_pct: Annotated[
+        Decimal | None,
+        Query(gt=0, le=100, description="margin at list_price * (1 - pct/100)"),
+    ] = None,
+    min_margin_pct: Annotated[
+        Decimal | None,
+        Query(ge=0, le=100, description="lowest price keeping at least this margin %"),
+    ] = None,
+    meli_banca_pct: Annotated[
+        Decimal,
+        Query(ge=0, le=100, description="ML co-pay % on SMART/DEAL (0 for PRICE_DISCOUNT)"),
+    ] = Decimal(0),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
+    """Real-time margin breakdown for a SKU, using the cost snapshot from
+    the spreadsheet (base_cost + commission_pct + freight_bands) plus the
+    sheet-wide DIFAL constant.
+
+    Pick exactly one of: ``price``, ``max_discount_pct``, ``min_margin_pct``.
+
+    Returns per-MLB result, since costs and freight bands are stored per
+    MLB even when SKU has variants — the snapshot can drift (e.g. only
+    one variant has cost data yet).
+    """
+    from tiny_mirror.services.pricing_service import (
+        PricingDataError,
+        margin_at_price,
+        target_price_for_max_discount_pct,
+        target_price_for_min_margin_pct,
+    )
+
+    provided = sum(x is not None for x in (price, max_discount_pct, min_margin_pct))
+    if provided != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="provide exactly one of: price, max_discount_pct, min_margin_pct",
+        )
+
+    repo = MLCostsSnapshotRepository(session)
+    snapshots = await repo.get_by_sku(sku)
+    if not snapshots:
+        raise HTTPException(status_code=404, detail=f"no cost snapshot for sku={sku}")
+
+    out: list[dict[str, Any]] = []
+    for snap in snapshots:
+        if snap.base_cost is None or snap.commission_pct is None or snap.list_price is None:
+            out.append(
+                {
+                    "mlb_id": snap.mlb_id,
+                    "error": "snapshot missing base_cost/commission_pct/list_price",
+                    "fetch_error": snap.fetch_error,
+                }
+            )
+            continue
+        try:
+            if price is not None:
+                effective_price = price
+            elif max_discount_pct is not None:
+                effective_price = target_price_for_max_discount_pct(
+                    list_price=snap.list_price,
+                    max_discount_pct=max_discount_pct,
+                )
+            else:
+                assert min_margin_pct is not None
+                effective_price = target_price_for_min_margin_pct(
+                    base_cost=snap.base_cost,
+                    commission_pct=snap.commission_pct,
+                    freight_bands=snap.freight_bands,
+                    min_margin_pct=min_margin_pct,
+                    list_price=snap.list_price,
+                    meli_banca_pct=meli_banca_pct,
+                )
+            breakdown = margin_at_price(
+                price=effective_price,
+                base_cost=snap.base_cost,
+                commission_pct=snap.commission_pct,
+                freight_bands=snap.freight_bands,
+                list_price=snap.list_price,
+                meli_banca_pct=meli_banca_pct,
+            )
+        except PricingDataError as exc:
+            out.append({"mlb_id": snap.mlb_id, "error": str(exc)})
+            continue
+
+        out.append(
+            {
+                "mlb_id": snap.mlb_id,
+                "list_price": float(snap.list_price),
+                "discount_pct_vs_list": (
+                    float(((snap.list_price - breakdown.price) / snap.list_price) * 100)
+                    if snap.list_price > 0
+                    else None
+                ),
+                **breakdown.as_dict(),
+            }
+        )
+
+    return {"sku": sku, "results": out}
+
+
+# ---------------------------------------------------------------------------
 # ELIGIBLE — live ML API pass-through
 # ---------------------------------------------------------------------------
 @router.get("/eligible/{sku}")
