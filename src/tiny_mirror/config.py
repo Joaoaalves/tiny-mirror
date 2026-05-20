@@ -118,6 +118,12 @@ class Settings(BaseSettings):
     # only when the operator changes the tax regime in the spreadsheet.
     margin_difal_pct: float = 0.115
 
+    # Daily job that (1) refreshes GAS cost snapshots for every active MLB
+    # and (2) recomputes ml_promo_caps targeting 10% margin / 30% max
+    # discount. Runs after products (02:00), stock (03:00), manual_status
+    # (04:30) so caps are based on the freshest cost data of the day.
+    sync_ml_promo_recompute_cron: str = "0 5 * * *"
+
     # Manual SKU status sync (GAS Web App that reads GERAL spreadsheet cell
     # background colors and exposes worst-of(B, C) as queima/analise/normal).
     # Empty URL disables the daily job entirely.

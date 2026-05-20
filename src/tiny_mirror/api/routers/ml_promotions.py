@@ -275,6 +275,37 @@ async def refresh_all_costs(
 
 
 # ---------------------------------------------------------------------------
+# CAPS RECOMPUTE — derive max_seller_share_pct from costs + 10% margin target
+# ---------------------------------------------------------------------------
+@router.post("/caps/recompute")
+async def recompute_caps(
+    refresh_costs_first: bool = Query(
+        default=False,
+        description="when true, pulls fresh GAS costs for every MLB before recomputing",
+    ),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Recompute every ``ml_promo_caps`` row from the current
+    ``ml_costs_snapshot`` data, targeting a 10% minimum margin and clipping
+    at 30% absolute. Returns per-bucket stats + first 10 examples for QA.
+    """
+    from tiny_mirror.services.cap_recompute_service import recompute_all_caps
+
+    if refresh_costs_first:
+        listings = MLListingRepository(session)
+        pairs = await listings.get_all_active_mlb_ids()
+        for i, (mlb_id, _sku) in enumerate(pairs):
+            await service.refresh_costs_for_mlb(session, mlb_id)
+            if (i + 1) % 25 == 0:
+                await session.commit()
+        await session.commit()
+
+    stats = await recompute_all_caps(session)
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # PROFITABILITY — real-time margin math (no ML API call)
 # ---------------------------------------------------------------------------
 @router.get("/profitability/{sku}")

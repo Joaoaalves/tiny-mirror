@@ -105,6 +105,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "manual_status_sync": CronTrigger.from_crontab(
                 settings.sync_manual_status_cron, timezone="UTC"
             ),
+            "ml_promo_recompute": CronTrigger.from_crontab(
+                settings.sync_ml_promo_recompute_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -156,6 +159,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _manual_status_sync() -> None:
         await manual_status_sync_job()
+
+    ml_token_service = getattr(app.state, "ml_token_service", None)
+    http_client = getattr(app.state, "http_client", None)
+
+    async def _ml_promo_recompute() -> None:
+        await ml_promo_recompute_job(http_client, ml_token_service)
 
     scheduler.add_job(
         _token_rotation,
@@ -233,6 +242,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _manual_status_sync,
         trigger=triggers["manual_status_sync"],
         id="manual_status_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_promo_recompute,
+        trigger=triggers["ml_promo_recompute"],
+        id="ml_promo_recompute",
         replace_existing=True,
     )
 
@@ -631,6 +646,51 @@ async def manual_status_sync_job() -> None:
             logger.error("Manual status sync job failed", error=str(exc))
 
 
+async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any) -> None:
+    """Daily: refresh GAS cost snapshots for every active MLB, then
+    recompute ml_promo_caps targeting 10% margin / 30% absolute cap.
+
+    Both phases share the same DB session so failures abort cleanly. The
+    job no-ops when the ML token service is not configured.
+    """
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML promo recompute skipped: ML token service or http client missing")
+        return
+
+    from tiny_mirror.infrastructure.repositories.ml_listing_repository import (
+        MLListingRepository,
+    )
+    from tiny_mirror.services.cap_recompute_service import recompute_all_caps
+    from tiny_mirror.services.ml_promotion_service import MLPromotionService
+
+    logger.info("ML promo recompute job started")
+    service = MLPromotionService(token_service=ml_token_service, http_client=http_client)
+    async with AsyncSessionLocal() as session:
+        listings = MLListingRepository(session)
+        pairs = await listings.get_all_active_mlb_ids()
+        refreshed_ok = 0
+        refreshed_err = 0
+        for i, (mlb_id, _sku) in enumerate(pairs):
+            try:
+                result = await service.refresh_costs_for_mlb(session, mlb_id)
+                if result is None or (isinstance(result, dict) and result.get("error")):
+                    refreshed_err += 1
+                else:
+                    refreshed_ok += 1
+            except Exception:  # pragma: no cover — per-row failures are tracked
+                refreshed_err += 1
+            if (i + 1) % 25 == 0:
+                await session.commit()
+        await session.commit()
+        stats = await recompute_all_caps(session, actor="scheduler-daily")
+        logger.info(
+            "ML promo recompute job completed",
+            refreshed_ok=refreshed_ok,
+            refreshed_err=refreshed_err,
+            **{k: v for k, v in stats.items() if k != "examples"},
+        )
+
+
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:
     """Poll ML INBOUND_RECEPTION and mark pending fulfillment transfers as received."""
     from tiny_mirror.services.fulfillment_reception_service import FulfillmentReceptionService
@@ -663,6 +723,7 @@ __all__ = [
     "fulfillment_reception_scan_job",
     "manual_status_sync_job",
     "ml_listings_sync_job",
+    "ml_promo_recompute_job",
     "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",
