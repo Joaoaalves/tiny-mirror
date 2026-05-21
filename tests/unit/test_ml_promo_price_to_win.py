@@ -20,8 +20,34 @@ def _costs(list_price: float, promo_price: float | None = None) -> dict[str, Any
     return {"listPrice": list_price, "promoPrice": promo_price, "freightBands": []}
 
 
-def test_winning_with_maximum_share_returns_keep_winning() -> None:
-    """Policy: if we already win and visit_share=maximum, do nothing."""
+def test_winning_with_maximum_share_returns_keep_winning_when_opted_in() -> None:
+    """Policy (2026-05-21): keep_winning is opt-in per SKU via skip_when_winning.
+
+    When the flag is on AND we already win with maximum share, the engine
+    leaves the item alone. Default (flag off) keeps pushing discounts so
+    the engine maximises promo coverage regardless of catalog state.
+    """
+    dec = decide_for_item(
+        promos=[],
+        costs=_costs(57.0, 39.90),
+        cap_seller_pct=30,
+        margin_floor_price=39.90,
+        price_to_win_info={
+            "current_price": 34.90,
+            "price_to_win": 34.90,
+            "status": "winning",
+            "visit_share": "maximum",
+        },
+        skip_when_winning=True,
+    )
+    assert dec.action == "keep_winning"
+    assert dec.catalog_status == "winning"
+    assert dec.visit_share == "maximum"
+    assert dec.price_to_win == 34.90
+
+
+def test_winning_with_maximum_share_default_keeps_pushing() -> None:
+    """Without the opt-in flag, the engine still pushes promos even when winning."""
     dec = decide_for_item(
         promos=[],
         costs=_costs(57.0, 39.90),
@@ -34,10 +60,9 @@ def test_winning_with_maximum_share_returns_keep_winning() -> None:
             "visit_share": "maximum",
         },
     )
-    assert dec.action == "keep_winning"
+    assert dec.action != "keep_winning"
     assert dec.catalog_status == "winning"
     assert dec.visit_share == "maximum"
-    assert dec.price_to_win == 34.90
 
 
 def test_winning_but_low_share_runs_normal_engine() -> None:

@@ -801,6 +801,7 @@ async def analyze_all(
     visit_share_counts: dict[str, int] = {}
     skus_with_results = 0
     mlbs_evaluated = 0
+    total_eligible_candidates = 0
     activate_examples: list[dict[str, Any]] = []
     create_examples: list[dict[str, Any]] = []
     still_losing_examples: list[dict[str, Any]] = []
@@ -821,8 +822,10 @@ async def analyze_all(
             continue
         if results:
             skus_with_results += 1
+        sku_eligible_count = 0
         for r in results:
             mlbs_evaluated += 1
+            sku_eligible_count += int(r.get("eligible_candidates_in_cap", 0))
             dec = r["decision"]
             action_counts[dec.action] = action_counts.get(dec.action, 0) + 1
             if dec.target_promo_type:
@@ -874,6 +877,7 @@ async def analyze_all(
                             "reason": dec.reason,
                         }
                     )
+        total_eligible_candidates += sku_eligible_count
 
     elapsed = _time.monotonic() - started_at
     would_activate = action_counts.get("activate_candidate", 0) + action_counts.get(
@@ -888,6 +892,7 @@ async def analyze_all(
         "skus_with_at_least_one_mlb": skus_with_results,
         "mlbs_evaluated": mlbs_evaluated,
         "would_activate_total": would_activate,
+        "total_eligible_candidates_in_cap": total_eligible_candidates,
         "action_counts": action_counts,
         "promo_type_counts_when_acting": promo_type_counts,
         "catalog_status_counts": catalog_status_counts,

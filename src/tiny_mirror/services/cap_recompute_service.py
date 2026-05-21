@@ -1,9 +1,12 @@
 """Recompute ``ml_promo_caps`` from cost snapshots.
 
 For each MLB with a fresh cost snapshot, derive:
-- the lowest selling price that still yields ``TARGET_MARGIN_PCT`` margin,
-- the discount % vs. ``list_price`` that produces it,
-- the resulting cap = ``min(discount_at_floor_pct, ABSOLUTE_MAX_CAP_PCT)``.
+
+- the base cap from ``sheet_discount_pct`` — the % the operator already
+  practices in the Drive sheet (usually 30%), or DEFAULT_CAP_PCT when missing,
+- the margin-protected cap — the maximum discount that still keeps at
+  least ``MIN_MARGIN_PCT`` margin at the resulting price,
+- the final cap = ``min(base, margin-protected)``.
 
 When a SKU has multiple MLBs (variations / catalogue listings) we pick the
 **most conservative** cap so no MLB ever ends up below the margin target.
@@ -35,10 +38,17 @@ from tiny_mirror.services.pricing_service import (
 
 logger = structlog.get_logger(__name__)
 
-# Operator-stated defaults; both could be lifted into config later, but
-# keeping them here keeps the policy obvious to anyone reading the code.
-TARGET_MARGIN_PCT: Decimal = Decimal("10")
-ABSOLUTE_MAX_CAP_PCT: Decimal = Decimal("30")
+# Policy constants (clarified with the operator on 2026-05-21):
+#
+# - MIN_MARGIN_PCT is an INVIOLABLE floor. Engine never sets a target_price
+#   below this margin, even if the operator's sheet_discount_pct would
+#   imply more aggressive discounting.
+# - DEFAULT_CAP_PCT applies when the snapshot has no sheet_discount_pct.
+#   The operator-managed Drive sheet has these values per-SKU; we mirror
+#   them into ml_promo_caps so subsequent edits in Mission Control take
+#   over without needing the sheet anymore.
+MIN_MARGIN_PCT: Decimal = Decimal("10")
+DEFAULT_CAP_PCT: Decimal = Decimal("30")
 
 
 @dataclass(frozen=True)
@@ -52,7 +62,7 @@ class CapCalculation:
 
     mlb_id: str
     sku: str
-    cap_pct: Decimal  # always in [0, ABSOLUTE_MAX_CAP_PCT]
+    cap_pct: Decimal  # always in [0, 100]
     floor_price: Decimal | None
     margin_pct_at_floor: Decimal | None
     list_price: Decimal | None
@@ -61,8 +71,20 @@ class CapCalculation:
 
 
 def calc_cap_for_snapshot(snap: MLCostsSnapshotORM) -> CapCalculation:
-    """Pure calculation, no DB. Returns a CapCalculation describing what to
-    write (or why the snapshot was skipped)."""
+    """Derive the cap (`max_seller_share_pct`) for one MLB from its snapshot.
+
+    Policy (2026-05-21):
+      1. Base cap = ``snap.sheet_discount_pct`` (% the operator already
+         practices in the Drive sheet; usually 30%). If missing, fall
+         back to ``DEFAULT_CAP_PCT``.
+      2. Compute the max cap that still leaves at least ``MIN_MARGIN_PCT``
+         margin at the resulting price. Call this ``cap_by_margin``.
+      3. Final cap = ``min(base_cap, cap_by_margin)``. Margin protection
+         is inviolable; the cap can never imply a target price below
+         the margin floor.
+      4. If the SKU can't reach the margin floor even at list price,
+         set cap=0 (no promo allowed).
+    """
     if snap.fetch_error:
         return CapCalculation(
             mlb_id=snap.mlb_id,
@@ -94,15 +116,20 @@ def calc_cap_for_snapshot(snap: MLCostsSnapshotORM) -> CapCalculation:
 
     list_price = snap.list_price
 
-    # Margin at full list price (no discount) — sanity check.
+    # 1) Base cap from the operator's Drive sheet. Most rows = 30%.
+    base_cap: Decimal = (
+        snap.sheet_discount_pct if snap.sheet_discount_pct is not None else DEFAULT_CAP_PCT
+    )
+
+    # 2) Sanity: margin at full list price. If it can't meet the floor,
+    # no discount is safe.
     full_price_margin = margin_at_price(
         price=list_price,
         base_cost=snap.base_cost,
         commission_pct=snap.commission_pct,
         freight_bands=snap.freight_bands,
     )
-    if full_price_margin.margin_pct < TARGET_MARGIN_PCT:
-        # Can't even hit 10% at list price — no promo allowed.
+    if full_price_margin.margin_pct < MIN_MARGIN_PCT:
         return CapCalculation(
             mlb_id=snap.mlb_id,
             sku=snap.sku,
@@ -111,18 +138,20 @@ def calc_cap_for_snapshot(snap: MLCostsSnapshotORM) -> CapCalculation:
             margin_pct_at_floor=full_price_margin.margin_pct,
             list_price=list_price,
             reason=(
-                f"margem {TARGET_MARGIN_PCT}% inatingivel: a list_price "
+                f"margem {MIN_MARGIN_PCT}% inatingivel: a list_price "
                 f"R$ {list_price} so rende {full_price_margin.margin_pct}% margem"
             ),
             skipped=False,
         )
 
+    # 3) Margin-protected cap: the maximum discount that still keeps
+    # MIN_MARGIN_PCT margin at the resulting price.
     try:
         floor_price = target_price_for_min_margin_pct(
             base_cost=snap.base_cost,
             commission_pct=snap.commission_pct,
             freight_bands=snap.freight_bands,
-            min_margin_pct=TARGET_MARGIN_PCT,
+            min_margin_pct=MIN_MARGIN_PCT,
         )
     except PricingDataError as exc:
         return CapCalculation(
@@ -136,45 +165,36 @@ def calc_cap_for_snapshot(snap: MLCostsSnapshotORM) -> CapCalculation:
             skipped=True,
         )
 
-    # Floor above list price means 0 discount allowed.
-    if floor_price >= list_price:
-        return CapCalculation(
-            mlb_id=snap.mlb_id,
-            sku=snap.sku,
-            cap_pct=Decimal(0),
-            floor_price=list_price,
-            margin_pct_at_floor=full_price_margin.margin_pct,
-            list_price=list_price,
-            reason=(
-                f"piso R$ {floor_price.quantize(Decimal('0.01'))} "
-                f">= list R$ {list_price.quantize(Decimal('0.01'))}; sem espaco pra promo"
-            ),
-            skipped=False,
-        )
+    cap_by_margin = ((list_price - floor_price) / list_price * Decimal(100)).quantize(
+        Decimal("0.01")
+    )
+    if cap_by_margin < Decimal(0):
+        cap_by_margin = Decimal(0)
 
+    # 4) Final cap = min(sheet base, margin-protected).
+    cap = min(base_cap, cap_by_margin).quantize(Decimal("0.01"))
+    # Final floor_price reflects the FINAL cap (not the looser margin one).
+    target_price_at_cap = (list_price * (Decimal(100) - cap) / Decimal(100)).quantize(
+        Decimal("0.01")
+    )
     realised = margin_at_price(
-        price=floor_price,
+        price=target_price_at_cap,
         base_cost=snap.base_cost,
         commission_pct=snap.commission_pct,
         freight_bands=snap.freight_bands,
     )
-    discount_at_floor = ((list_price - floor_price) / list_price * Decimal(100)).quantize(
-        Decimal("0.01")
-    )
-    cap = min(discount_at_floor, ABSOLUTE_MAX_CAP_PCT).quantize(Decimal("0.01"))
-    if cap < Decimal(0):
-        cap = Decimal(0)
 
-    if cap == ABSOLUTE_MAX_CAP_PCT and discount_at_floor > ABSOLUTE_MAX_CAP_PCT:
+    if cap < base_cap:
         reason = (
-            f"clipado em {ABSOLUTE_MAX_CAP_PCT}% (margem 10% permitiria "
-            f"{discount_at_floor}%, mas teto comercial fixo)"
+            f"cap clipado pela margem: planilha pede {base_cap}% "
+            f"mas o piso de {MIN_MARGIN_PCT}% margem so permite {cap}%"
         )
     else:
         reason = (
-            f"cap={cap}%, piso R$ {floor_price.quantize(Decimal('0.01'))} "
+            f"cap={cap}% (= planilha), piso R$ {target_price_at_cap} "
             f"-> margem {realised.margin_pct}% no piso"
         )
+    floor_price = target_price_at_cap
 
     return CapCalculation(
         mlb_id=snap.mlb_id,
@@ -229,8 +249,8 @@ async def recompute_all_caps(
         "snapshots_read": len(snapshots),
         "skus_processed": 0,
         "skus_skipped": 0,
-        "skus_capped_at_30": 0,
-        "skus_below_30": 0,
+        "skus_at_default_30": 0,
+        "skus_clipped_by_margin": 0,
         "skus_zero_cap": 0,
     }
     examples: list[dict[str, Any]] = []
@@ -242,12 +262,12 @@ async def recompute_all_caps(
             stats["skus_skipped"] += 1
             continue
         stats["skus_processed"] += 1
-        if chosen.cap_pct == ABSOLUTE_MAX_CAP_PCT:
-            stats["skus_capped_at_30"] += 1
+        if chosen.cap_pct == DEFAULT_CAP_PCT:
+            stats["skus_at_default_30"] += 1
         elif chosen.cap_pct == Decimal(0):
             stats["skus_zero_cap"] += 1
         else:
-            stats["skus_below_30"] += 1
+            stats["skus_clipped_by_margin"] += 1
 
         await cap_repo.upsert(
             sku=sku,

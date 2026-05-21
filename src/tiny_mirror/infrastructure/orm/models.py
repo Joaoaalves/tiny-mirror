@@ -1025,6 +1025,15 @@ class MLPromoCapORM(Base):
     freight_band_opt: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )
+    skip_when_winning: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=(
+            "When true and catalog_status='winning' + visit_share='maximum', "
+            "the engine returns keep_winning instead of activating new promos."
+        ),
+    )
     excluded_promo_types: Mapped[list[str]] = mapped_column(
         JSONB, nullable=False, server_default=text("'[]'::jsonb")
     )

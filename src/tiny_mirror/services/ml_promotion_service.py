@@ -178,6 +178,7 @@ def decide_for_item(
     freight_band_opt_enabled: bool = True,
     excluded_types: Iterable[str] = (),
     price_to_win_info: dict[str, Any] | None = None,
+    skip_when_winning: bool = False,
 ) -> Decision:
     """Pure decision function. Inputs:
 
@@ -212,7 +213,7 @@ def decide_for_item(
     cat_visit_share = ptw.get("visit_share") if isinstance(ptw, dict) else None
     cat_ptw = ptw.get("price_to_win") if isinstance(ptw, dict) else None
 
-    if cat_status == "winning" and cat_visit_share == "maximum":
+    if cat_status == "winning" and cat_visit_share == "maximum" and skip_when_winning:
         return Decision(
             action="keep_winning",
             reason=(
@@ -746,9 +747,88 @@ class MLPromotionService:
                 freight_band_opt_enabled=cap.freight_band_opt,
                 excluded_types=cap.excluded_promo_types or (),
                 price_to_win_info=price_to_win_info,
+                skip_when_winning=bool(getattr(cap, "skip_when_winning", False)),
             )
-            results.append({"mlb_id": mlb_id, "decision": decision})
+            # Operator policy (2026-05-21): the engine activates ALL
+            # candidates that fit inside the cap. Count them per MLB so
+            # the report reflects total promotions that would be created
+            # in one run.
+            eligible_count = count_eligible_candidates(
+                promos=promos,
+                cap_seller_pct=float(cap.max_seller_share_pct),
+                margin_floor_price=float(cap.margin_floor_price)
+                if cap.margin_floor_price
+                else None,
+                list_price=float(snap.list_price) if snap and snap.list_price else None,
+                excluded_types=cap.excluded_promo_types or (),
+            )
+            results.append(
+                {
+                    "mlb_id": mlb_id,
+                    "decision": decision,
+                    "eligible_candidates_in_cap": eligible_count,
+                }
+            )
         return results
+
+
+def count_eligible_candidates(
+    *,
+    promos: list[dict[str, Any]],
+    cap_seller_pct: float,
+    margin_floor_price: float | None,
+    list_price: float | None,
+    excluded_types: Iterable[str] = (),
+) -> int:
+    """Count how many CANDIDATE promos pass the cap + margin floor.
+
+    Used by analyze-all to report the total number of promotions the
+    engine would activate per MLB under the "activate everything that
+    fits" policy from 2026-05-21. Pure function; no I/O.
+
+    Rules:
+      - status must be ``candidate``.
+      - type not in ``excluded_types``.
+      - One of: ``fixed_percentage`` <= cap_total
+                ``min_discounted_price`` >= floor
+                ``suggested_discounted_price`` >= floor and produces
+                  total% <= cap_total
+    """
+    if not promos or list_price is None or list_price <= 0:
+        return 0
+    excluded = set(excluded_types)
+    floor = margin_floor_price or 0.0
+    count = 0
+    for p in promos:
+        if p.get("status") != "candidate":
+            continue
+        if p.get("type") in excluded:
+            continue
+        meli_pct = p.get("meli_percentage") or 0
+        cap_total = cap_seller_pct + meli_pct
+
+        fixed = p.get("fixed_percentage")
+        if fixed is not None:
+            if float(fixed) <= cap_total + 0.01:
+                # Need to also respect the floor.
+                target = list_price * (1 - float(fixed) / 100)
+                if target + 0.01 >= floor:
+                    count += 1
+            continue
+
+        min_price = p.get("min_discounted_price")
+        if min_price is not None:
+            # We can reach min_price only if it's at/above the floor.
+            if float(min_price) + 0.01 >= floor:
+                count += 1
+            continue
+
+        sugg = p.get("suggested_discounted_price")
+        if sugg is not None:
+            total_pct = (list_price - float(sugg)) / list_price * 100
+            if total_pct <= cap_total + 0.01 and float(sugg) + 0.01 >= floor:
+                count += 1
+    return count
 
 
 def _catalog_row_to_ptw(row: Any) -> dict[str, Any]:

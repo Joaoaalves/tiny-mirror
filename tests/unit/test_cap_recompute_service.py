@@ -14,8 +14,8 @@ from typing import Any
 import pytest
 
 from tiny_mirror.services.cap_recompute_service import (
-    ABSOLUTE_MAX_CAP_PCT,
-    TARGET_MARGIN_PCT,
+    DEFAULT_CAP_PCT,
+    MIN_MARGIN_PCT,
     CapCalculation,
     _conservative_pick,
     calc_cap_for_snapshot,
@@ -35,6 +35,10 @@ class FakeSnap:
     list_price: Decimal | None
     freight_bands: list[dict[str, Any]] | None
     fetch_error: str | None = None
+    # New field: the % the operator practices today (from Drive sheet).
+    # None means "no sheet value, fall back to DEFAULT_CAP_PCT".
+    sheet_discount_pct: Decimal | None = None
+    sheet_promo_price: Decimal | None = None
 
 
 BUB_PATIN_BANDS = [
@@ -60,9 +64,8 @@ SLF_KITBAN_BANDS = [
 ]
 
 
-def test_bub_patin_caps_at_30_pct() -> None:
-    """BUB-PATIN has fat margin: at floor for 10% margin the implied
-    discount is way above 30%, so the cap clips to the commercial ceiling."""
+def test_bub_patin_sheet_30_caps_at_30() -> None:
+    """BUB-PATIN sheet practises 30%. With fat margin, cap = sheet = 30%."""
     snap = FakeSnap(
         mlb_id="MLB3884049149",
         sku="BUB-PATIN-BANH-COLOR",
@@ -70,22 +73,33 @@ def test_bub_patin_caps_at_30_pct() -> None:
         commission_pct=Decimal("11.5"),
         list_price=Decimal("57.00"),
         freight_bands=BUB_PATIN_BANDS,
+        sheet_discount_pct=Decimal("30"),
     )
     calc = calc_cap_for_snapshot(snap)  # type: ignore[arg-type]
     assert not calc.skipped
-    assert calc.cap_pct == ABSOLUTE_MAX_CAP_PCT
-    assert "clipado em 30%" in calc.reason
-    # And the floor (10% margin price) should be well below the 30% cap price (R$ 39.90).
-    assert calc.floor_price is not None
-    assert calc.floor_price < Decimal("39.90")
+    assert calc.cap_pct == DEFAULT_CAP_PCT  # 30 (matches the sheet)
+    assert calc.margin_pct_at_floor is not None
+    assert calc.margin_pct_at_floor >= Decimal("10")
 
 
-def test_slf_kitban_tight_margin_yields_intermediate_cap() -> None:
-    """SLF-KITBAN-2PC-PR at sheet_promo_price 45.90 had only 1.26% margin
-    on the sheet — the sheet was discounting too aggressively. At list
-    price (65.57) the margin is ~20%, so the cap can be wider than 0 but
-    must be tighter than the global 30% ceiling. Expected cap ~17%.
-    """
+def test_no_sheet_defaults_to_30() -> None:
+    """When the snapshot has no sheet_discount_pct, fall back to DEFAULT_CAP_PCT."""
+    snap = FakeSnap(
+        mlb_id="MLB1",
+        sku="X",
+        base_cost=Decimal("16.89"),
+        commission_pct=Decimal("11.5"),
+        list_price=Decimal("57.00"),
+        freight_bands=BUB_PATIN_BANDS,
+        sheet_discount_pct=None,
+    )
+    calc = calc_cap_for_snapshot(snap)  # type: ignore[arg-type]
+    assert not calc.skipped
+    assert calc.cap_pct == DEFAULT_CAP_PCT
+
+
+def test_sheet_aggressive_gets_clipped_by_margin() -> None:
+    """If the sheet asks for 30% but margin only allows ~17%, cap is clipped."""
     snap = FakeSnap(
         mlb_id="MLB-FAKE-KITBAN",
         sku="SLF-KITBAN-2PC-PR",
@@ -93,13 +107,31 @@ def test_slf_kitban_tight_margin_yields_intermediate_cap() -> None:
         commission_pct=Decimal("16.5"),
         list_price=Decimal("65.57"),
         freight_bands=SLF_KITBAN_BANDS,
+        sheet_discount_pct=Decimal("30"),
     )
     calc = calc_cap_for_snapshot(snap)  # type: ignore[arg-type]
     assert not calc.skipped
     assert Decimal("15") < calc.cap_pct < Decimal("20")
-    assert calc.cap_pct < ABSOLUTE_MAX_CAP_PCT
+    assert calc.cap_pct < DEFAULT_CAP_PCT
+    assert "clipado pela margem" in calc.reason
     assert calc.margin_pct_at_floor is not None
     assert calc.margin_pct_at_floor >= Decimal("10")
+
+
+def test_sheet_conservative_uses_sheet() -> None:
+    """When the sheet practises LESS than what margin permits, respect the sheet."""
+    snap = FakeSnap(
+        mlb_id="MLB1",
+        sku="X",
+        base_cost=Decimal("16.89"),
+        commission_pct=Decimal("11.5"),
+        list_price=Decimal("57.00"),
+        freight_bands=BUB_PATIN_BANDS,
+        sheet_discount_pct=Decimal("12"),  # only 12% off — well within margin
+    )
+    calc = calc_cap_for_snapshot(snap)  # type: ignore[arg-type]
+    assert not calc.skipped
+    assert calc.cap_pct == Decimal("12")
 
 
 def test_high_commission_sku_with_low_list_price_yields_zero_cap() -> None:
@@ -110,8 +142,9 @@ def test_high_commission_sku_with_low_list_price_yields_zero_cap() -> None:
         sku="TIGHT-SKU",
         base_cost=Decimal("40"),
         commission_pct=Decimal("16.5"),
-        list_price=Decimal("55"),  # 55 - 40 - 9.07 - 6.33 - 7.95 ≈ -8 → negative margin
+        list_price=Decimal("55"),
         freight_bands=SLF_KITBAN_BANDS,
+        sheet_discount_pct=Decimal("30"),
     )
     calc = calc_cap_for_snapshot(snap)  # type: ignore[arg-type]
     assert not calc.skipped
@@ -119,10 +152,10 @@ def test_high_commission_sku_with_low_list_price_yields_zero_cap() -> None:
     assert "inatingivel" in calc.reason
 
 
-def test_calc_uses_target_margin_pct_module_constant() -> None:
-    """Sanity: the policy constants are visible to anyone re-tuning them."""
-    assert TARGET_MARGIN_PCT == Decimal("10")
-    assert ABSOLUTE_MAX_CAP_PCT == Decimal("30")
+def test_calc_uses_policy_constants() -> None:
+    """Sanity: policy constants are visible to anyone re-tuning them."""
+    assert MIN_MARGIN_PCT == Decimal("10")
+    assert DEFAULT_CAP_PCT == Decimal("30")
 
 
 def test_calc_skips_when_freight_bands_missing() -> None:
