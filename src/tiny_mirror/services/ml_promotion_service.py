@@ -276,23 +276,23 @@ def decide_for_item(
     cur_total_pct = best_started["_total_pct"] if best_started else 0
 
     # ---- best candidate respecting cap + floor ----------------------------
+    # Uses the unified score_candidate_promo helper so every promo type
+    # (DEAL, SMART, PRICE_DISCOUNT, SELLER_COUPON_CAMPAIGN, UNHEALTHY_STOCK,
+    # …) is evaluated against the same cap + floor envelope.
     best_cand = None
     best_cand_total_pct = 0.0
     best_cand_target_price = None
     for p in candidates:
-        min_price = p.get("min_discounted_price")
-        if not min_price:
+        scored = score_candidate_promo(
+            p,
+            cap_seller_pct=cap_seller_pct,
+            margin_floor_price=floor_price,
+            list_price=orig_price,
+        )
+        if scored is None:
             continue
-        meli_pct = p.get("meli_percentage") or 0
-        # Highest total% the cap allows (cap is on seller; ML banca extra is bonus)
-        max_total_seller_cap = cap_seller_pct + meli_pct
-        max_total_ml_min = _compute_pct(orig_price, min_price) or 0
-        achievable_total = min(max_total_seller_cap, max_total_ml_min)
-        target_price = round(orig_price * (1 - achievable_total / 100), 2)
-        # Floor constraint
-        if floor_price is not None and target_price < floor_price:
-            achievable_total = _compute_pct(orig_price, floor_price) or 0
-            target_price = floor_price
+        achievable_total = float(scored["target_total_pct"] or 0)
+        target_price = float(scored["target_price"] or 0)
         if achievable_total > best_cand_total_pct:
             best_cand_total_pct = achievable_total
             best_cand = p
@@ -776,6 +776,157 @@ class MLPromotionService:
         return results
 
 
+def score_candidate_promo(
+    p: dict[str, Any],
+    *,
+    cap_seller_pct: float,
+    margin_floor_price: float | None,
+    list_price: float,
+) -> dict[str, Any] | None:
+    """Uniformly score one CANDIDATE promo against the per-MLB cap + floor.
+
+    ML's promo API returns candidates in five different shapes depending
+    on the type:
+
+    1. ``fixed_percentage``       — SELLER_COUPON_CAMPAIGN
+    2. ``min_discounted_price``   — DEAL / DOD / LIGHTNING / PRICE_DISCOUNT
+                                    / SELLER_CAMPAIGN (and falls back to
+                                    ``suggested_discounted_price`` if the
+                                    minimum field is missing)
+    3. ``price`` + ``seller_percentage`` — SMART / PRICE_MATCHING
+    4. ``seller_percentage`` only (no price) — UNHEALTHY_STOCK; we derive
+       the target price from ``original_price * (1 - (seller% + meli%)/100)``
+    5. ``price`` + ``original_price`` only — generic fallback (compute
+       total% from the two prices)
+
+    Returns a dict ``{target_price, target_total_pct, target_seller_pct,
+    meli_percentage, constraint, reason}`` when the candidate fits the
+    cap + floor envelope; returns ``None`` otherwise.
+    """
+    if list_price is None or list_price <= 0:
+        return None
+    floor = margin_floor_price or 0.0
+    meli_pct = float(p.get("meli_percentage") or 0)
+    cap_total = cap_seller_pct + meli_pct
+
+    # 1. fixed_percentage (cupons).
+    fixed = p.get("fixed_percentage")
+    if fixed is not None:
+        fixed_f = float(fixed)
+        if fixed_f > cap_total + 0.01:
+            return None
+        target = round(list_price * (1 - fixed_f / 100), 2)
+        if target + 0.01 < floor:
+            return None
+        return {
+            "target_price": target,
+            "target_total_pct": fixed_f,
+            "target_seller_pct": round(fixed_f - meli_pct, 2),
+            "meli_percentage": meli_pct,
+            "constraint": "fixed_percentage",
+            "reason": f"fixed -{fixed_f}% @ R$ {target}",
+        }
+
+    # 2. min_discounted_price (price-floor candidates).
+    min_price = p.get("min_discounted_price")
+    if min_price is not None:
+        min_f = float(min_price)
+        if min_f + 0.01 < floor:
+            return None
+        target_at_cap = round(list_price * (1 - cap_total / 100), 2)
+        target = round(max(min_f, floor, target_at_cap), 2)
+        total_pct = round((list_price - target) / list_price * 100, 2)
+        return {
+            "target_price": target,
+            "target_total_pct": total_pct,
+            "target_seller_pct": round(total_pct - meli_pct, 2),
+            "meli_percentage": meli_pct,
+            "constraint": "min_discounted_price",
+            "reason": f"min_price R$ {min_f} → R$ {target} (-{total_pct}%)",
+        }
+
+    # 2b. suggested_discounted_price (fallback when min isn't published).
+    sugg = p.get("suggested_discounted_price")
+    if sugg is not None:
+        sugg_f = float(sugg)
+        total_pct = round((list_price - sugg_f) / list_price * 100, 2)
+        if total_pct > cap_total + 0.01:
+            return None
+        if sugg_f + 0.01 < floor:
+            return None
+        return {
+            "target_price": sugg_f,
+            "target_total_pct": total_pct,
+            "target_seller_pct": round(total_pct - meli_pct, 2),
+            "meli_percentage": meli_pct,
+            "constraint": "suggested_discounted_price",
+            "reason": f"suggested -{total_pct}% @ R$ {sugg_f}",
+        }
+
+    # 3. price + seller_percentage (SMART / PRICE_MATCHING).
+    ml_price = p.get("price")
+    seller_raw = p.get("seller_percentage")
+    if ml_price is not None and seller_raw is not None:
+        price_f = float(ml_price)
+        seller_f = float(seller_raw)
+        if seller_f > cap_seller_pct + 0.01:
+            return None
+        if price_f + 0.01 < floor:
+            return None
+        total_pct = round(seller_f + meli_pct, 2)
+        return {
+            "target_price": price_f,
+            "target_total_pct": total_pct,
+            "target_seller_pct": seller_f,
+            "meli_percentage": meli_pct,
+            "constraint": "ml_priced",
+            "reason": f"{p.get('type')} -{total_pct}% @ R$ {price_f} (seller -{seller_f}%)",
+        }
+
+    # 4. seller_percentage only — derive target price from original.
+    if seller_raw is not None:
+        orig = p.get("original_price") or list_price
+        seller_f = float(seller_raw)
+        total_pct = round(seller_f + meli_pct, 2)
+        if seller_f > cap_seller_pct + 0.01:
+            return None
+        derived_price = round(float(orig) * (1 - total_pct / 100), 2)
+        if derived_price + 0.01 < floor:
+            return None
+        return {
+            "target_price": derived_price,
+            "target_total_pct": total_pct,
+            "target_seller_pct": seller_f,
+            "meli_percentage": meli_pct,
+            "constraint": "seller_pct_only",
+            "reason": (
+                f"{p.get('type')} seller -{seller_f}% → R$ {derived_price} "
+                f"(derivado de original R$ {orig})"
+            ),
+        }
+
+    # 5. price + original_price only (generic fallback).
+    if ml_price is not None:
+        orig = p.get("original_price")
+        if orig:
+            price_f = float(ml_price)
+            total_pct = round((float(orig) - price_f) / float(orig) * 100, 2)
+            if total_pct > cap_total + 0.01:
+                return None
+            if price_f + 0.01 < floor:
+                return None
+            return {
+                "target_price": price_f,
+                "target_total_pct": total_pct,
+                "target_seller_pct": round(total_pct - meli_pct, 2),
+                "meli_percentage": meli_pct,
+                "constraint": "price_only",
+                "reason": f"{p.get('type')} -{total_pct}% @ R$ {price_f}",
+            }
+
+    return None
+
+
 def enumerate_activations_for_item(
     *,
     promos: list[dict[str, Any]],
@@ -807,14 +958,12 @@ def enumerate_activations_for_item(
     if not promos or list_price is None or list_price <= 0:
         return []
     excluded = set(excluded_types)
-    floor = margin_floor_price or 0.0
     out: list[dict[str, Any]] = []
     for p in promos:
         if p.get("type") in excluded:
             continue
         status = (p.get("status") or "").lower()
         meli_pct = float(p.get("meli_percentage") or 0)
-        cap_total = cap_seller_pct + meli_pct
 
         # STARTED promos: report as already-active for the operator audit.
         if status == "started":
@@ -842,109 +991,23 @@ def enumerate_activations_for_item(
         if status != "candidate":
             continue
 
-        # Candidate eligibility: same three constraint paths as the counter.
-        fixed = p.get("fixed_percentage")
-        if fixed is not None:
-            fixed_f = float(fixed)
-            if fixed_f > cap_total + 0.01:
-                continue
-            target = round(list_price * (1 - fixed_f / 100), 2)
-            if target + 0.01 < floor:
-                continue
-            out.append(
-                {
-                    "promo_id": p.get("id"),
-                    "promo_type": p.get("type"),
-                    "promo_name": p.get("name"),
-                    "status": "would_activate",
-                    "target_price": target,
-                    "target_total_pct": fixed_f,
-                    "target_seller_pct": fixed_f - meli_pct,
-                    "meli_percentage": meli_pct,
-                    "constraint": "fixed_percentage",
-                    "reason": f"fixed -{fixed_f}% @ R$ {target}",
-                }
-            )
+        scored = score_candidate_promo(
+            p,
+            cap_seller_pct=cap_seller_pct,
+            margin_floor_price=margin_floor_price,
+            list_price=list_price,
+        )
+        if scored is None:
             continue
-
-        min_price = p.get("min_discounted_price")
-        if min_price is not None:
-            min_f = float(min_price)
-            if min_f + 0.01 < floor:
-                continue
-            # Activate at the cheapest allowed: max(min_price, floor); apply
-            # cap_total as the worst-case headroom so we never go below cap.
-            target_at_cap = round(list_price * (1 - cap_total / 100), 2)
-            target = max(min_f, floor, target_at_cap)
-            target = round(target, 2)
-            total_pct = round((list_price - target) / list_price * 100, 2)
-            out.append(
-                {
-                    "promo_id": p.get("id"),
-                    "promo_type": p.get("type"),
-                    "promo_name": p.get("name"),
-                    "status": "would_activate",
-                    "target_price": target,
-                    "target_total_pct": total_pct,
-                    "target_seller_pct": total_pct - meli_pct,
-                    "meli_percentage": meli_pct,
-                    "constraint": "min_discounted_price",
-                    "reason": f"min_price R$ {min_f} → R$ {target} (-{total_pct}%)",
-                }
-            )
-            continue
-
-        sugg = p.get("suggested_discounted_price")
-        if sugg is not None:
-            sugg_f = float(sugg)
-            total_pct = round((list_price - sugg_f) / list_price * 100, 2)
-            if total_pct > cap_total + 0.01:
-                continue
-            if sugg_f + 0.01 < floor:
-                continue
-            out.append(
-                {
-                    "promo_id": p.get("id"),
-                    "promo_type": p.get("type"),
-                    "promo_name": p.get("name"),
-                    "status": "would_activate",
-                    "target_price": sugg_f,
-                    "target_total_pct": total_pct,
-                    "target_seller_pct": total_pct - meli_pct,
-                    "meli_percentage": meli_pct,
-                    "constraint": "suggested_discounted_price",
-                    "reason": f"suggested -{total_pct}% @ R$ {sugg_f}",
-                }
-            )
-            continue
-
-        # SMART / PRICE_MATCHING-style: ML pre-computes ``price`` directly
-        # (no min/fixed/suggested fields). The seller share is exposed as
-        # ``seller_percentage``; meli_percentage is the banca co-pay.
-        ml_price = p.get("price")
-        seller_pct_raw = p.get("seller_percentage")
-        if ml_price is not None and seller_pct_raw is not None:
-            price_f = float(ml_price)
-            seller_f = float(seller_pct_raw)
-            total_pct = round(seller_f + meli_pct, 2)
-            if seller_f > cap_seller_pct + 0.01:
-                continue
-            if price_f + 0.01 < floor:
-                continue
-            out.append(
-                {
-                    "promo_id": p.get("id"),
-                    "promo_type": p.get("type"),
-                    "promo_name": p.get("name"),
-                    "status": "would_activate",
-                    "target_price": price_f,
-                    "target_total_pct": total_pct,
-                    "target_seller_pct": seller_f,
-                    "meli_percentage": meli_pct,
-                    "constraint": "ml_priced",
-                    "reason": f"{p.get('type')} -{total_pct}% @ R$ {price_f} (seller -{seller_f}%)",
-                }
-            )
+        out.append(
+            {
+                "promo_id": p.get("id"),
+                "promo_type": p.get("type"),
+                "promo_name": p.get("name"),
+                "status": "would_activate",
+                **scored,
+            }
+        )
     return out
 
 
