@@ -558,3 +558,61 @@ class MLPromotionService:
                 }
             )
         return results
+
+    # -- Pure analysis (no persistence, no ML write, no GAS call) ------------
+    async def analyze_sku_dry(
+        self,
+        session: AsyncSession,
+        sku: str,
+    ) -> list[dict[str, Any]]:
+        """Like ``evaluate_sku`` but with zero side-effects.
+
+        - Reads the cap and the cost SNAPSHOT from Postgres (no GAS call).
+        - Calls ML /seller-promotions to fetch live eligible promos.
+        - Runs the pure ``decide_for_item`` engine.
+        - Does NOT write to ``ml_promo_actions`` or ``ml_promo_alerts``.
+        - Does NOT call any ML write endpoint.
+
+        Designed to be safe to run across the whole catalog every day for
+        forecasting and trend analysis.
+        """
+        caps = MLPromoCapRepository(session)
+        listings = MLListingRepository(session)
+        snap_repo = MLCostsSnapshotRepository(session)
+
+        cap = await caps.get(sku)
+        if cap is None:
+            return []
+
+        mlb_ids = await listings.get_active_mlb_ids_for_sku(sku)
+        results: list[dict[str, Any]] = []
+        for mlb_id in mlb_ids:
+            promos = await self.fetch_eligible_promos(mlb_id)
+            snap = await snap_repo.get(mlb_id)
+            costs = _snapshot_to_costs(snap) if snap else None
+            decision = decide_for_item(
+                promos=promos,
+                costs=costs,
+                cap_seller_pct=float(cap.max_seller_share_pct),
+                margin_floor_price=float(cap.margin_floor_price)
+                if cap.margin_floor_price
+                else None,
+                freight_band_opt_enabled=cap.freight_band_opt,
+                excluded_types=cap.excluded_promo_types or (),
+            )
+            results.append({"mlb_id": mlb_id, "decision": decision})
+        return results
+
+
+def _snapshot_to_costs(snap: Any) -> dict[str, Any]:
+    """Convert an ml_costs_snapshot row into the camelCase dict shape that
+    ``decide_for_item`` expects (mirrors the GAS endpoint payload)."""
+
+    def _f(v: Any) -> float | None:
+        return None if v is None else float(v)
+
+    return {
+        "listPrice": _f(snap.list_price),
+        "promoPrice": _f(snap.sheet_promo_price),
+        "freightBands": snap.freight_bands,
+    }

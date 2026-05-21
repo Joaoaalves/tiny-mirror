@@ -591,6 +591,106 @@ async def evaluate_all(
     return summary
 
 
+@router.post("/analyze-all")
+async def analyze_all(
+    limit: int = Query(default=2000, ge=1, le=5000),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Full dry-run analysis across every SKU that has a cap.
+
+    Side-effects-free:
+      - reads caps + cost snapshots from Postgres (no GAS call)
+      - calls ML /seller-promotions per MLB (live read, no write)
+      - returns aggregate stats + elapsed time + per-action breakdown
+      - DOES NOT write ml_promo_actions, ml_promo_alerts, or anything to ML
+
+    Use this to forecast "if I turned auto_apply on tomorrow, how many
+    promos would be activated, how long would it take, what would break".
+    """
+    import time as _time
+
+    repo = MLPromoCapRepository(session)
+    rows, total = await repo.list_all(only_auto=None, limit=limit)
+    started_at = _time.monotonic()
+    action_counts: dict[str, int] = {}
+    promo_type_counts: dict[str, int] = {}
+    skus_with_results = 0
+    mlbs_evaluated = 0
+    activate_examples: list[dict[str, Any]] = []
+    create_examples: list[dict[str, Any]] = []
+    keep_with_violation = 0
+    skus_with_zero_cap = 0
+    errors: list[dict[str, Any]] = []
+
+    for cap in rows:
+        if cap.max_seller_share_pct == 0:
+            skus_with_zero_cap += 1
+            action_counts["skip_zero_cap"] = action_counts.get("skip_zero_cap", 0) + 1
+            continue
+        try:
+            results = await service.analyze_sku_dry(session, cap.sku)
+        except Exception as exc:  # pragma: no cover — surface error in report
+            errors.append({"sku": cap.sku, "error": str(exc)[:200]})
+            continue
+        if results:
+            skus_with_results += 1
+        for r in results:
+            mlbs_evaluated += 1
+            dec = r["decision"]
+            action_counts[dec.action] = action_counts.get(dec.action, 0) + 1
+            if dec.target_promo_type:
+                promo_type_counts[dec.target_promo_type] = (
+                    promo_type_counts.get(dec.target_promo_type, 0) + 1
+                )
+            if dec.action == "activate_candidate" and len(activate_examples) < 5:
+                activate_examples.append(
+                    {
+                        "sku": cap.sku,
+                        "mlb_id": r["mlb_id"],
+                        "from_total_pct": dec.current_total_pct,
+                        "to_total_pct": dec.target_total_pct,
+                        "target_price": dec.target_price,
+                        "promo_type": dec.target_promo_type,
+                        "promo_name": dec.target_promo_name,
+                        "reason": dec.reason,
+                    }
+                )
+            if dec.action == "create_price_discount" and len(create_examples) < 5:
+                create_examples.append(
+                    {
+                        "sku": cap.sku,
+                        "mlb_id": r["mlb_id"],
+                        "target_total_pct": dec.target_total_pct,
+                        "target_price": dec.target_price,
+                        "reason": dec.reason,
+                    }
+                )
+            if dec.action == "keep" and dec.floor_violated:
+                keep_with_violation += 1
+
+    elapsed = _time.monotonic() - started_at
+    would_activate = action_counts.get("activate_candidate", 0) + action_counts.get(
+        "create_price_discount", 0
+    )
+
+    return {
+        "elapsed_seconds": round(elapsed, 2),
+        "caps_total_in_db": total,
+        "caps_iterated": len(rows),
+        "skus_with_zero_cap_skipped": skus_with_zero_cap,
+        "skus_with_at_least_one_mlb": skus_with_results,
+        "mlbs_evaluated": mlbs_evaluated,
+        "would_activate_total": would_activate,
+        "action_counts": action_counts,
+        "promo_type_counts_when_acting": promo_type_counts,
+        "keep_with_floor_violation": keep_with_violation,
+        "errors": errors,
+        "activate_examples": activate_examples,
+        "create_examples": create_examples,
+    }
+
+
 # ---------------------------------------------------------------------------
 # LOG
 # ---------------------------------------------------------------------------
