@@ -85,6 +85,11 @@ class CapOut(BaseModel):
     price_to_win: Decimal | None = None
     winner_price: Decimal | None = None
     competitors_sharing_first_place: int | None = None
+    # True when the SKU has at least one active MLB in ml_listings.
+    # False = the cap is orphan (snapshot exists from a past listing, but
+    # the listing is gone). The dashboard renders this as "Sem anúncio"
+    # instead of a misleading "—".
+    has_active_listing: bool | None = None
 
 
 class CostSnapshotOut(BaseModel):
@@ -262,6 +267,13 @@ async def _enrich_cap(
         out.price_to_win = cat.price_to_win
         out.winner_price = cat.winner_price
         out.competitors_sharing_first_place = cat.competitors_sharing_first_place
+
+    # has_active_listing: distinguishes "no MLB at all" (orphan cap) from
+    # "MLB exists but ML returned not_listed". Without this the UI shows
+    # "—" for both, which made the operator chase 107 phantom caps.
+    listing_repo = MLListingRepository(session)
+    active_mlbs = await listing_repo.get_active_mlb_ids_for_sku(cap.sku)
+    out.has_active_listing = bool(active_mlbs)
     return out
 
 
