@@ -38,12 +38,20 @@ router = APIRouter()
 # Schemas
 # ---------------------------------------------------------------------------
 class CapIn(BaseModel):
+    """Cap bulk-upsert input — one entry per anúncio (per MLB).
+
+    `sku` is required so newly-introduced rows know their grouping key;
+    `mlb_id` is the canonical identity. Both must be present.
+    """
+
     model_config = ConfigDict(extra="forbid")
+    mlb_id: str
     sku: str
     max_seller_share_pct: Decimal = Field(..., gt=0, le=100)
     margin_floor_price: Decimal | None = Field(default=None, ge=0)
     auto_apply: bool | None = None
     freight_band_opt: bool | None = None
+    skip_when_winning: bool | None = None
     excluded_promo_types: list[str] | None = None
     notes: str | None = None
 
@@ -54,54 +62,36 @@ class CapsBulkIn(BaseModel):
     updated_by: str | None = None
 
 
-class CapMLBOut(BaseModel):
-    """Per-MLB detail exposed inside CapOut.mlbs[] for the collapsible row."""
+class CapOut(BaseModel):
+    """Per-MLB cap row enriched with the matching cost snapshot + catalog
+    status. The frontend groups these by SKU client-side."""
 
     model_config = ConfigDict(from_attributes=True)
     mlb_id: str
-    logistic_type: str | None = None  # fulfillment / cross_docking / etc.
-    listing_status: str | None = None  # active / paused / closed
-    # From ml_costs_snapshot.
-    base_cost: Decimal | None = None
-    commission_pct: Decimal | None = None
-    list_price: Decimal | None = None
-    sheet_promo_price: Decimal | None = None
-    freight_bands: Any | None = None
-    margin_at_floor_value: Decimal | None = None
-    margin_at_floor_pct: Decimal | None = None
-    # From ml_catalog_status (price_to_win).
-    catalog_status: str | None = None
-    visit_share: str | None = None
-    current_price: Decimal | None = None
-    price_to_win: Decimal | None = None
-    winner_price: Decimal | None = None
-    competitors_sharing_first_place: int | None = None
-
-
-class CapOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
     sku: str
     max_seller_share_pct: Decimal
     margin_floor_price: Decimal | None
     auto_apply: bool
     freight_band_opt: bool
+    skip_when_winning: bool
     excluded_promo_types: list[str]
     notes: str | None
     updated_by: str | None
     updated_at: datetime
-    # Joined from ml_costs_snapshot (latest active one) so the dashboard
-    # table can show profitability without a per-SKU round-trip.
-    list_price: Decimal | None = None
-    margin_at_floor_value: Decimal | None = None
-    margin_at_floor_pct: Decimal | None = None
-    # Full pricing inputs so the dashboard can recompute margin live
-    # while the operator drags the cap slider in the table.
+    # Joined from ml_listings (the MLB's listing row) — type + status.
+    logistic_type: str | None = None
+    listing_status: str | None = None
+    # Joined from ml_costs_snapshot — the pricing inputs the dashboard
+    # uses to recompute margin live while editing the cap.
     base_cost: Decimal | None = None
     commission_pct: Decimal | None = None
     difal_pct: Decimal | None = None
+    list_price: Decimal | None = None
+    sheet_promo_price: Decimal | None = None
     freight_bands: Any | None = None
-    # Joined from ml_catalog_status (worst-case MLB) so the dashboard can
-    # show the buy-box context without an extra round-trip.
+    margin_at_floor_value: Decimal | None = None
+    margin_at_floor_pct: Decimal | None = None
+    # Joined from ml_catalog_status (price_to_win / buy-box).
     catalog_listing: bool | None = None
     catalog_status: str | None = None
     visit_share: str | None = None
@@ -109,15 +99,9 @@ class CapOut(BaseModel):
     price_to_win: Decimal | None = None
     winner_price: Decimal | None = None
     competitors_sharing_first_place: int | None = None
-    # True when the SKU has at least one active MLB in ml_listings.
-    # False = the cap is orphan (snapshot exists from a past listing, but
-    # the listing is gone). The dashboard renders this as "Sem anúncio"
-    # instead of a misleading "—".
+    # True when the underlying MLB is still active in ml_listings. False
+    # means the cap row is orphan and the UI should hide it by default.
     has_active_listing: bool | None = None
-    # Full per-MLB detail (one row per active MLB). Populated only by
-    # endpoints that include catalog data (single-SKU and list_caps);
-    # default empty for backward compat with consumers that ignore it.
-    mlbs: list[CapMLBOut] = Field(default_factory=list)
 
 
 class CostSnapshotOut(BaseModel):
@@ -214,80 +198,63 @@ async def _enrich_cap(
     session: AsyncSession,
     cap: Any,
 ) -> CapOut:
-    """Attach list_price + margin-at-floor to a cap row.
-
-    The margin uses the same pricing formula as the recompute job so
-    numbers shown in the dashboard match the engine exactly. Snapshot
-    lookup is by SKU; if multiple MLBs exist we use the most expensive
-    base_cost (the worst-case MLB the cap has to protect).
+    """Attach the matching cost snapshot, catalog status, and listing row
+    to a per-MLB cap. Each enrichment lookup is keyed by ``cap.mlb_id``.
     """
+    from sqlalchemy import select
+
     from tiny_mirror.config import settings
+    from tiny_mirror.infrastructure.orm.models import MLCatalogStatusORM, MLListingORM
     from tiny_mirror.services.pricing_service import PricingDataError, margin_at_price
 
     snap_repo = MLCostsSnapshotRepository(session)
-    snaps = await snap_repo.get_by_sku(cap.sku)
+    snap = await snap_repo.get(cap.mlb_id)
 
     out = CapOut.model_validate(cap)
-    if not snaps:
-        return out
-
-    # Pick the worst-case MLB (highest base_cost) — the same conservative
-    # choice cap_recompute_service makes.
-    usable = [
-        s
-        for s in snaps
-        if s.base_cost is not None
-        and s.commission_pct is not None
-        and s.list_price is not None
-        and s.freight_bands
-    ]
-    if not usable:
-        return out
-    snap = max(usable, key=lambda s: s.base_cost or Decimal(0))
-    out.list_price = snap.list_price
-    out.base_cost = snap.base_cost
-    out.commission_pct = snap.commission_pct
-    out.freight_bands = snap.freight_bands
     out.difal_pct = Decimal(str(settings.margin_difal_pct))
 
-    floor_price = cap.margin_floor_price
-    if floor_price is None:
-        floor_price = snap.sheet_promo_price
-    if floor_price is None or snap.base_cost is None or snap.commission_pct is None:
-        return out
-    try:
-        breakdown = margin_at_price(
-            price=floor_price,
-            base_cost=snap.base_cost,
-            commission_pct=snap.commission_pct,
-            freight_bands=snap.freight_bands,
+    if snap is not None:
+        out.list_price = snap.list_price
+        out.base_cost = snap.base_cost
+        out.commission_pct = snap.commission_pct
+        out.freight_bands = snap.freight_bands
+        out.sheet_promo_price = snap.sheet_promo_price
+
+        floor_price = cap.margin_floor_price or snap.sheet_promo_price
+        if (
+            floor_price is not None
+            and snap.base_cost is not None
+            and snap.commission_pct is not None
+            and snap.freight_bands
+        ):
+            try:
+                breakdown = margin_at_price(
+                    price=floor_price,
+                    base_cost=snap.base_cost,
+                    commission_pct=snap.commission_pct,
+                    freight_bands=snap.freight_bands,
+                )
+                out.margin_at_floor_value = breakdown.margin_value
+                out.margin_at_floor_pct = breakdown.margin_pct
+            except PricingDataError:
+                pass
+
+    listing = (
+        await session.execute(select(MLListingORM).where(MLListingORM.mlb_id == cap.mlb_id))
+    ).scalar_one_or_none()
+    if listing is not None:
+        out.logistic_type = listing.logistic_type
+        out.listing_status = listing.status
+        out.has_active_listing = listing.status == "active"
+    else:
+        out.has_active_listing = False
+
+    cat = (
+        await session.execute(
+            select(MLCatalogStatusORM).where(MLCatalogStatusORM.mlb_id == cap.mlb_id)
         )
-    except PricingDataError:
-        return out
-    out.margin_at_floor_value = breakdown.margin_value
-    out.margin_at_floor_pct = breakdown.margin_pct
-
-    # Catalog context (buy-box). Pick the WORST-CASE MLB — competing /
-    # losing beats winning so the dashboard surfaces problems first.
-    from sqlalchemy import select
-
-    from tiny_mirror.infrastructure.orm.models import MLCatalogStatusORM
-
-    cat_rows = (
-        (await session.execute(select(MLCatalogStatusORM).where(MLCatalogStatusORM.sku == cap.sku)))
-        .scalars()
-        .all()
-    )
-    if cat_rows:
-        rank = {
-            "competing": 0,
-            "losing": 0,
-            "sharing_first_place": 1,
-            "winning": 2,
-            "not_listed": 3,
-            "unknown": 4,
-        }
-        cat = min(cat_rows, key=lambda r: rank.get(r.status or "unknown", 5))
+    ).scalar_one_or_none()
+    if cat is not None:
         out.catalog_listing = bool(cat.catalog_listing)
         out.catalog_status = cat.status
         out.visit_share = cat.visit_share
@@ -296,76 +263,6 @@ async def _enrich_cap(
         out.winner_price = cat.winner_price
         out.competitors_sharing_first_place = cat.competitors_sharing_first_place
 
-    # has_active_listing: distinguishes "no MLB at all" (orphan cap) from
-    # "MLB exists but ML returned not_listed". Without this the UI shows
-    # "—" for both, which made the operator chase 107 phantom caps.
-    from tiny_mirror.infrastructure.orm.models import MLListingORM
-
-    listings_rows = (
-        (
-            await session.execute(
-                select(MLListingORM).where(
-                    MLListingORM.sku == cap.sku, MLListingORM.status == "active"
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    out.has_active_listing = bool(listings_rows)
-
-    # Per-MLB detail for the collapsible row. Build a {mlb_id -> snap/cat}
-    # lookup so a single iteration over active listings can join everything.
-    snaps_by_mlb = {s.mlb_id: s for s in snaps}
-    cats_by_mlb = {c.mlb_id: c for c in cat_rows} if cat_rows else {}
-
-    mlb_rows: list[CapMLBOut] = []
-    for lst in listings_rows:
-        s = snaps_by_mlb.get(lst.mlb_id)
-        c = cats_by_mlb.get(lst.mlb_id)
-        margin_at_floor_value: Decimal | None = None
-        margin_at_floor_pct: Decimal | None = None
-        floor_for_margin = cap.margin_floor_price or (s.sheet_promo_price if s else None)
-        if (
-            s is not None
-            and s.base_cost is not None
-            and s.commission_pct is not None
-            and s.freight_bands
-            and floor_for_margin is not None
-        ):
-            try:
-                br = margin_at_price(
-                    price=floor_for_margin,
-                    base_cost=s.base_cost,
-                    commission_pct=s.commission_pct,
-                    freight_bands=s.freight_bands,
-                )
-                margin_at_floor_value = br.margin_value
-                margin_at_floor_pct = br.margin_pct
-            except PricingDataError:
-                pass
-
-        mlb_rows.append(
-            CapMLBOut(
-                mlb_id=lst.mlb_id,
-                logistic_type=lst.logistic_type,
-                listing_status=lst.status,
-                base_cost=s.base_cost if s else None,
-                commission_pct=s.commission_pct if s else None,
-                list_price=s.list_price if s else None,
-                sheet_promo_price=s.sheet_promo_price if s else None,
-                freight_bands=s.freight_bands if s else None,
-                margin_at_floor_value=margin_at_floor_value,
-                margin_at_floor_pct=margin_at_floor_pct,
-                catalog_status=c.status if c else None,
-                visit_share=c.visit_share if c else None,
-                current_price=c.current_price if c else None,
-                price_to_win=c.price_to_win if c else None,
-                winner_price=c.winner_price if c else None,
-                competitors_sharing_first_place=(c.competitors_sharing_first_place if c else None),
-            )
-        )
-    out.mlbs = mlb_rows
     return out
 
 
@@ -376,12 +273,12 @@ async def list_caps(
         bool,
         Query(
             description=(
-                "Include caps without any active MLB in ml_listings. "
+                "Include caps whose MLB is not active in ml_listings. "
                 "False (default) hides them — they cannot be acted on."
             ),
         ),
     ] = False,
-    limit: int = Query(default=200, ge=1, le=1000),
+    limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(db_session),
 ) -> list[CapOut]:
@@ -393,15 +290,26 @@ async def list_caps(
     return enriched
 
 
-@router.get("/caps/{sku}", response_model=CapOut)
-async def get_cap(
+@router.get("/caps/by-sku/{sku}", response_model=list[CapOut])
+async def list_caps_by_sku(
     sku: str,
+    session: AsyncSession = Depends(db_session),
+) -> list[CapOut]:
+    """All per-MLB caps for a SKU. Used by the drawer + kit grouping flows."""
+    repo = MLPromoCapRepository(session)
+    rows = await repo.get_by_sku(sku)
+    return [await _enrich_cap(session, r) for r in rows]
+
+
+@router.get("/caps/{mlb_id}", response_model=CapOut)
+async def get_cap(
+    mlb_id: str,
     session: AsyncSession = Depends(db_session),
 ) -> CapOut:
     repo = MLPromoCapRepository(session)
-    row = await repo.get(sku)
+    row = await repo.get(mlb_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"no cap for sku={sku}")
+        raise HTTPException(status_code=404, detail=f"no cap for mlb_id={mlb_id}")
     return await _enrich_cap(session, row)
 
 
@@ -414,29 +322,31 @@ async def bulk_upsert_caps(
     out: list[CapOut] = []
     for item in body.items:
         row = await repo.upsert(
+            item.mlb_id,
             sku=item.sku,
             max_seller_share_pct=item.max_seller_share_pct,
             margin_floor_price=item.margin_floor_price,
             auto_apply=item.auto_apply,
             freight_band_opt=item.freight_band_opt,
+            skip_when_winning=item.skip_when_winning,
             excluded_promo_types=item.excluded_promo_types,
             notes=item.notes,
             updated_by=body.updated_by,
         )
-        out.append(CapOut.model_validate(row))
+        out.append(await _enrich_cap(session, row))
     await session.commit()
     return out
 
 
-@router.delete("/caps/{sku}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/caps/{mlb_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_cap(
-    sku: str,
+    mlb_id: str,
     session: AsyncSession = Depends(db_session),
 ) -> None:
     repo = MLPromoCapRepository(session)
-    deleted = await repo.delete(sku)
+    deleted = await repo.delete(mlb_id)
     if not deleted:
-        raise HTTPException(status_code=404, detail=f"no cap for sku={sku}")
+        raise HTTPException(status_code=404, detail=f"no cap for mlb_id={mlb_id}")
     await session.commit()
 
 
@@ -770,11 +680,17 @@ async def evaluate_all(
     session: AsyncSession = Depends(db_session),
     service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, int]:
-    """Iterate every SKU with auto_apply=true and run evaluate. Returns count summary."""
+    """Iterate every SKU with at least one auto_apply=true cap and evaluate.
+    Returns count summary."""
     repo = MLPromoCapRepository(session)
-    rows, _ = await repo.list_all(only_auto=True, limit=1000)
+    rows, _ = await repo.list_all(only_auto=True, limit=2000)
     summary: dict[str, int] = {}
+    # Caps are now per-MLB; dedupe SKUs so we don't call evaluate_sku N times.
+    skus_seen: set[str] = set()
     for cap in rows:
+        if cap.sku in skus_seen:
+            continue
+        skus_seen.add(cap.sku)
         results = await service.evaluate_sku(session, cap.sku, dry_run=True, actor="cron")
         for r in results:
             summary[r["decision"].action] = summary.get(r["decision"].action, 0) + 1
@@ -819,15 +735,21 @@ async def analyze_all(
     skus_with_zero_cap = 0
     errors: list[dict[str, Any]] = []
 
+    # Caps are per-MLB now; dedupe SKUs and use a SKU-level "zero" check
+    # (every MLB of the SKU has cap=0 => the whole SKU is skipped).
+    by_sku: dict[str, list[Any]] = {}
     for cap in rows:
-        if cap.max_seller_share_pct == 0:
+        by_sku.setdefault(cap.sku, []).append(cap)
+
+    for sku, sku_caps in by_sku.items():
+        if all(c.max_seller_share_pct == 0 for c in sku_caps):
             skus_with_zero_cap += 1
             action_counts["skip_zero_cap"] = action_counts.get("skip_zero_cap", 0) + 1
             continue
         try:
-            results = await service.analyze_sku_dry(session, cap.sku)
+            results = await service.analyze_sku_dry(session, sku)
         except Exception as exc:  # pragma: no cover — surface error in report
-            errors.append({"sku": cap.sku, "error": str(exc)[:200]})
+            errors.append({"sku": sku, "error": str(exc)[:200]})
             continue
         if results:
             skus_with_results += 1
@@ -844,7 +766,7 @@ async def analyze_all(
             if dec.action == "activate_candidate" and len(activate_examples) < 5:
                 activate_examples.append(
                     {
-                        "sku": cap.sku,
+                        "sku": sku,
                         "mlb_id": r["mlb_id"],
                         "from_total_pct": dec.current_total_pct,
                         "to_total_pct": dec.target_total_pct,
@@ -857,7 +779,7 @@ async def analyze_all(
             if dec.action == "create_price_discount" and len(create_examples) < 5:
                 create_examples.append(
                     {
-                        "sku": cap.sku,
+                        "sku": sku,
                         "mlb_id": r["mlb_id"],
                         "target_total_pct": dec.target_total_pct,
                         "target_price": dec.target_price,
@@ -878,7 +800,7 @@ async def analyze_all(
                 if len(still_losing_examples) < 5:
                     still_losing_examples.append(
                         {
-                            "sku": cap.sku,
+                            "sku": sku,
                             "mlb_id": r["mlb_id"],
                             "our_price": dec.target_price or dec.current_price,
                             "price_to_win": dec.price_to_win,

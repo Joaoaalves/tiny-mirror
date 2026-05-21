@@ -23,12 +23,14 @@ from tiny_mirror.services.ml_promotion_service import (
 pytestmark = pytest.mark.unit
 
 
-def _fake_cap() -> SimpleNamespace:
+def _fake_cap(mlb_id: str = "MLB1") -> SimpleNamespace:
     return SimpleNamespace(
+        mlb_id=mlb_id,
         sku="X",
         max_seller_share_pct=Decimal("30"),
         margin_floor_price=Decimal("39.90"),
         freight_band_opt=False,
+        skip_when_winning=False,
         excluded_promo_types=[],
     )
 
@@ -46,7 +48,7 @@ async def test_analyze_sku_dry_skips_when_cap_missing() -> None:
     service = MLPromotionService(token_service=MagicMock(), http_client=MagicMock())
     session = MagicMock()
     with patch("tiny_mirror.services.ml_promotion_service.MLPromoCapRepository") as cap_repo_cls:
-        cap_repo_cls.return_value.get = AsyncMock(return_value=None)
+        cap_repo_cls.return_value.get_by_sku = AsyncMock(return_value=[])
         out = await service.analyze_sku_dry(session, "no-cap-sku")
     assert out == []
 
@@ -84,7 +86,7 @@ async def test_analyze_sku_dry_does_not_touch_actions_or_alerts() -> None:
         ),
         patch.object(MLPromotionService, "fetch_price_to_win", new=AsyncMock(return_value=None)),
     ):
-        cap_repo_cls.return_value.get = AsyncMock(return_value=cap)
+        cap_repo_cls.return_value.get_by_sku = AsyncMock(return_value=[cap])
         list_repo_cls.return_value.get_active_mlb_ids_for_sku = AsyncMock(return_value=["MLB1"])
         snap_repo_cls.return_value.get = AsyncMock(return_value=snap)
 

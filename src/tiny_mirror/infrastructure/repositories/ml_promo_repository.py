@@ -29,12 +29,28 @@ from tiny_mirror.infrastructure.orm.models import (
 # Caps
 # ---------------------------------------------------------------------------
 class MLPromoCapRepository:
+    """Per-MLB cap CRUD (re-keyed from sku to mlb_id on 2026-05-21).
+
+    SKU lookups still exist (drawer needs the full set of MLBs for a
+    SKU), but the canonical lookup key is mlb_id.
+    """
+
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def get(self, sku: str) -> MLPromoCapORM | None:
-        result = await self._session.execute(select(MLPromoCapORM).where(MLPromoCapORM.sku == sku))
+    async def get(self, mlb_id: str) -> MLPromoCapORM | None:
+        result = await self._session.execute(
+            select(MLPromoCapORM).where(MLPromoCapORM.mlb_id == mlb_id)
+        )
         return result.scalar_one_or_none()
+
+    async def get_by_sku(self, sku: str) -> list[MLPromoCapORM]:
+        """All caps belonging to a SKU. Used by the drawer to render the
+        SKU-level summary alongside its per-MLB editable rows."""
+        result = await self._session.execute(
+            select(MLPromoCapORM).where(MLPromoCapORM.sku == sku).order_by(MLPromoCapORM.mlb_id)
+        )
+        return list(result.scalars().all())
 
     async def list_all(
         self,
@@ -44,33 +60,42 @@ class MLPromoCapRepository:
         offset: int = 0,
     ) -> tuple[list[MLPromoCapORM], int]:
         q = select(MLPromoCapORM)
-        count_q = select(func.count(MLPromoCapORM.sku))
+        count_q = select(func.count(MLPromoCapORM.mlb_id))
         if only_auto is not None:
             q = q.where(MLPromoCapORM.auto_apply == only_auto)
             count_q = count_q.where(MLPromoCapORM.auto_apply == only_auto)
-        q = q.order_by(MLPromoCapORM.sku).limit(limit).offset(offset)
+        # Order by sku first so consumers that group by SKU read in groups.
+        q = q.order_by(MLPromoCapORM.sku, MLPromoCapORM.mlb_id).limit(limit).offset(offset)
         rows = list((await self._session.execute(q)).scalars().all())
         total = int((await self._session.execute(count_q)).scalar_one())
         return rows, total
 
     async def upsert(
         self,
-        sku: str,
+        mlb_id: str,
         *,
+        sku: str,
         max_seller_share_pct: Decimal,
         margin_floor_price: Decimal | None = None,
         auto_apply: bool | None = None,
         freight_band_opt: bool | None = None,
+        skip_when_winning: bool | None = None,
         excluded_promo_types: list[str] | None = None,
         notes: str | None = None,
         updated_by: str | None = None,
     ) -> MLPromoCapORM:
-        """Insert or update a cap row. None-valued kwargs preserve current value on update."""
+        """Insert or update a cap row. None-valued kwargs preserve current value on update.
+
+        `sku` is required so we always know the grouping key, even for new rows
+        introduced after a listing first becomes active.
+        """
         update_set: dict[str, Any] = {
             "max_seller_share_pct": max_seller_share_pct,
+            "sku": sku,
             "updated_at": func.now(),
         }
         insert_values: dict[str, Any] = {
+            "mlb_id": mlb_id,
             "sku": sku,
             "max_seller_share_pct": max_seller_share_pct,
         }
@@ -78,6 +103,7 @@ class MLPromoCapRepository:
             ("margin_floor_price", margin_floor_price),
             ("auto_apply", auto_apply),
             ("freight_band_opt", freight_band_opt),
+            ("skip_when_winning", skip_when_winning),
             ("excluded_promo_types", excluded_promo_types),
             ("notes", notes),
             ("updated_by", updated_by),
@@ -89,15 +115,15 @@ class MLPromoCapRepository:
         stmt = (
             pg_insert(MLPromoCapORM)
             .values(**insert_values)
-            .on_conflict_do_update(index_elements=["sku"], set_=update_set)
+            .on_conflict_do_update(index_elements=["mlb_id"], set_=update_set)
             .returning(MLPromoCapORM)
         )
         result = await self._session.execute(stmt)
         await self._session.flush()
         return result.scalar_one()
 
-    async def delete(self, sku: str) -> bool:
-        existing = await self.get(sku)
+    async def delete(self, mlb_id: str) -> bool:
+        existing = await self.get(mlb_id)
         if existing is None:
             return False
         await self._session.delete(existing)

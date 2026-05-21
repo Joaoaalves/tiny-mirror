@@ -16,9 +16,7 @@ import pytest
 from tiny_mirror.services.cap_recompute_service import (
     DEFAULT_CAP_PCT,
     MIN_MARGIN_PCT,
-    CapCalculation,
     _baseline_from_active_promos,
-    _consolidate_sku,
     calc_cap_for_snapshot,
     calc_cap_from_active_promo,
 )
@@ -357,80 +355,6 @@ def test_fallback_skips_when_fetch_error_set() -> None:
     assert "fetch_error" in calc.reason
 
 
-# ---------------------------------------------------------------------------
-# _consolidate_sku — per-SKU consolidation must never alert on live promos
-# ---------------------------------------------------------------------------
-def test_consolidate_picks_max_cap_so_no_active_promo_violates() -> None:
-    """If two MLBs of a SKU run different active discounts, the SKU cap
-    must equal the LARGER of the two, otherwise the deeper promo would
-    look like a cap violation."""
-    weak = CapCalculation(
-        mlb_id="MLB-weak",
-        sku="S",
-        cap_pct=Decimal("15"),
-        floor_price=Decimal("85"),
-        margin_pct_at_floor=Decimal("12"),
-        list_price=Decimal("100"),
-        reason="from active 15%",
-        skipped=False,
-        source="active_promo",
-    )
-    deep = CapCalculation(
-        mlb_id="MLB-deep",
-        sku="S",
-        cap_pct=Decimal("40"),
-        floor_price=Decimal("60"),
-        margin_pct_at_floor=Decimal("8"),
-        list_price=Decimal("100"),
-        reason="from active 40%",
-        skipped=False,
-        source="active_promo",
-    )
-    picked = _consolidate_sku([weak, deep])
-    assert picked.cap_pct == Decimal("40")
-    assert picked.floor_price == Decimal("60")  # min of the two floors
-    assert picked.source == "active_promo"
-
-
-def test_consolidate_floor_is_min_across_mlbs() -> None:
-    a = CapCalculation(
-        mlb_id="MLB-a",
-        sku="S",
-        cap_pct=Decimal("30"),
-        floor_price=Decimal("70"),
-        margin_pct_at_floor=Decimal("12"),
-        list_price=Decimal("100"),
-        reason="a",
-        skipped=False,
-        source="active_promo",
-    )
-    b = CapCalculation(
-        mlb_id="MLB-b",
-        sku="S",
-        cap_pct=Decimal("20"),
-        floor_price=Decimal("50"),
-        margin_pct_at_floor=Decimal("8"),
-        list_price=Decimal("60"),
-        reason="b",
-        skipped=False,
-        source="active_promo",
-    )
-    picked = _consolidate_sku([a, b])
-    assert picked.cap_pct == Decimal("30")
-    assert picked.floor_price == Decimal("50")
-
-
-def test_consolidate_returns_skipped_when_all_skipped() -> None:
-    skipped = CapCalculation(
-        mlb_id="X",
-        sku="S",
-        cap_pct=Decimal(0),
-        floor_price=None,
-        margin_pct_at_floor=None,
-        list_price=None,
-        reason="missing",
-        skipped=True,
-    )
-    picked = _consolidate_sku([skipped])
-    assert picked.mlb_id == "X"
-    assert picked.skipped
+# Per-SKU consolidation tests were removed on 2026-05-21 when caps became
+# per-MLB. The engine now operates on each anúncio independently, so there
+# is no max(cap)/min(floor) reduction to test.

@@ -1001,16 +1001,20 @@ class MLListingVariationORM(Base):
 # ---------------------------------------------------------------------------
 class MLPromoCapORM(Base):
     __tablename__ = "ml_promo_caps"
-    __table_args__ = {
-        "comment": (
-            "User-set cap on Mercado Livre promotion automation, per SKU. "
-            "auto_apply=true means the daily cron may activate/upgrade promotions for "
-            "this SKU within the cap; freight_band_opt=true lets the algorithm drop "
-            "the price by 1 cent if it crosses a freight band and net gain is positive."
-        ),
-    }
+    __table_args__ = (
+        Index("ix_ml_promo_caps_sku", "sku"),
+        {
+            "comment": (
+                "User-set cap on Mercado Livre promotion automation, per MLB. "
+                "PK changed from sku to mlb_id on 2026-05-21 so each anúncio "
+                "carries its own cap; sku stays as a non-unique column for "
+                "grouping queries (e.g. drawer fetch by SKU)."
+            ),
+        },
+    )
 
-    sku: Mapped[str] = mapped_column(String(100), primary_key=True)
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
     max_seller_share_pct: Mapped[Decimal] = mapped_column(
         Numeric(5, 2),
         nullable=False,

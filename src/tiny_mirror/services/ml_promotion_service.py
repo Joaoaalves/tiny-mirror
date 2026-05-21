@@ -592,14 +592,18 @@ class MLPromotionService:
         alerts = MLPromoAlertRepository(session)
         listings = MLListingRepository(session)
 
-        cap = await caps.get(sku)
-        if cap is None:
+        sku_caps = await caps.get_by_sku(sku)
+        if not sku_caps:
             return []  # not configured
+        cap_by_mlb = {c.mlb_id: c for c in sku_caps}
 
         # Find active MLBs for this SKU
         mlb_ids = await listings.get_active_mlb_ids_for_sku(sku)
         results: list[dict[str, Any]] = []
         for mlb_id in mlb_ids:
+            cap = cap_by_mlb.get(mlb_id)
+            if cap is None:
+                continue  # listing has no cap row yet — skip silently
             promos = await self.fetch_eligible_promos(mlb_id)
             costs = await self.fetch_gas_costs(mlb_id)
             decision = decide_for_item(
@@ -709,9 +713,10 @@ class MLPromotionService:
         listings = MLListingRepository(session)
         snap_repo = MLCostsSnapshotRepository(session)
 
-        cap = await caps.get(sku)
-        if cap is None:
+        sku_caps = await caps.get_by_sku(sku)
+        if not sku_caps:
             return []
+        cap_by_mlb = {c.mlb_id: c for c in sku_caps}
 
         # Catalog status comes from the DB (refreshed daily by
         # CatalogStatusSyncService). This keeps analyze_sku_dry fast and
@@ -732,6 +737,9 @@ class MLPromotionService:
 
         results: list[dict[str, Any]] = []
         for mlb_id in mlb_ids:
+            cap = cap_by_mlb.get(mlb_id)
+            if cap is None:
+                continue  # listing without a cap row yet — skip silently
             promos = await self.fetch_eligible_promos(mlb_id)
             snap = await snap_repo.get(mlb_id)
             costs = _snapshot_to_costs(snap) if snap else None
@@ -749,10 +757,6 @@ class MLPromotionService:
                 price_to_win_info=price_to_win_info,
                 skip_when_winning=bool(getattr(cap, "skip_when_winning", False)),
             )
-            # Operator policy (2026-05-21): the engine activates ALL
-            # candidates that fit inside the cap. Count them per MLB so
-            # the report reflects total promotions that would be created
-            # in one run.
             eligible_count = count_eligible_candidates(
                 promos=promos,
                 cap_seller_pct=float(cap.max_seller_share_pct),

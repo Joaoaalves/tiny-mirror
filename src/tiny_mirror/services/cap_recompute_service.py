@@ -19,12 +19,11 @@ For each MLB we fetch its ML promos and look for STARTED entries:
   fallback gives them a sensible permission window with the 10% margin
   protection intact.
 
-Per-SKU consolidation
----------------------
-``ml_promo_caps`` is keyed by SKU. Across the SKU's MLBs we take
-``max(cap_pct)`` (so no live promo is ever above the cap) and
-``min(floor_price)`` (so no live promo is ever below the floor).
-SKUs where every MLB was skipped stay skipped.
+Storage
+-------
+``ml_promo_caps`` is keyed by ``mlb_id`` (re-keyed 2026-05-21). Each
+MLB has its own cap row — no SKU-level consolidation is needed because
+the engine evaluates per-MLB and the operator edits per anúncio.
 """
 
 from __future__ import annotations
@@ -323,59 +322,6 @@ def calc_cap_for_snapshot(snap: MLCostsSnapshotORM) -> CapCalculation:
     )
 
 
-def _consolidate_sku(rows: list[CapCalculation]) -> CapCalculation:
-    """Consolidate per-MLB calcs into a single SKU row.
-
-    Rules:
-      - drop ``skipped`` rows; if everything is skipped, return the first
-        skipped row as-is so the caller can record it;
-      - cap_pct = ``max`` across MLBs (so no live promo is above cap);
-      - floor_price = ``min`` of the non-None floors (so no live promo
-        is below the floor).
-    """
-    non_skipped = [r for r in rows if not r.skipped]
-    if not non_skipped:
-        return rows[0]
-
-    chosen_cap = max(non_skipped, key=lambda r: r.cap_pct)
-    floors = [r.floor_price for r in non_skipped if r.floor_price is not None]
-    floor_price = min(floors) if floors else None
-
-    # Prefer the reason from the row that has the LOWEST floor (most
-    # aggressive baseline), because that one is the binding constraint.
-    floor_row = chosen_cap
-    if floors:
-        floor_row = min(
-            (r for r in non_skipped if r.floor_price is not None),
-            key=lambda r: r.floor_price,  # type: ignore[arg-type,return-value]
-        )
-
-    source = "active_promo" if any(r.source == "active_promo" for r in non_skipped) else "fallback"
-    if len(non_skipped) > 1:
-        reason = f"{chosen_cap.reason} | floor de {floor_row.mlb_id}: R$ {floor_price}"
-    else:
-        reason = chosen_cap.reason
-
-    return CapCalculation(
-        mlb_id=chosen_cap.mlb_id,
-        sku=chosen_cap.sku,
-        cap_pct=chosen_cap.cap_pct,
-        floor_price=floor_price,
-        margin_pct_at_floor=chosen_cap.margin_pct_at_floor,
-        list_price=chosen_cap.list_price,
-        reason=reason,
-        skipped=False,
-        source=source,
-    )
-
-
-# Back-compat alias for older imports/tests that referenced the conservative
-# pick. The new implementation is a MAX-cap consolidation (no alerts on live
-# promos), so the legacy "_conservative_pick" name is misleading; we keep
-# the symbol pointing at _consolidate_sku for callers who still import it.
-_conservative_pick = _consolidate_sku
-
-
 async def _fetch_active_baseline_for_mlb(
     service: MLPromotionService, mlb_id: str
 ) -> dict[str, Any] | None:
@@ -424,61 +370,61 @@ async def recompute_all_caps(
     actor = actor or f"auto-cap-recompute-{datetime.now(UTC).date().isoformat()}"
     stats = {
         "snapshots_read": len(snapshots),
-        "skus_processed": 0,
-        "skus_skipped": 0,
-        "skus_from_active_promo": 0,
-        "skus_fallback_sheet": 0,
-        "skus_zero_cap": 0,
+        "mlbs_processed": 0,
+        "mlbs_skipped": 0,
+        "mlbs_from_active_promo": 0,
+        "mlbs_fallback_sheet": 0,
+        "mlbs_zero_cap": 0,
         "mlbs_fetched_promos": 0,
-        "mlbs_with_active_promo": 0,
     }
     examples: list[dict[str, Any]] = []
 
+    # Per-MLB upsert — no SKU-level consolidation anymore. Each anúncio gets
+    # its own cap, derived from its own active STARTED promos (or fallback).
     for sku, snaps in sorted(by_sku.items()):
-        per_mlb_calcs: list[CapCalculation] = []
         for snap in snaps:
             baseline: dict[str, Any] | None = None
             if service is not None and not snap.fetch_error:
                 baseline = await _fetch_active_baseline_for_mlb(service, snap.mlb_id)
                 stats["mlbs_fetched_promos"] += 1
-                if baseline is not None:
-                    stats["mlbs_with_active_promo"] += 1
-            if baseline is not None:
-                per_mlb_calcs.append(calc_cap_from_active_promo(snap, baseline))
-            else:
-                per_mlb_calcs.append(calc_cap_for_snapshot(snap))
-
-        chosen = _consolidate_sku(per_mlb_calcs)
-        if chosen.skipped:
-            stats["skus_skipped"] += 1
-            continue
-        stats["skus_processed"] += 1
-        if chosen.source == "active_promo":
-            stats["skus_from_active_promo"] += 1
-        else:
-            stats["skus_fallback_sheet"] += 1
-        if chosen.cap_pct == Decimal(0):
-            stats["skus_zero_cap"] += 1
-
-        await cap_repo.upsert(
-            sku=sku,
-            max_seller_share_pct=chosen.cap_pct,
-            margin_floor_price=chosen.floor_price,
-            notes=chosen.reason[:500],
-            updated_by=actor,
-        )
-        if len(examples) < 10:
-            examples.append(
-                {
-                    "sku": sku,
-                    "cap_pct": float(chosen.cap_pct),
-                    "floor_price": float(chosen.floor_price)
-                    if chosen.floor_price is not None
-                    else None,
-                    "source": chosen.source,
-                    "reason": chosen.reason,
-                }
+            calc = (
+                calc_cap_from_active_promo(snap, baseline)
+                if baseline is not None
+                else calc_cap_for_snapshot(snap)
             )
+
+            if calc.skipped:
+                stats["mlbs_skipped"] += 1
+                continue
+            stats["mlbs_processed"] += 1
+            if calc.source == "active_promo":
+                stats["mlbs_from_active_promo"] += 1
+            else:
+                stats["mlbs_fallback_sheet"] += 1
+            if calc.cap_pct == Decimal(0):
+                stats["mlbs_zero_cap"] += 1
+
+            await cap_repo.upsert(
+                snap.mlb_id,
+                sku=sku,
+                max_seller_share_pct=calc.cap_pct,
+                margin_floor_price=calc.floor_price,
+                notes=calc.reason[:500],
+                updated_by=actor,
+            )
+            if len(examples) < 10:
+                examples.append(
+                    {
+                        "sku": sku,
+                        "mlb_id": snap.mlb_id,
+                        "cap_pct": float(calc.cap_pct),
+                        "floor_price": float(calc.floor_price)
+                        if calc.floor_price is not None
+                        else None,
+                        "source": calc.source,
+                        "reason": calc.reason,
+                    }
+                )
 
     await session.commit()
     logger.info("cap_recompute_done", **stats)
