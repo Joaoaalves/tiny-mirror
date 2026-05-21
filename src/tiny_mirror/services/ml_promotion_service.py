@@ -78,6 +78,12 @@ class Decision:
     floor_violated: bool = False
     freight_opt: FreightOpt | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    # Catalog-listing (buy-box) context. Populated only when the caller
+    # provides price_to_win info from ML's /items/{MLB}/price_to_win.
+    catalog_status: str | None = None  # "winning" | "losing" | "not_listed" | None
+    price_to_win: float | None = None
+    visit_share: str | None = None
+    still_losing: bool = False  # True when price_to_win < floor and we cap'd at floor
 
 
 def _compute_pct(orig: float | None, price: float | None) -> float | None:
@@ -130,6 +136,22 @@ def _freight_opt_check(
     return None
 
 
+def _annotate_catalog(decision: Decision, ptw: dict[str, Any] | None) -> Decision:
+    """Attach catalog buy-box context to a Decision (read-only)."""
+    if not ptw or not isinstance(ptw, dict):
+        return decision
+    decision.catalog_status = ptw.get("status")
+    decision.visit_share = ptw.get("visit_share")
+    raw_ptw = ptw.get("price_to_win")
+    decision.price_to_win = float(raw_ptw) if raw_ptw is not None else None
+    # still_losing = engine output (target_price or current_price) > price_to_win
+    if decision.catalog_status == "losing" and decision.price_to_win is not None:
+        effective_price = decision.target_price or decision.current_price
+        if effective_price is not None and effective_price > decision.price_to_win + 0.005:
+            decision.still_losing = True
+    return decision
+
+
 def decide_for_item(
     *,
     promos: list[dict[str, Any]],
@@ -138,6 +160,7 @@ def decide_for_item(
     margin_floor_price: float | None = None,
     freight_band_opt_enabled: bool = True,
     excluded_types: Iterable[str] = (),
+    price_to_win_info: dict[str, Any] | None = None,
 ) -> Decision:
     """Pure decision function. Inputs:
 
@@ -147,10 +170,46 @@ def decide_for_item(
     - ``margin_floor_price`` — explicit floor; if None, falls back to costs.sheet_promo_price
     - ``freight_band_opt_enabled`` — opt-in for the 1-cent-down freight trick
     - ``excluded_types`` — list of promotion types to ignore entirely
+    - ``price_to_win_info`` — optional dict from /items/{MLB}/price_to_win:
+        ``{ current_price, price_to_win, status, visit_share }``.
+        When provided, applies the catalog-aware policy:
+          • status="winning" AND visit_share="maximum"
+            → no new discount; keep_winning.
+          • status="losing" AND price_to_win >= floor
+            → cap still rules. If cap can't reach price_to_win, decision
+              proceeds at the cap-limited price; ``still_losing`` flag set.
+          • status="losing" AND price_to_win < floor
+            → cap to the floor (cap is inviolable). ``still_losing=True``.
+
+    **INVARIANT (cap is inviolable)**:
+        target_price >= max(margin_floor_price, list_price * (1 - cap/100))
+    The price_to_win signal can only RAISE the target_price, never lower it.
 
     Policy: never removes a ``started`` promotion (cap only blocks creates/upgrades).
     """
     excluded = set(excluded_types)
+
+    # ---- catalog-aware short-circuit: winning + maximum share ------------
+    ptw = price_to_win_info or {}
+    cat_status = ptw.get("status") if isinstance(ptw, dict) else None
+    cat_visit_share = ptw.get("visit_share") if isinstance(ptw, dict) else None
+    cat_ptw = ptw.get("price_to_win") if isinstance(ptw, dict) else None
+
+    if cat_status == "winning" and cat_visit_share == "maximum":
+        return Decision(
+            action="keep_winning",
+            reason=(
+                f"vencendo o catalogo com visit_share=maximum; "
+                f"current_price=R$ {ptw.get('current_price')}, "
+                f"price_to_win=R$ {cat_ptw}"
+            ),
+            current_price=float(ptw["current_price"])
+            if ptw.get("current_price") is not None
+            else None,
+            catalog_status=cat_status,
+            price_to_win=float(cat_ptw) if cat_ptw is not None else None,
+            visit_share=cat_visit_share,
+        )
 
     # ---- pre-process promos ------------------------------------------------
     started: list[dict[str, Any]] = []
@@ -181,7 +240,10 @@ def decide_for_item(
         orig_price = costs.get("listPrice")
 
     if not orig_price:
-        return Decision(action="no_data", reason="no original price from ML or sheet")
+        return _annotate_catalog(
+            Decision(action="no_data", reason="no original price from ML or sheet"),
+            price_to_win_info,
+        )
 
     # ---- floor price -------------------------------------------------------
     floor_price = margin_floor_price
@@ -238,43 +300,49 @@ def decide_for_item(
                         _compute_pct(orig_price, target_price) or best_cand_total_pct
                     )
         meli = best_cand.get("meli_percentage") or 0
-        return Decision(
-            action="activate_candidate",
-            reason=(
-                f"candidate -{best_cand_total_pct:.1f}% "
-                f"(seller -{best_cand_total_pct - meli:.1f}%) vs atual -{cur_total_pct:.1f}%"
+        return _annotate_catalog(
+            Decision(
+                action="activate_candidate",
+                reason=(
+                    f"candidate -{best_cand_total_pct:.1f}% "
+                    f"(seller -{best_cand_total_pct - meli:.1f}%) vs atual -{cur_total_pct:.1f}%"
+                ),
+                floor_price=floor_price,
+                current_total_pct=cur_total_pct,
+                current_seller_pct=best_started["_seller_pct"] if best_started else None,
+                current_meli_pct=best_started["_meli_pct"] if best_started else None,
+                current_price=best_started["_price"] if best_started else None,
+                current_promo_type=best_started.get("type") if best_started else None,
+                current_promo_id=best_started.get("id") if best_started else None,
+                target_total_pct=best_cand_total_pct,
+                target_seller_pct=best_cand_total_pct - meli,
+                target_meli_pct=meli,
+                target_price=target_price,
+                target_promo_type=best_cand.get("type"),
+                target_promo_id=best_cand.get("id"),
+                target_promo_name=best_cand.get("name"),
+                floor_violated=floor_violated,
+                freight_opt=freight_opt,
             ),
-            floor_price=floor_price,
-            current_total_pct=cur_total_pct,
-            current_seller_pct=best_started["_seller_pct"] if best_started else None,
-            current_meli_pct=best_started["_meli_pct"] if best_started else None,
-            current_price=best_started["_price"] if best_started else None,
-            current_promo_type=best_started.get("type") if best_started else None,
-            current_promo_id=best_started.get("id") if best_started else None,
-            target_total_pct=best_cand_total_pct,
-            target_seller_pct=best_cand_total_pct - meli,
-            target_meli_pct=meli,
-            target_price=target_price,
-            target_promo_type=best_cand.get("type"),
-            target_promo_id=best_cand.get("id"),
-            target_promo_name=best_cand.get("name"),
-            floor_violated=floor_violated,
-            freight_opt=freight_opt,
+            price_to_win_info,
         )
 
     # Keep current
     if best_started:
-        return Decision(
-            action="keep",
-            reason="já tem a melhor promo ativa dentro do cap (política: nunca derruba)",
-            floor_price=floor_price,
-            current_total_pct=cur_total_pct,
-            current_seller_pct=best_started["_seller_pct"],
-            current_meli_pct=best_started["_meli_pct"],
-            current_price=best_started["_price"],
-            current_promo_type=best_started.get("type"),
-            current_promo_id=best_started.get("id"),
-            floor_violated=floor_violated,
+        return _annotate_catalog(
+            Decision(
+                action="keep",
+                reason="já tem a melhor promo ativa dentro do cap (política: nunca derruba)",
+                floor_price=floor_price,
+                current_total_pct=cur_total_pct,
+                current_seller_pct=best_started["_seller_pct"],
+                current_meli_pct=best_started["_meli_pct"],
+                current_price=best_started["_price"],
+                current_promo_type=best_started.get("type"),
+                current_promo_id=best_started.get("id"),
+                floor_violated=floor_violated,
+            ),
+            price_to_win_info,
         )
 
     # Fallback: PRICE_DISCOUNT respecting floor
@@ -289,19 +357,24 @@ def decide_for_item(
                 target_price = opt.to_price
                 freight_opt = opt
                 actual_pct = _compute_pct(orig_price, target_price) or actual_pct
-        return Decision(
-            action="create_price_discount",
-            reason=f"sem promo ativa; criar PRICE_DISCOUNT -{actual_pct:.1f}% (piso: R$ {floor_price})",
-            floor_price=floor_price,
-            target_total_pct=actual_pct,
-            target_seller_pct=actual_pct,
-            target_meli_pct=0,
-            target_price=target_price,
-            target_promo_type="PRICE_DISCOUNT",
-            freight_opt=freight_opt,
+        return _annotate_catalog(
+            Decision(
+                action="create_price_discount",
+                reason=f"sem promo ativa; criar PRICE_DISCOUNT -{actual_pct:.1f}% (piso: R$ {floor_price})",
+                floor_price=floor_price,
+                target_total_pct=actual_pct,
+                target_seller_pct=actual_pct,
+                target_meli_pct=0,
+                target_price=target_price,
+                target_promo_type="PRICE_DISCOUNT",
+                freight_opt=freight_opt,
+            ),
+            price_to_win_info,
         )
 
-    return Decision(action="skip", reason="sem cap configurado")
+    return _annotate_catalog(
+        Decision(action="skip", reason="sem cap configurado"), price_to_win_info
+    )
 
 
 # ===========================================================================
@@ -344,6 +417,44 @@ class MLPromotionService:
             return []
         body = resp.json()
         return body if isinstance(body, list) else []
+
+    # -- Price-to-win (catalog buy-box info from ML) ----------------------
+    async def fetch_price_to_win(self, mlb_id: str) -> dict[str, Any] | None:
+        """Pull catalog-listing competitive info for an MLB.
+
+        Returns the raw ML payload from ``/items/{MLB}/price_to_win``:
+            { item_id, current_price, price_to_win, status,
+              visit_share, winner: {item_id, price}, catalog_product_id, ... }
+
+        Returns None on HTTP error, on non-catalog items (404), or on
+        token failure. The decision engine treats absent info as "no signal"
+        and falls back to the cap-only policy.
+        """
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/items/{mlb_id}/price_to_win"
+        try:
+            resp = await self._http.get(
+                url, headers={"Authorization": f"Bearer {token}"}, timeout=15.0
+            )
+            if resp.status_code == 401:
+                token = await self._token_service.handle_unauthorized()
+                resp = await self._http.get(
+                    url, headers={"Authorization": f"Bearer {token}"}, timeout=15.0
+                )
+            if resp.status_code >= 400:
+                # 404 here is normal for non-catalog items; only log other errors.
+                if resp.status_code != 404:
+                    logger.debug(
+                        "price_to_win_fetch_non_2xx",
+                        mlb_id=mlb_id,
+                        status=resp.status_code,
+                    )
+                return None
+            body = resp.json()
+            return body if isinstance(body, dict) else None
+        except (httpx.RequestError, json.JSONDecodeError) as e:
+            logger.warning("price_to_win_fetch_failed", mlb_id=mlb_id, error=str(e))
+            return None
 
     # -- GAS costs --------------------------------------------------------
     async def fetch_gas_costs(self, mlb_id: str) -> dict[str, Any] | None:
@@ -590,6 +701,10 @@ class MLPromotionService:
             promos = await self.fetch_eligible_promos(mlb_id)
             snap = await snap_repo.get(mlb_id)
             costs = _snapshot_to_costs(snap) if snap else None
+            # Catalog buy-box info. None when item is not in a catalog
+            # listing (no competition) — the engine then falls back to
+            # the cap-only policy.
+            price_to_win_info = await self.fetch_price_to_win(mlb_id)
             decision = decide_for_item(
                 promos=promos,
                 costs=costs,
@@ -599,6 +714,7 @@ class MLPromotionService:
                 else None,
                 freight_band_opt_enabled=cap.freight_band_opt,
                 excluded_types=cap.excluded_promo_types or (),
+                price_to_win_info=price_to_win_info,
             )
             results.append({"mlb_id": mlb_id, "decision": decision})
         return results

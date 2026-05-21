@@ -615,11 +615,15 @@ async def analyze_all(
     started_at = _time.monotonic()
     action_counts: dict[str, int] = {}
     promo_type_counts: dict[str, int] = {}
+    catalog_status_counts: dict[str, int] = {}
+    visit_share_counts: dict[str, int] = {}
     skus_with_results = 0
     mlbs_evaluated = 0
     activate_examples: list[dict[str, Any]] = []
     create_examples: list[dict[str, Any]] = []
+    still_losing_examples: list[dict[str, Any]] = []
     keep_with_violation = 0
+    still_losing_count = 0
     skus_with_zero_cap = 0
     errors: list[dict[str, Any]] = []
 
@@ -668,6 +672,26 @@ async def analyze_all(
                 )
             if dec.action == "keep" and dec.floor_violated:
                 keep_with_violation += 1
+            # Catalog-aware stats
+            if dec.catalog_status:
+                catalog_status_counts[dec.catalog_status] = (
+                    catalog_status_counts.get(dec.catalog_status, 0) + 1
+                )
+            if dec.visit_share:
+                visit_share_counts[dec.visit_share] = visit_share_counts.get(dec.visit_share, 0) + 1
+            if dec.still_losing:
+                still_losing_count += 1
+                if len(still_losing_examples) < 5:
+                    still_losing_examples.append(
+                        {
+                            "sku": cap.sku,
+                            "mlb_id": r["mlb_id"],
+                            "our_price": dec.target_price or dec.current_price,
+                            "price_to_win": dec.price_to_win,
+                            "floor_price": dec.floor_price,
+                            "reason": dec.reason,
+                        }
+                    )
 
     elapsed = _time.monotonic() - started_at
     would_activate = action_counts.get("activate_candidate", 0) + action_counts.get(
@@ -684,10 +708,14 @@ async def analyze_all(
         "would_activate_total": would_activate,
         "action_counts": action_counts,
         "promo_type_counts_when_acting": promo_type_counts,
+        "catalog_status_counts": catalog_status_counts,
+        "visit_share_counts": visit_share_counts,
+        "still_losing_count": still_losing_count,
         "keep_with_floor_violation": keep_with_violation,
         "errors": errors,
         "activate_examples": activate_examples,
         "create_examples": create_examples,
+        "still_losing_examples": still_losing_examples,
     }
 
 

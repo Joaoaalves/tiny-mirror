@@ -77,6 +77,7 @@ async def test_analyze_sku_dry_does_not_touch_actions_or_alerts() -> None:
             "fetch_gas_costs",
             new=AsyncMock(side_effect=AssertionError("GAS must not be called in dry path")),
         ),
+        patch.object(MLPromotionService, "fetch_price_to_win", new=AsyncMock(return_value=None)),
     ):
         cap_repo_cls.return_value.get = AsyncMock(return_value=cap)
         list_repo_cls.return_value.get_active_mlb_ids_for_sku = AsyncMock(return_value=["MLB1"])
