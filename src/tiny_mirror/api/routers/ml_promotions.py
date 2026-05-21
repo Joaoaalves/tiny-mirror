@@ -552,14 +552,23 @@ async def recompute_caps(
             "Web App (single HTTP call) before recomputing"
         ),
     ),
+    use_active_promos: bool = Query(
+        default=True,
+        description=(
+            "when true (default), fetch each MLB's live promos from ML and "
+            "anchor the cap to any STARTED promo. When false, only the "
+            "fallback sheet+10% margin logic runs (no ML API calls)."
+        ),
+    ),
     request: Request = None,  # type: ignore[assignment]
     session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, Any]:
-    """Recompute every ``ml_promo_caps`` row from ``ml_costs_snapshot``,
-    targeting a 10% minimum margin and clipping at 30% absolute. With
-    ``refresh_costs_first=true`` the bulk GAS endpoint is called once
-    to refresh all snapshots first (≈ 30s, vs. ~30 min for the legacy
-    per-MLB loop).
+    """Recompute every ``ml_promo_caps`` row using each MLB's CURRENT
+    STARTED promo as the baseline. Falls back to ``sheet_discount_pct``
+    (or ``DEFAULT_CAP_PCT=30``) clipped by ``MIN_MARGIN_PCT=10`` when an
+    MLB has no live promo. With ``refresh_costs_first=true`` the bulk
+    GAS endpoint is called once to refresh all snapshots first.
     """
     from tiny_mirror.config import settings
     from tiny_mirror.services.cap_recompute_service import recompute_all_caps
@@ -588,7 +597,7 @@ async def recompute_caps(
         except CostRefreshError as exc:
             raise HTTPException(status_code=502, detail=f"GAS bulk refresh failed: {exc}") from exc
 
-    stats = await recompute_all_caps(session)
+    stats = await recompute_all_caps(session, service=service if use_active_promos else None)
     if refresh_stats is not None:
         stats = {"refresh": refresh_stats, **stats}
     return stats

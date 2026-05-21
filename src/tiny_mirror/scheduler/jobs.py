@@ -166,7 +166,7 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
     http_client = getattr(app.state, "http_client", None)
 
     async def _ml_promo_recompute() -> None:
-        await ml_promo_recompute_job(http_client)
+        await ml_promo_recompute_job(http_client, app.state.ml_token_service)
 
     async def _ml_catalog_status_sync() -> None:
         await ml_catalog_status_sync_job(http_client, app.state.ml_token_service)
@@ -659,7 +659,7 @@ async def manual_status_sync_job() -> None:
             logger.error("Manual status sync job failed", error=str(exc))
 
 
-async def ml_promo_recompute_job(http_client: Any) -> None:
+async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any = None) -> None:
     """Daily: pull the full ml_costs_snapshot from the GAS bulk endpoint
     (one HTTP call instead of N), then recompute ml_promo_caps targeting
     10% margin / 30% absolute cap.
@@ -676,6 +676,7 @@ async def ml_promo_recompute_job(http_client: Any) -> None:
         refresh_all_from_bulk,
     )
     from tiny_mirror.services.gas_client import GASClient
+    from tiny_mirror.services.ml_promotion_service import MLPromotionService
 
     logger.info("ML promo recompute job started")
     gas = GASClient(
@@ -684,13 +685,20 @@ async def ml_promo_recompute_job(http_client: Any) -> None:
         token=settings.gas_token,
         timeout_seconds=settings.gas_http_timeout_seconds,
     )
+    promo_service = (
+        MLPromotionService(token_service=ml_token_service, http_client=http_client)
+        if ml_token_service is not None
+        else None
+    )
     async with AsyncSessionLocal() as session:
         try:
             refresh_stats = await refresh_all_from_bulk(session, gas)
         except CostRefreshError as exc:
             logger.error("ML promo recompute aborted: cost refresh failed", error=str(exc))
             return
-        cap_stats = await recompute_all_caps(session, actor="scheduler-daily")
+        cap_stats = await recompute_all_caps(
+            session, service=promo_service, actor="scheduler-daily"
+        )
         logger.info(
             "ML promo recompute job completed",
             **refresh_stats,
