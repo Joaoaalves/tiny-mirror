@@ -17,8 +17,8 @@ from tiny_mirror.services.cap_recompute_service import (
     DEFAULT_CAP_PCT,
     MIN_MARGIN_PCT,
     CapCalculation,
+    _baseline_from_active_promos,
     _consolidate_sku,
-    _pick_best_started_promo,
     calc_cap_for_snapshot,
     calc_cap_from_active_promo,
 )
@@ -67,6 +67,14 @@ SLF_KITBAN_BANDS = [
 # ---------------------------------------------------------------------------
 # calc_cap_from_active_promo — baseline is the live STARTED promo
 # ---------------------------------------------------------------------------
+def _baseline(promos: list[dict[str, Any]]) -> dict[str, Any]:
+    """Convenience wrapper that returns the synthesised baseline; asserts
+    that the test data does include at least one STARTED promo."""
+    b = _baseline_from_active_promos(promos)
+    assert b is not None, "fixture should produce a baseline"
+    return b
+
+
 def test_active_promo_anchors_cap_to_seller_pct() -> None:
     """If the operator runs a 25% PRICE_DISCOUNT today, the cap MUST be 25%
     (or higher), never lower — otherwise the live promo would violate the
@@ -80,14 +88,18 @@ def test_active_promo_anchors_cap_to_seller_pct() -> None:
         freight_bands=BUB_PATIN_BANDS,
         sheet_discount_pct=Decimal("30"),
     )
-    active = {
-        "type": "PRICE_DISCOUNT",
-        "status": "started",
-        "original_price": 57.0,
-        "price": 42.75,  # 25% off
-        "meli_percentage": 0,
-    }
-    calc = calc_cap_from_active_promo(snap, active)  # type: ignore[arg-type]
+    baseline = _baseline(
+        [
+            {
+                "type": "PRICE_DISCOUNT",
+                "status": "started",
+                "original_price": 57.0,
+                "price": 42.75,
+                "meli_percentage": 0,
+            }
+        ]
+    )
+    calc = calc_cap_from_active_promo(snap, baseline)  # type: ignore[arg-type]
     assert not calc.skipped
     assert calc.cap_pct == Decimal("25.00")
     assert calc.floor_price == Decimal("42.75")
@@ -106,14 +118,18 @@ def test_active_promo_subtracts_meli_share_from_cap() -> None:
         list_price=Decimal("100.00"),
         freight_bands=BUB_PATIN_BANDS,
     )
-    active = {
-        "type": "DEAL",
-        "status": "started",
-        "original_price": 100.0,
-        "price": 70.0,
-        "meli_percentage": 10,  # 10% banca
-    }
-    calc = calc_cap_from_active_promo(snap, active)  # type: ignore[arg-type]
+    baseline = _baseline(
+        [
+            {
+                "type": "DEAL",
+                "status": "started",
+                "original_price": 100.0,
+                "price": 70.0,
+                "meli_percentage": 10,
+            }
+        ]
+    )
+    calc = calc_cap_from_active_promo(snap, baseline)  # type: ignore[arg-type]
     assert calc.cap_pct == Decimal("20.00")
     assert calc.floor_price == Decimal("70.00")
 
@@ -126,22 +142,112 @@ def test_active_promo_floor_eq_promo_price_means_no_alert() -> None:
         sku="X-SKU",
         base_cost=Decimal("40"),
         commission_pct=Decimal("16.5"),
-        list_price=Decimal("55"),  # tight margin
+        list_price=Decimal("55"),
         freight_bands=SLF_KITBAN_BANDS,
         sheet_discount_pct=Decimal("30"),
     )
-    active = {
-        "type": "PRICE_DISCOUNT",
-        "status": "started",
-        "original_price": 55.0,
-        "price": 49.5,  # 10% off — would alert under old margin-10% rule
-        "meli_percentage": 0,
-    }
-    calc = calc_cap_from_active_promo(snap, active)  # type: ignore[arg-type]
-    # Accept reality: cap = 10, floor = 49.5, even if margin is tight.
+    baseline = _baseline(
+        [
+            {
+                "type": "PRICE_DISCOUNT",
+                "status": "started",
+                "original_price": 55.0,
+                "price": 49.5,
+                "meli_percentage": 0,
+            }
+        ]
+    )
+    calc = calc_cap_from_active_promo(snap, baseline)  # type: ignore[arg-type]
     assert calc.cap_pct == Decimal("10.00")
     assert calc.floor_price == Decimal("49.50")
-    # `49.5 < 49.5` is False → no floor violation. Mission accomplished.
+
+
+def test_baseline_cap_and_floor_can_come_from_different_promos() -> None:
+    """The crucial invariant: when two STARTED promos co-exist with
+    different meli_percentages, the cap is max(seller_pct) and the floor
+    is min(price) — and they may come from *different* promos. This
+    matches the engine's floor_violated check, which uses the
+    highest-total% (= lowest-price) STARTED promo."""
+    snap = FakeSnap(
+        mlb_id="MLB-MIX",
+        sku="MIX-SKU",
+        base_cost=Decimal("20"),
+        commission_pct=Decimal("11.5"),
+        list_price=Decimal("100"),
+        freight_bands=BUB_PATIN_BANDS,
+    )
+    baseline = _baseline(
+        [
+            # Higher seller share, higher price (no meli banca).
+            {
+                "type": "PRICE_DISCOUNT",
+                "status": "started",
+                "original_price": 100.0,
+                "price": 70.0,
+                "meli_percentage": 0,
+            },
+            # Lower seller share but ALSO LOWER price thanks to meli banca.
+            {
+                "type": "DEAL",
+                "status": "started",
+                "original_price": 100.0,
+                "price": 60.0,
+                "meli_percentage": 15,
+            },
+        ]
+    )
+    calc = calc_cap_from_active_promo(snap, baseline)  # type: ignore[arg-type]
+    # Cap = max seller pct = 30 (from PRICE_DISCOUNT).
+    assert calc.cap_pct == Decimal("30.00")
+    # Floor = min price = 60 (from DEAL).
+    assert calc.floor_price == Decimal("60.00")
+    # The reason MUST highlight the composite origin so the operator sees it.
+    assert "composto" in calc.reason
+
+
+def test_baseline_returns_none_when_no_started_promo() -> None:
+    """Only CANDIDATE promos? Then there is no baseline and the orchestrator
+    must fall back to the sheet/30% + 10% margin path."""
+    assert (
+        _baseline_from_active_promos(
+            [
+                {
+                    "type": "DEAL",
+                    "status": "candidate",
+                    "original_price": 100,
+                    "price": 50,
+                    "meli_percentage": 0,
+                }
+            ]
+        )
+        is None
+    )
+
+
+def test_baseline_ignores_promos_with_zero_price() -> None:
+    """Malformed promos with original=0 or price=0 must not crash the
+    division — they are simply dropped from the baseline pool."""
+    b = _baseline_from_active_promos(
+        [
+            {
+                "type": "DEAL",
+                "status": "started",
+                "original_price": 0,
+                "price": 50,
+                "meli_percentage": 0,
+            },
+            {
+                "type": "PRICE_DISCOUNT",
+                "status": "started",
+                "original_price": 100,
+                "price": 80,
+                "meli_percentage": 0,
+            },
+        ]
+    )
+    assert b is not None
+    assert b["type_of_max_seller"] == "PRICE_DISCOUNT"
+    assert b["n_started"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -249,76 +355,6 @@ def test_fallback_skips_when_fetch_error_set() -> None:
     calc = calc_cap_for_snapshot(snap)  # type: ignore[arg-type]
     assert calc.skipped
     assert "fetch_error" in calc.reason
-
-
-# ---------------------------------------------------------------------------
-# _pick_best_started_promo — pick the most aggressive STARTED promo
-# ---------------------------------------------------------------------------
-def test_pick_best_started_returns_largest_seller_pct() -> None:
-    promos = [
-        {
-            "status": "candidate",
-            "type": "DEAL",
-            "original_price": 100,
-            "price": 50,
-            "meli_percentage": 0,
-        },
-        {
-            "status": "started",
-            "type": "PRICE_DISCOUNT",
-            "original_price": 100,
-            "price": 80,
-            "meli_percentage": 0,
-        },
-        {
-            "status": "started",
-            "type": "DEAL",
-            "original_price": 100,
-            "price": 60,
-            "meli_percentage": 10,
-        },
-    ]
-    best = _pick_best_started_promo(promos)
-    assert best is not None
-    # Total -40% with -10% meli = -30% seller (DEAL)
-    # vs total -20% with 0% meli = -20% seller (PRICE_DISCOUNT)
-    # DEAL wins (more aggressive seller share).
-    assert best["type"] == "DEAL"
-
-
-def test_pick_best_started_returns_none_when_only_candidates() -> None:
-    promos = [
-        {
-            "status": "candidate",
-            "type": "DEAL",
-            "original_price": 100,
-            "price": 50,
-            "meli_percentage": 0,
-        },
-    ]
-    assert _pick_best_started_promo(promos) is None
-
-
-def test_pick_best_started_ignores_promos_with_zero_price() -> None:
-    promos = [
-        {
-            "status": "started",
-            "type": "DEAL",
-            "original_price": 0,
-            "price": 50,
-            "meli_percentage": 0,
-        },
-        {
-            "status": "started",
-            "type": "PRICE_DISCOUNT",
-            "original_price": 100,
-            "price": 80,
-            "meli_percentage": 0,
-        },
-    ]
-    best = _pick_best_started_promo(promos)
-    assert best is not None
-    assert best["type"] == "PRICE_DISCOUNT"
 
 
 # ---------------------------------------------------------------------------

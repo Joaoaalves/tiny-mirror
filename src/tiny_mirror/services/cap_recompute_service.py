@@ -84,16 +84,27 @@ class CapCalculation:
     source: str = "fallback"
 
 
-def _pick_best_started_promo(promos: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Return the STARTED promo with the largest seller share.
+def _baseline_from_active_promos(
+    promos: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Synthesise a per-MLB baseline from every STARTED promo.
 
-    "seller share" = ``original_price - price`` minus the ML share
-    (``meli_percentage``). That matches how ``cap_seller_pct`` is
-    interpreted elsewhere — the cap is on the seller's contribution,
-    not the total visible discount.
+    The cap is on **seller** share and the floor is on **price**, and those
+    two constraints can be set by *different* STARTED promos when ML's
+    ``meli_percentage`` (banca) varies across them. Compute each side
+    independently so neither constraint is violated:
+
+      - ``max_seller_pct`` — the cap (max across STARTED).
+      - ``min_price`` — the floor in BRL (min across STARTED).
+
+    The engine's ``floor_violated`` check picks ``best_started`` by total%
+    (which corresponds to the lowest price on a given MLB). Setting floor
+    to that exact price makes ``price < floor`` strictly false on today's
+    state regardless of how many STARTED promos co-exist.
+
+    Returns ``None`` when no usable STARTED promo exists.
     """
-    best: dict[str, Any] | None = None
-    best_seller_pct = Decimal("-1")
+    parsed: list[dict[str, Any]] = []
     for p in promos:
         if (p.get("status") or "").lower() != "started":
             continue
@@ -101,39 +112,53 @@ def _pick_best_started_promo(promos: list[dict[str, Any]]) -> dict[str, Any] | N
         price = p.get("price") or 0
         if not original or not price or original <= 0:
             continue
-        total_pct = (
-            (Decimal(str(original)) - Decimal(str(price))) / Decimal(str(original)) * Decimal(100)
-        )
+        orig_dec = Decimal(str(original))
+        price_dec = Decimal(str(price))
+        total_pct = (orig_dec - price_dec) / orig_dec * Decimal(100)
         meli_pct = Decimal(str(p.get("meli_percentage") or 0))
         seller_pct = total_pct - meli_pct
-        if seller_pct > best_seller_pct:
-            best_seller_pct = seller_pct
-            best = p
-    return best
+        parsed.append(
+            {
+                "promo": p,
+                "price": price_dec,
+                "original": orig_dec,
+                "seller_pct": seller_pct,
+                "total_pct": total_pct,
+            }
+        )
+    if not parsed:
+        return None
+
+    max_seller = max(parsed, key=lambda x: x["seller_pct"])
+    min_price = min(parsed, key=lambda x: x["price"])
+    return {
+        "max_seller_pct": max_seller["seller_pct"],
+        "min_price": min_price["price"],
+        "original_price": max_seller["original"],
+        "type_of_max_seller": max_seller["promo"].get("type"),
+        "type_of_min_price": min_price["promo"].get("type"),
+        "n_started": len(parsed),
+    }
 
 
 def calc_cap_from_active_promo(
     snap: MLCostsSnapshotORM,
-    active_promo: dict[str, Any],
+    baseline: dict[str, Any],
 ) -> CapCalculation:
-    """Anchor cap + floor to a live STARTED promo.
+    """Anchor cap + floor to live STARTED promos on this MLB.
 
-    Invariant: the engine evaluates ``floor_violated`` as
-    ``best_started["_price"] < floor_price``. By setting
-    ``floor_price`` to exactly that promo's price, every less-aggressive
-    sibling promo and the promo itself satisfy ``price >= floor``,
-    so no alert fires on today's state.
+    ``baseline`` is the dict returned by ``_baseline_from_active_promos``.
+    By using ``min_price`` as the floor (independent of which promo sets the
+    cap), the engine's check ``best_started["_price"] < floor_price`` is
+    strictly false for every STARTED promo on this MLB.
     """
-    original = Decimal(str(active_promo.get("original_price") or 0))
-    price = Decimal(str(active_promo.get("price") or 0))
-    meli_pct = Decimal(str(active_promo.get("meli_percentage") or 0))
-    promo_type = str(active_promo.get("type") or "?")
-
-    total_pct = ((original - price) / original * Decimal(100)).quantize(Decimal("0.01"))
-    seller_pct = (total_pct - meli_pct).quantize(Decimal("0.01"))
+    original = baseline["original_price"]
+    floor_price = baseline["min_price"].quantize(Decimal("0.01"))
+    seller_pct = baseline["max_seller_pct"].quantize(Decimal("0.01"))
     if seller_pct < Decimal(0):
         seller_pct = Decimal(0)
-    floor_price = price.quantize(Decimal("0.01"))
+    cap_type = baseline["type_of_max_seller"]
+    floor_type = baseline["type_of_min_price"]
 
     margin_at_floor: Decimal | None = None
     if snap.base_cost is not None and snap.commission_pct is not None and snap.freight_bands:
@@ -149,10 +174,16 @@ def calc_cap_from_active_promo(
             margin_at_floor = None
 
     margin_note = f" margem {margin_at_floor}%" if margin_at_floor is not None else ""
-    reason = (
-        f"baseline da promo ativa {promo_type} -{seller_pct}% seller "
-        f"(piso R$ {floor_price}{margin_note})"
-    )
+    if cap_type == floor_type:
+        reason = (
+            f"baseline da promo ativa {cap_type} -{seller_pct}% seller "
+            f"(piso R$ {floor_price}{margin_note})"
+        )
+    else:
+        reason = (
+            f"baseline composto: cap {seller_pct}% (de {cap_type}) "
+            f"+ piso R$ {floor_price} (de {floor_type}){margin_note}"
+        )
 
     return CapCalculation(
         mlb_id=snap.mlb_id,
@@ -345,21 +376,21 @@ def _consolidate_sku(rows: list[CapCalculation]) -> CapCalculation:
 _conservative_pick = _consolidate_sku
 
 
-async def _fetch_active_promo_for_mlb(
+async def _fetch_active_baseline_for_mlb(
     service: MLPromotionService, mlb_id: str
 ) -> dict[str, Any] | None:
-    """Wrap ML promo fetch + best-STARTED selection in one call.
+    """Wrap ML promo fetch + STARTED-baseline synthesis in one call.
 
-    Returns None on network failure / no STARTED promo. Errors are
-    swallowed (logged at debug) so a single flaky MLB doesn't abort
-    the whole recompute.
+    Returns ``None`` on network failure or when no STARTED promo exists.
+    Errors are swallowed (logged at debug) so a single flaky MLB doesn't
+    abort the whole recompute.
     """
     try:
         promos = await service.fetch_eligible_promos(mlb_id)
     except Exception as exc:  # pragma: no cover — network noise
         logger.debug("recompute_promo_fetch_failed", mlb_id=mlb_id, error=str(exc))
         return None
-    return _pick_best_started_promo(promos)
+    return _baseline_from_active_promos(promos)
 
 
 async def recompute_all_caps(
@@ -406,14 +437,14 @@ async def recompute_all_caps(
     for sku, snaps in sorted(by_sku.items()):
         per_mlb_calcs: list[CapCalculation] = []
         for snap in snaps:
-            active_promo: dict[str, Any] | None = None
+            baseline: dict[str, Any] | None = None
             if service is not None and not snap.fetch_error:
-                active_promo = await _fetch_active_promo_for_mlb(service, snap.mlb_id)
+                baseline = await _fetch_active_baseline_for_mlb(service, snap.mlb_id)
                 stats["mlbs_fetched_promos"] += 1
-                if active_promo is not None:
+                if baseline is not None:
                     stats["mlbs_with_active_promo"] += 1
-            if active_promo is not None:
-                per_mlb_calcs.append(calc_cap_from_active_promo(snap, active_promo))
+            if baseline is not None:
+                per_mlb_calcs.append(calc_cap_from_active_promo(snap, baseline))
             else:
                 per_mlb_calcs.append(calc_cap_for_snapshot(snap))
 
