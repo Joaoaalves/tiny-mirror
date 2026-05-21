@@ -776,6 +776,149 @@ class MLPromotionService:
         return results
 
 
+def enumerate_activations_for_item(
+    *,
+    promos: list[dict[str, Any]],
+    cap_seller_pct: float,
+    margin_floor_price: float | None,
+    list_price: float | None,
+    excluded_types: Iterable[str] = (),
+) -> list[dict[str, Any]]:
+    """Return every promo the engine would *try to activate* under the
+    "activate everything that fits" policy (2026-05-21).
+
+    The same eligibility rules as ``count_eligible_candidates`` apply, but
+    instead of a count this returns one dict per candidate so the caller
+    can render them, persist plans, or call ML's activate endpoint per
+    promotion. STARTED promos are returned with ``status='already_active'``
+    so the caller sees the full coverage on the MLB at a glance.
+
+    Each entry carries:
+      - promo_id, promo_type, promo_name
+      - status: "would_activate" | "already_active"
+      - target_price: BRL the customer would pay if activated
+      - target_total_pct: total discount (seller + meli)
+      - target_seller_pct: seller share only
+      - meli_percentage: ML's banca co-pay
+      - constraint: which rule pinned the price (fixed_percentage /
+        min_discounted_price / suggested_discounted_price)
+      - reason: one-line human label.
+    """
+    if not promos or list_price is None or list_price <= 0:
+        return []
+    excluded = set(excluded_types)
+    floor = margin_floor_price or 0.0
+    out: list[dict[str, Any]] = []
+    for p in promos:
+        if p.get("type") in excluded:
+            continue
+        status = (p.get("status") or "").lower()
+        meli_pct = float(p.get("meli_percentage") or 0)
+        cap_total = cap_seller_pct + meli_pct
+
+        # STARTED promos: report as already-active for the operator audit.
+        if status == "started":
+            original = float(p.get("original_price") or list_price)
+            price = float(p.get("price") or 0)
+            total_pct = (original - price) / original * 100 if original > 0 and price > 0 else None
+            out.append(
+                {
+                    "promo_id": p.get("id"),
+                    "promo_type": p.get("type"),
+                    "promo_name": p.get("name"),
+                    "status": "already_active",
+                    "target_price": price or None,
+                    "target_total_pct": total_pct,
+                    "target_seller_pct": (total_pct - meli_pct) if total_pct is not None else None,
+                    "meli_percentage": meli_pct,
+                    "constraint": "started",
+                    "reason": f"{p.get('type')} já STARTED -{total_pct:.1f}%"
+                    if total_pct
+                    else "STARTED",
+                }
+            )
+            continue
+
+        if status != "candidate":
+            continue
+
+        # Candidate eligibility: same three constraint paths as the counter.
+        fixed = p.get("fixed_percentage")
+        if fixed is not None:
+            fixed_f = float(fixed)
+            if fixed_f > cap_total + 0.01:
+                continue
+            target = round(list_price * (1 - fixed_f / 100), 2)
+            if target + 0.01 < floor:
+                continue
+            out.append(
+                {
+                    "promo_id": p.get("id"),
+                    "promo_type": p.get("type"),
+                    "promo_name": p.get("name"),
+                    "status": "would_activate",
+                    "target_price": target,
+                    "target_total_pct": fixed_f,
+                    "target_seller_pct": fixed_f - meli_pct,
+                    "meli_percentage": meli_pct,
+                    "constraint": "fixed_percentage",
+                    "reason": f"fixed -{fixed_f}% @ R$ {target}",
+                }
+            )
+            continue
+
+        min_price = p.get("min_discounted_price")
+        if min_price is not None:
+            min_f = float(min_price)
+            if min_f + 0.01 < floor:
+                continue
+            # Activate at the cheapest allowed: max(min_price, floor); apply
+            # cap_total as the worst-case headroom so we never go below cap.
+            target_at_cap = round(list_price * (1 - cap_total / 100), 2)
+            target = max(min_f, floor, target_at_cap)
+            target = round(target, 2)
+            total_pct = round((list_price - target) / list_price * 100, 2)
+            out.append(
+                {
+                    "promo_id": p.get("id"),
+                    "promo_type": p.get("type"),
+                    "promo_name": p.get("name"),
+                    "status": "would_activate",
+                    "target_price": target,
+                    "target_total_pct": total_pct,
+                    "target_seller_pct": total_pct - meli_pct,
+                    "meli_percentage": meli_pct,
+                    "constraint": "min_discounted_price",
+                    "reason": f"min_price R$ {min_f} → R$ {target} (-{total_pct}%)",
+                }
+            )
+            continue
+
+        sugg = p.get("suggested_discounted_price")
+        if sugg is not None:
+            sugg_f = float(sugg)
+            total_pct = round((list_price - sugg_f) / list_price * 100, 2)
+            if total_pct > cap_total + 0.01:
+                continue
+            if sugg_f + 0.01 < floor:
+                continue
+            out.append(
+                {
+                    "promo_id": p.get("id"),
+                    "promo_type": p.get("type"),
+                    "promo_name": p.get("name"),
+                    "status": "would_activate",
+                    "target_price": sugg_f,
+                    "target_total_pct": total_pct,
+                    "target_seller_pct": total_pct - meli_pct,
+                    "meli_percentage": meli_pct,
+                    "constraint": "suggested_discounted_price",
+                    "reason": f"suggested -{total_pct}% @ R$ {sugg_f}",
+                }
+            )
+    return out
+
+
 def count_eligible_candidates(
     *,
     promos: list[dict[str, Any]],
