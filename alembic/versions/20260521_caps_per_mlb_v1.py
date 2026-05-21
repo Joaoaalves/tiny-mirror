@@ -55,7 +55,23 @@ def upgrade() -> None:
 
     # 3) Drop the old PK + clear the table. We rebuild it from the expanded set;
     #    any cap without an active listing is dropped on the floor.
-    op.execute("ALTER TABLE ml_promo_caps DROP CONSTRAINT ml_promo_caps_pkey")
+    # The PK constraint name varies by SQLAlchemy naming convention
+    # (`pk_ml_promo_caps` here, `ml_promo_caps_pkey` elsewhere), so look
+    # it up at runtime instead of hard-coding.
+    op.execute(
+        """
+        DO $$
+        DECLARE pk_name text;
+        BEGIN
+          SELECT conname INTO pk_name
+          FROM pg_constraint
+          WHERE conrelid = 'ml_promo_caps'::regclass AND contype = 'p';
+          IF pk_name IS NOT NULL THEN
+            EXECUTE 'ALTER TABLE ml_promo_caps DROP CONSTRAINT ' || quote_ident(pk_name);
+          END IF;
+        END $$;
+        """
+    )
     op.execute("DELETE FROM ml_promo_caps")
 
     op.execute(
@@ -76,7 +92,7 @@ def upgrade() -> None:
 
     # 4) Lock the new shape in: mlb_id is the PK, sku stays NOT NULL and indexed.
     op.alter_column("ml_promo_caps", "mlb_id", nullable=False)
-    op.create_primary_key("ml_promo_caps_pkey", "ml_promo_caps", ["mlb_id"])
+    op.create_primary_key("pk_ml_promo_caps", "ml_promo_caps", ["mlb_id"])
     op.create_index("ix_ml_promo_caps_sku", "ml_promo_caps", ["sku"])
 
 
@@ -104,7 +120,20 @@ def downgrade() -> None:
     )
 
     op.drop_index("ix_ml_promo_caps_sku", table_name="ml_promo_caps")
-    op.execute("ALTER TABLE ml_promo_caps DROP CONSTRAINT ml_promo_caps_pkey")
+    op.execute(
+        """
+        DO $$
+        DECLARE pk_name text;
+        BEGIN
+          SELECT conname INTO pk_name
+          FROM pg_constraint
+          WHERE conrelid = 'ml_promo_caps'::regclass AND contype = 'p';
+          IF pk_name IS NOT NULL THEN
+            EXECUTE 'ALTER TABLE ml_promo_caps DROP CONSTRAINT ' || quote_ident(pk_name);
+          END IF;
+        END $$;
+        """
+    )
     op.execute("DELETE FROM ml_promo_caps")
     op.drop_column("ml_promo_caps", "mlb_id")
 
@@ -123,4 +152,4 @@ def downgrade() -> None:
         """
     )
     op.execute("DROP TABLE _caps_collapsed")
-    op.create_primary_key("ml_promo_caps_pkey", "ml_promo_caps", ["sku"])
+    op.create_primary_key("pk_ml_promo_caps", "ml_promo_caps", ["sku"])
