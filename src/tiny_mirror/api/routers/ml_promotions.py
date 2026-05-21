@@ -76,6 +76,15 @@ class CapOut(BaseModel):
     commission_pct: Decimal | None = None
     difal_pct: Decimal | None = None
     freight_bands: Any | None = None
+    # Joined from ml_catalog_status (worst-case MLB) so the dashboard can
+    # show the buy-box context without an extra round-trip.
+    catalog_listing: bool | None = None
+    catalog_status: str | None = None
+    visit_share: str | None = None
+    current_price: Decimal | None = None
+    price_to_win: Decimal | None = None
+    winner_price: Decimal | None = None
+    competitors_sharing_first_place: int | None = None
 
 
 class CostSnapshotOut(BaseModel):
@@ -224,6 +233,35 @@ async def _enrich_cap(
         return out
     out.margin_at_floor_value = breakdown.margin_value
     out.margin_at_floor_pct = breakdown.margin_pct
+
+    # Catalog context (buy-box). Pick the WORST-CASE MLB — competing /
+    # losing beats winning so the dashboard surfaces problems first.
+    from sqlalchemy import select
+
+    from tiny_mirror.infrastructure.orm.models import MLCatalogStatusORM
+
+    cat_rows = (
+        (await session.execute(select(MLCatalogStatusORM).where(MLCatalogStatusORM.sku == cap.sku)))
+        .scalars()
+        .all()
+    )
+    if cat_rows:
+        rank = {
+            "competing": 0,
+            "losing": 0,
+            "sharing_first_place": 1,
+            "winning": 2,
+            "not_listed": 3,
+            "unknown": 4,
+        }
+        cat = min(cat_rows, key=lambda r: rank.get(r.status or "unknown", 5))
+        out.catalog_listing = bool(cat.catalog_listing)
+        out.catalog_status = cat.status
+        out.visit_share = cat.visit_share
+        out.current_price = cat.current_price
+        out.price_to_win = cat.price_to_win
+        out.winner_price = cat.winner_price
+        out.competitors_sharing_first_place = cat.competitors_sharing_first_place
     return out
 
 
@@ -356,6 +394,34 @@ async def refresh_all_costs(
             await session.commit()
     await session.commit()
     return {"total": len(pairs), "ok": ok, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# CATALOG STATUS — refresh price_to_win / buy-box snapshot for every MLB
+# ---------------------------------------------------------------------------
+@router.post("/catalog-status/refresh-all")
+async def refresh_catalog_status_all(
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, int]:
+    """Iterate every active MLB and refresh `ml_catalog_status`.
+
+    Calls /items/{MLB}/price_to_win for each. Items returning 404 are
+    persisted with `catalog_listing=false` (so the engine knows they are
+    NOT in a catalog listing — different from "never fetched").
+
+    Heavy operation (~3-5 min depending on MLB count); the daily cron is
+    the normal trigger. Use this endpoint manually after rebuilding the
+    table or for testing.
+    """
+    from tiny_mirror.services.catalog_status_sync_service import CatalogStatusSyncService
+
+    sync = CatalogStatusSyncService(
+        token_service=service._token_service,
+        http_client=service._http,
+    )
+    stats = await sync.refresh_all(session)
+    return stats
 
 
 # ---------------------------------------------------------------------------

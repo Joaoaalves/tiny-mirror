@@ -1074,6 +1074,51 @@ class MLCostsSnapshotORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_catalog_status — buy-box / price_to_win snapshot per MLB
+# ---------------------------------------------------------------------------
+class MLCatalogStatusORM(Base):
+    __tablename__ = "ml_catalog_status"
+    __table_args__ = (
+        CheckConstraint(
+            "status IS NULL OR status IN "
+            "('winning', 'sharing_first_place', 'competing', 'losing', "
+            "'not_listed', 'unknown')",
+            name="valid_catalog_status",
+        ),
+        Index("ix_ml_catalog_status_sku", "sku"),
+        Index("ix_ml_catalog_status_status", "status"),
+        Index("ix_ml_catalog_status_catalog_listing", "catalog_listing"),
+        {
+            "comment": (
+                "Cached buy-box / price_to_win competitive data per MLB. "
+                "Refreshed daily by CatalogStatusSyncService from "
+                "GET /items/{MLB}/price_to_win. The promo decision engine "
+                "reads this table instead of calling ML live, so daily "
+                "analysis runs over the whole catalog in seconds."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    catalog_listing: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    catalog_product_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    visit_share: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    current_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    price_to_win: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    winner_item_id: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    winner_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    competitors_sharing_first_place: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    boosts: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_promo_actions
 # ---------------------------------------------------------------------------
 class MLPromoActionORM(Base):

@@ -136,16 +136,33 @@ def _freight_opt_check(
     return None
 
 
+# Statuses that mean "we are not on top of the catalog". still_losing
+# semantics apply across all of them — the engine respects the cap and
+# flags when the cap-limited price is above price_to_win.
+_LOSING_STATUSES = frozenset({"losing", "competing"})
+
+
 def _annotate_catalog(decision: Decision, ptw: dict[str, Any] | None) -> Decision:
-    """Attach catalog buy-box context to a Decision (read-only)."""
+    """Attach catalog buy-box context to a Decision (read-only).
+
+    ``still_losing`` fires when our (cap-respected) effective price is
+    higher than price_to_win and the catalog status is any of
+    ``losing`` / ``competing`` / ``sharing_first_place`` (when not on
+    maximum visit_share).
+    """
     if not ptw or not isinstance(ptw, dict):
         return decision
     decision.catalog_status = ptw.get("status")
     decision.visit_share = ptw.get("visit_share")
     raw_ptw = ptw.get("price_to_win")
     decision.price_to_win = float(raw_ptw) if raw_ptw is not None else None
-    # still_losing = engine output (target_price or current_price) > price_to_win
-    if decision.catalog_status == "losing" and decision.price_to_win is not None:
+
+    if decision.price_to_win is None:
+        return decision
+    losing_like = decision.catalog_status in _LOSING_STATUSES or (
+        decision.catalog_status == "sharing_first_place" and decision.visit_share != "maximum"
+    )
+    if losing_like:
         effective_price = decision.target_price or decision.current_price
         if effective_price is not None and effective_price > decision.price_to_win + 0.005:
             decision.still_losing = True
@@ -695,16 +712,30 @@ class MLPromotionService:
         if cap is None:
             return []
 
+        # Catalog status comes from the DB (refreshed daily by
+        # CatalogStatusSyncService). This keeps analyze_sku_dry fast and
+        # idempotent — every analysis pass over the whole catalog runs in
+        # seconds instead of minutes.
+        from sqlalchemy import select as _select
+
+        from tiny_mirror.infrastructure.orm.models import MLCatalogStatusORM
+
         mlb_ids = await listings.get_active_mlb_ids_for_sku(sku)
+        catalog_by_mlb: dict[str, MLCatalogStatusORM] = {}
+        if mlb_ids:
+            result = await session.execute(
+                _select(MLCatalogStatusORM).where(MLCatalogStatusORM.mlb_id.in_(mlb_ids))
+            )
+            for row in result.scalars().all():
+                catalog_by_mlb[row.mlb_id] = row
+
         results: list[dict[str, Any]] = []
         for mlb_id in mlb_ids:
             promos = await self.fetch_eligible_promos(mlb_id)
             snap = await snap_repo.get(mlb_id)
             costs = _snapshot_to_costs(snap) if snap else None
-            # Catalog buy-box info. None when item is not in a catalog
-            # listing (no competition) — the engine then falls back to
-            # the cap-only policy.
-            price_to_win_info = await self.fetch_price_to_win(mlb_id)
+            cat = catalog_by_mlb.get(mlb_id)
+            price_to_win_info = _catalog_row_to_ptw(cat) if cat else None
             decision = decide_for_item(
                 promos=promos,
                 costs=costs,
@@ -718,6 +749,22 @@ class MLPromotionService:
             )
             results.append({"mlb_id": mlb_id, "decision": decision})
         return results
+
+
+def _catalog_row_to_ptw(row: Any) -> dict[str, Any]:
+    """Turn an MLCatalogStatusORM row into the dict shape decide_for_item
+    expects from /items/{MLB}/price_to_win."""
+    return {
+        "status": row.status,
+        "visit_share": row.visit_share,
+        "price_to_win": float(row.price_to_win) if row.price_to_win is not None else None,
+        "current_price": float(row.current_price) if row.current_price is not None else None,
+        "winner": {
+            "item_id": row.winner_item_id,
+            "price": float(row.winner_price) if row.winner_price is not None else None,
+        },
+        "catalog_product_id": row.catalog_product_id,
+    }
 
 
 def _snapshot_to_costs(snap: Any) -> dict[str, Any]:

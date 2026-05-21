@@ -108,6 +108,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_promo_recompute": CronTrigger.from_crontab(
                 settings.sync_ml_promo_recompute_cron, timezone="UTC"
             ),
+            "ml_catalog_status_sync": CronTrigger.from_crontab(
+                settings.sync_ml_catalog_status_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -164,6 +167,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_promo_recompute() -> None:
         await ml_promo_recompute_job(http_client)
+
+    async def _ml_catalog_status_sync() -> None:
+        await ml_catalog_status_sync_job(http_client, app.state.ml_token_service)
 
     scheduler.add_job(
         _token_rotation,
@@ -241,6 +247,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _manual_status_sync,
         trigger=triggers["manual_status_sync"],
         id="manual_status_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_catalog_status_sync,
+        trigger=triggers["ml_catalog_status_sync"],
+        id="ml_catalog_status_sync",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -684,6 +696,26 @@ async def ml_promo_recompute_job(http_client: Any) -> None:
             **refresh_stats,
             **{k: v for k, v in cap_stats.items() if k != "examples"},
         )
+
+
+async def ml_catalog_status_sync_job(http_client: Any, ml_token_service: Any) -> None:
+    """Daily: refresh ``ml_catalog_status`` by calling
+    /items/{MLB}/price_to_win for every active MLB.
+
+    No-ops when ML credentials are not configured. Each per-MLB HTTP
+    failure is logged but does not abort the run (existing row is kept).
+    """
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML catalog status sync skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.services.catalog_status_sync_service import CatalogStatusSyncService
+
+    logger.info("ML catalog status sync job started")
+    service = CatalogStatusSyncService(token_service=ml_token_service, http_client=http_client)
+    async with AsyncSessionLocal() as session:
+        stats = await service.refresh_all(session)
+    logger.info("ML catalog status sync job completed", **stats)
 
 
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:

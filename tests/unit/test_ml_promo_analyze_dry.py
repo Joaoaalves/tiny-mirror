@@ -57,6 +57,11 @@ async def test_analyze_sku_dry_does_not_touch_actions_or_alerts() -> None:
     AlertRepo — that's the side-effect-free guarantee."""
     service = MLPromotionService(token_service=MagicMock(), http_client=MagicMock())
     session = MagicMock()
+    # session.execute returns a result whose .scalars().all() is []
+    # (analyze_sku_dry queries ml_catalog_status by mlb_id IN (...)).
+    _empty_result = MagicMock()
+    _empty_result.scalars.return_value.all.return_value = []
+    session.execute = AsyncMock(return_value=_empty_result)
 
     cap = _fake_cap()
     snap = _fake_snapshot()
