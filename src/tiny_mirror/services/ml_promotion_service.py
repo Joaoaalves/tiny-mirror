@@ -916,6 +916,35 @@ def enumerate_activations_for_item(
                     "reason": f"suggested -{total_pct}% @ R$ {sugg_f}",
                 }
             )
+            continue
+
+        # SMART / PRICE_MATCHING-style: ML pre-computes ``price`` directly
+        # (no min/fixed/suggested fields). The seller share is exposed as
+        # ``seller_percentage``; meli_percentage is the banca co-pay.
+        ml_price = p.get("price")
+        seller_pct_raw = p.get("seller_percentage")
+        if ml_price is not None and seller_pct_raw is not None:
+            price_f = float(ml_price)
+            seller_f = float(seller_pct_raw)
+            total_pct = round(seller_f + meli_pct, 2)
+            if seller_f > cap_seller_pct + 0.01:
+                continue
+            if price_f + 0.01 < floor:
+                continue
+            out.append(
+                {
+                    "promo_id": p.get("id"),
+                    "promo_type": p.get("type"),
+                    "promo_name": p.get("name"),
+                    "status": "would_activate",
+                    "target_price": price_f,
+                    "target_total_pct": total_pct,
+                    "target_seller_pct": seller_f,
+                    "meli_percentage": meli_pct,
+                    "constraint": "ml_priced",
+                    "reason": f"{p.get('type')} -{total_pct}% @ R$ {price_f} (seller -{seller_f}%)",
+                }
+            )
     return out
 
 
