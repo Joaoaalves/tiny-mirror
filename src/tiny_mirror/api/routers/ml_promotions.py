@@ -54,6 +54,30 @@ class CapsBulkIn(BaseModel):
     updated_by: str | None = None
 
 
+class CapMLBOut(BaseModel):
+    """Per-MLB detail exposed inside CapOut.mlbs[] for the collapsible row."""
+
+    model_config = ConfigDict(from_attributes=True)
+    mlb_id: str
+    logistic_type: str | None = None  # fulfillment / cross_docking / etc.
+    listing_status: str | None = None  # active / paused / closed
+    # From ml_costs_snapshot.
+    base_cost: Decimal | None = None
+    commission_pct: Decimal | None = None
+    list_price: Decimal | None = None
+    sheet_promo_price: Decimal | None = None
+    freight_bands: Any | None = None
+    margin_at_floor_value: Decimal | None = None
+    margin_at_floor_pct: Decimal | None = None
+    # From ml_catalog_status (price_to_win).
+    catalog_status: str | None = None
+    visit_share: str | None = None
+    current_price: Decimal | None = None
+    price_to_win: Decimal | None = None
+    winner_price: Decimal | None = None
+    competitors_sharing_first_place: int | None = None
+
+
 class CapOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     sku: str
@@ -90,6 +114,10 @@ class CapOut(BaseModel):
     # the listing is gone). The dashboard renders this as "Sem anúncio"
     # instead of a misleading "—".
     has_active_listing: bool | None = None
+    # Full per-MLB detail (one row per active MLB). Populated only by
+    # endpoints that include catalog data (single-SKU and list_caps);
+    # default empty for backward compat with consumers that ignore it.
+    mlbs: list[CapMLBOut] = Field(default_factory=list)
 
 
 class CostSnapshotOut(BaseModel):
@@ -271,22 +299,98 @@ async def _enrich_cap(
     # has_active_listing: distinguishes "no MLB at all" (orphan cap) from
     # "MLB exists but ML returned not_listed". Without this the UI shows
     # "—" for both, which made the operator chase 107 phantom caps.
-    listing_repo = MLListingRepository(session)
-    active_mlbs = await listing_repo.get_active_mlb_ids_for_sku(cap.sku)
-    out.has_active_listing = bool(active_mlbs)
+    from tiny_mirror.infrastructure.orm.models import MLListingORM
+
+    listings_rows = (
+        (
+            await session.execute(
+                select(MLListingORM).where(
+                    MLListingORM.sku == cap.sku, MLListingORM.status == "active"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out.has_active_listing = bool(listings_rows)
+
+    # Per-MLB detail for the collapsible row. Build a {mlb_id -> snap/cat}
+    # lookup so a single iteration over active listings can join everything.
+    snaps_by_mlb = {s.mlb_id: s for s in snaps}
+    cats_by_mlb = {c.mlb_id: c for c in cat_rows} if cat_rows else {}
+
+    mlb_rows: list[CapMLBOut] = []
+    for lst in listings_rows:
+        s = snaps_by_mlb.get(lst.mlb_id)
+        c = cats_by_mlb.get(lst.mlb_id)
+        margin_at_floor_value: Decimal | None = None
+        margin_at_floor_pct: Decimal | None = None
+        floor_for_margin = cap.margin_floor_price or (s.sheet_promo_price if s else None)
+        if (
+            s is not None
+            and s.base_cost is not None
+            and s.commission_pct is not None
+            and s.freight_bands
+            and floor_for_margin is not None
+        ):
+            try:
+                br = margin_at_price(
+                    price=floor_for_margin,
+                    base_cost=s.base_cost,
+                    commission_pct=s.commission_pct,
+                    freight_bands=s.freight_bands,
+                )
+                margin_at_floor_value = br.margin_value
+                margin_at_floor_pct = br.margin_pct
+            except PricingDataError:
+                pass
+
+        mlb_rows.append(
+            CapMLBOut(
+                mlb_id=lst.mlb_id,
+                logistic_type=lst.logistic_type,
+                listing_status=lst.status,
+                base_cost=s.base_cost if s else None,
+                commission_pct=s.commission_pct if s else None,
+                list_price=s.list_price if s else None,
+                sheet_promo_price=s.sheet_promo_price if s else None,
+                freight_bands=s.freight_bands if s else None,
+                margin_at_floor_value=margin_at_floor_value,
+                margin_at_floor_pct=margin_at_floor_pct,
+                catalog_status=c.status if c else None,
+                visit_share=c.visit_share if c else None,
+                current_price=c.current_price if c else None,
+                price_to_win=c.price_to_win if c else None,
+                winner_price=c.winner_price if c else None,
+                competitors_sharing_first_place=(c.competitors_sharing_first_place if c else None),
+            )
+        )
+    out.mlbs = mlb_rows
     return out
 
 
 @router.get("/caps", response_model=list[CapOut])
 async def list_caps(
     only_auto: Annotated[bool | None, Query(description="filter by auto_apply")] = None,
+    include_orphans: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include caps without any active MLB in ml_listings. "
+                "False (default) hides them — they cannot be acted on."
+            ),
+        ),
+    ] = False,
     limit: int = Query(default=200, ge=1, le=1000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(db_session),
 ) -> list[CapOut]:
     repo = MLPromoCapRepository(session)
     rows, _ = await repo.list_all(only_auto=only_auto, limit=limit, offset=offset)
-    return [await _enrich_cap(session, r) for r in rows]
+    enriched = [await _enrich_cap(session, r) for r in rows]
+    if not include_orphans:
+        enriched = [c for c in enriched if c.has_active_listing]
+    return enriched
 
 
 @router.get("/caps/{sku}", response_model=CapOut)
