@@ -1206,3 +1206,64 @@ class MLPromoAlertORM(Base):
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# ---------------------------------------------------------------------------
+# ml_promo_decisions — operator approval queue (per (mlb_id, promo_key))
+# ---------------------------------------------------------------------------
+class MLPromoDecisionORM(Base):
+    __tablename__ = "ml_promo_decisions"
+    __table_args__ = (
+        Index("ix_ml_promo_decisions_status", "status"),
+        Index("ix_ml_promo_decisions_sku", "sku"),
+        UniqueConstraint("mlb_id", "promo_key", name="uq_ml_promo_decisions_mlb_promo"),
+        CheckConstraint(
+            "status IN ('pending', 'approved', 'rejected', 'ignored')",
+            name="ck_ml_promo_decisions_status",
+        ),
+        {
+            "comment": (
+                "Approval queue for engine candidate activations. The cron "
+                "writes pending rows here; the operator approves/rejects via "
+                "the dashboard. Unique on (mlb_id, promo_key) so re-runs are "
+                "idempotent — a decision is recorded once per anúncio + promo."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    promo_key: Mapped[str] = mapped_column(
+        String(80),
+        nullable=False,
+        comment="ML promo id when known; synthetic CREATE-<kind> token otherwise",
+    )
+    promo_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    promo_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    promo_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    decision_kind: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        comment="would_activate | create_price_discount | activate_candidate",
+    )
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    target_total_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    target_seller_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    meli_percentage: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    constraint_used: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    list_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    cap_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    floor_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default=text("'pending'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    decided_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)

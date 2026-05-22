@@ -28,6 +28,7 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
     MLPromoActionRepository,
     MLPromoAlertRepository,
     MLPromoCapRepository,
+    MLPromoDecisionRepository,
 )
 from tiny_mirror.services.ml_promotion_service import MLPromotionService
 
@@ -175,6 +176,41 @@ class EvaluateOut(BaseModel):
     target_promo_name: str | None
     floor_violated: bool
     freight_opt_net_gain: float | None
+
+
+# ---------------------------------------------------------------------------
+# Decisions (approval queue)
+# ---------------------------------------------------------------------------
+class DecisionOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    mlb_id: str
+    sku: str
+    promo_key: str
+    promo_id: str | None
+    promo_type: str
+    promo_name: str | None
+    decision_kind: str
+    target_price: Decimal | None
+    target_total_pct: Decimal | None
+    target_seller_pct: Decimal | None
+    meli_percentage: Decimal | None
+    constraint_used: str | None
+    list_price: Decimal | None
+    cap_pct: Decimal | None
+    floor_price: Decimal | None
+    reason: str
+    status: str
+    created_at: datetime
+    decided_at: datetime | None
+    decided_by: str | None
+    notes: str | None
+
+
+class DecisionDecideIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    decided_by: str | None = None
+    notes: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -894,3 +930,88 @@ async def acknowledge_alert(
     if not ok:
         raise HTTPException(status_code=404, detail=f"alert {alert_id} not found or already acked")
     await session.commit()
+
+
+# ---------------------------------------------------------------------------
+# DECISIONS (operator approval queue)
+# ---------------------------------------------------------------------------
+@router.post("/decisions/generate")
+async def generate_decisions(
+    only_sku: str | None = Query(default=None, description="restrict to a single SKU"),
+    limit_skus: int | None = Query(default=None, ge=1, le=2000),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Enumerate eligible candidate promos per MLB and insert one PENDING
+    decision per (mlb_id, promo_key). Idempotent — re-running this skips
+    decisions already in the queue (pending / approved / rejected)."""
+    return await service.generate_pending_decisions(
+        session, only_sku=only_sku, limit_skus=limit_skus
+    )
+
+
+@router.get("/decisions", response_model=list[DecisionOut])
+async def list_decisions(
+    status_: Annotated[str | None, Query(alias="status")] = "pending",
+    sku: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    session: AsyncSession = Depends(db_session),
+) -> list[DecisionOut]:
+    repo = MLPromoDecisionRepository(session)
+    rows, _ = await repo.list_(status=status_, sku=sku, limit=limit, offset=offset)
+    return [DecisionOut.model_validate(r) for r in rows]
+
+
+@router.post("/decisions/{decision_id}/approve", response_model=DecisionOut)
+async def approve_decision(
+    decision_id: int,
+    body: DecisionDecideIn,
+    session: AsyncSession = Depends(db_session),
+) -> DecisionOut:
+    repo = MLPromoDecisionRepository(session)
+    row = await repo.decide(decision_id, status="approved", by=body.decided_by, notes=body.notes)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"decision {decision_id} not found or already decided",
+        )
+    await session.commit()
+    return DecisionOut.model_validate(row)
+
+
+@router.post("/decisions/{decision_id}/reject", response_model=DecisionOut)
+async def reject_decision(
+    decision_id: int,
+    body: DecisionDecideIn,
+    session: AsyncSession = Depends(db_session),
+) -> DecisionOut:
+    repo = MLPromoDecisionRepository(session)
+    row = await repo.decide(decision_id, status="rejected", by=body.decided_by, notes=body.notes)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"decision {decision_id} not found or already decided",
+        )
+    await session.commit()
+    return DecisionOut.model_validate(row)
+
+
+@router.post("/decisions/{decision_id}/ignore", response_model=DecisionOut)
+async def ignore_decision(
+    decision_id: int,
+    body: DecisionDecideIn,
+    session: AsyncSession = Depends(db_session),
+) -> DecisionOut:
+    """Skip without committing yes/no. Same dedupe semantics as reject —
+    the row stays out of the pending queue and the cron will not
+    re-prompt for it."""
+    repo = MLPromoDecisionRepository(session)
+    row = await repo.decide(decision_id, status="ignored", by=body.decided_by, notes=body.notes)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"decision {decision_id} not found or already decided",
+        )
+    await session.commit()
+    return DecisionOut.model_validate(row)

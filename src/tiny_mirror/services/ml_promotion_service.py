@@ -775,6 +775,122 @@ class MLPromotionService:
             )
         return results
 
+    # ------------------------------------------------------------------
+    # Decisions queue (operator approval)
+    # ------------------------------------------------------------------
+    async def generate_pending_decisions(
+        self,
+        session: AsyncSession,
+        *,
+        only_sku: str | None = None,
+        limit_skus: int | None = None,
+    ) -> dict[str, Any]:
+        """Walk every (sku, MLB) and write a pending decision per
+        candidate promo that fits the cap+floor. Idempotent: existing
+        rows in any status are skipped by the unique constraint.
+
+        Returns aggregate counts so the cron / API can log them.
+        """
+        from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
+            MLPromoDecisionRepository,
+        )
+
+        caps = MLPromoCapRepository(session)
+        listings = MLListingRepository(session)
+        snap_repo = MLCostsSnapshotRepository(session)
+        decisions = MLPromoDecisionRepository(session)
+
+        all_caps, _ = await caps.list_all(only_auto=None, limit=2000)
+        caps_by_mlb = {c.mlb_id: c for c in all_caps}
+        skus = sorted({c.sku for c in all_caps})
+        if only_sku is not None:
+            skus = [s for s in skus if s == only_sku]
+        if limit_skus is not None:
+            skus = skus[:limit_skus]
+
+        stats = {
+            "skus_scanned": 0,
+            "mlbs_scanned": 0,
+            "candidates_eligible": 0,
+            "decisions_inserted": 0,
+            "decisions_skipped_existing": 0,
+        }
+
+        for sku in skus:
+            stats["skus_scanned"] += 1
+            mlb_ids = await listings.get_active_mlb_ids_for_sku(sku)
+            for mlb_id in mlb_ids:
+                cap = caps_by_mlb.get(mlb_id)
+                if cap is None or cap.max_seller_share_pct == 0:
+                    continue
+                stats["mlbs_scanned"] += 1
+                snap = await snap_repo.get(mlb_id)
+                list_price = float(snap.list_price) if snap and snap.list_price else None
+                try:
+                    promos = await self.fetch_eligible_promos(mlb_id)
+                except Exception as exc:  # pragma: no cover — network noise
+                    logger.debug("decisions_fetch_failed", mlb_id=mlb_id, error=str(exc))
+                    continue
+                if list_price is None:
+                    for p in promos:
+                        if p.get("original_price"):
+                            list_price = float(p["original_price"])
+                            break
+                if list_price is None:
+                    continue
+
+                entries = enumerate_activations_for_item(
+                    promos=promos,
+                    cap_seller_pct=float(cap.max_seller_share_pct),
+                    margin_floor_price=float(cap.margin_floor_price)
+                    if cap.margin_floor_price
+                    else None,
+                    list_price=list_price,
+                    excluded_types=cap.excluded_promo_types or (),
+                )
+                for entry in entries:
+                    if entry["status"] != "would_activate":
+                        continue
+                    stats["candidates_eligible"] += 1
+                    promo_id = entry.get("promo_id")
+                    promo_key = (
+                        promo_id if promo_id else f"CREATE-{entry.get('constraint') or 'unknown'}"
+                    )
+                    inserted = await decisions.insert_if_absent(
+                        mlb_id=mlb_id,
+                        sku=sku,
+                        promo_key=str(promo_key)[:80],
+                        promo_id=promo_id,
+                        promo_type=entry.get("promo_type") or "?",
+                        promo_name=entry.get("promo_name"),
+                        decision_kind="would_activate",
+                        target_price=_to_dec(entry.get("target_price")),
+                        target_total_pct=_to_dec(entry.get("target_total_pct")),
+                        target_seller_pct=_to_dec(entry.get("target_seller_pct")),
+                        meli_percentage=_to_dec(entry.get("meli_percentage")),
+                        constraint_used=entry.get("constraint"),
+                        list_price=Decimal(str(list_price)),
+                        cap_pct=cap.max_seller_share_pct,
+                        floor_price=cap.margin_floor_price,
+                        reason=entry.get("reason") or "",
+                    )
+                    if inserted is not None:
+                        stats["decisions_inserted"] += 1
+                    else:
+                        stats["decisions_skipped_existing"] += 1
+        await session.commit()
+        logger.info("decisions_generated", **stats)
+        return stats
+
+
+def _to_dec(v: Any) -> Decimal | None:
+    if v is None:
+        return None
+    try:
+        return Decimal(str(v))
+    except Exception:
+        return None
+
 
 def score_candidate_promo(
     p: dict[str, Any],

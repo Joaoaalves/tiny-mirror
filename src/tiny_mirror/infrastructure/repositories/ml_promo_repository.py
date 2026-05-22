@@ -22,6 +22,7 @@ from tiny_mirror.infrastructure.orm.models import (
     MLPromoActionORM,
     MLPromoAlertORM,
     MLPromoCapORM,
+    MLPromoDecisionORM,
 )
 
 
@@ -333,3 +334,121 @@ class MLPromoAlertRepository:
         row.acknowledged_at = datetime.utcnow()
         await self._session.flush()
         return True
+
+
+# ---------------------------------------------------------------------------
+# Decisions (operator approval queue)
+# ---------------------------------------------------------------------------
+class MLPromoDecisionRepository:
+    """CRUD for ``ml_promo_decisions``.
+
+    Generation is idempotent: ``insert_if_absent`` uses the unique
+    ``(mlb_id, promo_key)`` constraint so re-running the cron does not
+    duplicate rows. A decision that was previously approved or rejected
+    by the operator stays in that terminal state — the cron does not
+    re-prompt for it.
+    """
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def insert_if_absent(
+        self,
+        *,
+        mlb_id: str,
+        sku: str,
+        promo_key: str,
+        promo_id: str | None,
+        promo_type: str,
+        promo_name: str | None,
+        decision_kind: str,
+        target_price: Decimal | None,
+        target_total_pct: Decimal | None,
+        target_seller_pct: Decimal | None,
+        meli_percentage: Decimal | None,
+        constraint_used: str | None,
+        list_price: Decimal | None,
+        cap_pct: Decimal | None,
+        floor_price: Decimal | None,
+        reason: str,
+    ) -> MLPromoDecisionORM | None:
+        """Insert a pending decision; return the new row, or None if a
+        row with the same ``(mlb_id, promo_key)`` already exists."""
+        stmt = (
+            pg_insert(MLPromoDecisionORM)
+            .values(
+                mlb_id=mlb_id,
+                sku=sku,
+                promo_key=promo_key,
+                promo_id=promo_id,
+                promo_type=promo_type,
+                promo_name=promo_name,
+                decision_kind=decision_kind,
+                target_price=target_price,
+                target_total_pct=target_total_pct,
+                target_seller_pct=target_seller_pct,
+                meli_percentage=meli_percentage,
+                constraint_used=constraint_used,
+                list_price=list_price,
+                cap_pct=cap_pct,
+                floor_price=floor_price,
+                reason=reason,
+            )
+            .on_conflict_do_nothing(constraint="uq_ml_promo_decisions_mlb_promo")
+            .returning(MLPromoDecisionORM)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return result.scalar_one_or_none()
+
+    async def list_(
+        self,
+        *,
+        status: str | None = None,
+        sku: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> tuple[list[MLPromoDecisionORM], int]:
+        q = select(MLPromoDecisionORM)
+        count_q = select(func.count(MLPromoDecisionORM.id))
+        if status is not None:
+            q = q.where(MLPromoDecisionORM.status == status)
+            count_q = count_q.where(MLPromoDecisionORM.status == status)
+        if sku is not None:
+            q = q.where(MLPromoDecisionORM.sku == sku)
+            count_q = count_q.where(MLPromoDecisionORM.sku == sku)
+        q = q.order_by(MLPromoDecisionORM.created_at.desc()).limit(limit).offset(offset)
+        rows = list((await self._session.execute(q)).scalars().all())
+        total = int((await self._session.execute(count_q)).scalar_one())
+        return rows, total
+
+    async def get(self, decision_id: int) -> MLPromoDecisionORM | None:
+        return await self._session.get(MLPromoDecisionORM, decision_id)
+
+    async def decide(
+        self,
+        decision_id: int,
+        *,
+        status: str,
+        by: str | None = None,
+        notes: str | None = None,
+    ) -> MLPromoDecisionORM | None:
+        """Move a pending decision to a terminal state.
+
+        Valid terminal states: ``approved``, ``rejected``, ``ignored``.
+        All three dedupe equally — the cron will not re-prompt for a
+        row that has been touched by the operator. ``ignored`` is the
+        "skip this without committing yes/no" lane.
+        """
+        if status not in ("approved", "rejected", "ignored"):
+            raise ValueError(f"invalid decision status: {status}")
+        row = await self.get(decision_id)
+        if row is None or row.status != "pending":
+            return None
+        row.status = status
+        row.decided_at = datetime.utcnow()
+        row.decided_by = by
+        if notes is not None:
+            row.notes = notes
+        await self._session.flush()
+        return row
