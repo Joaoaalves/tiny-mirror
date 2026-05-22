@@ -6,8 +6,9 @@ import math
 from datetime import UTC, date, datetime, timedelta
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.api.dependencies import (
@@ -133,6 +134,64 @@ async def get_product(
     buckets = await buckets_repo.get_buckets_for_sku(product["sku"], days=90)
 
     return _to_detail_response(product, stock, components, buckets)
+
+
+class CostPriceUpdateRequest(BaseModel):
+    """Body for PATCH /products/{tiny_id}/cost-price."""
+
+    cost_price: float = Field(..., ge=0, description="New cost_price in BRL.")
+
+
+class CostPriceUpdateResponse(BaseModel):
+    tiny_id: int
+    sku: str
+    cost_price: float
+
+
+@router.patch("/{tiny_id}/cost-price", response_model=CostPriceUpdateResponse)
+async def update_cost_price(
+    tiny_id: int,
+    payload: Annotated[CostPriceUpdateRequest, Body()],
+    session: AsyncSession = Depends(db_session),
+) -> CostPriceUpdateResponse:
+    """Update the ``cost_price`` field inside ``products.prices`` JSONB.
+
+    Why: external cost-updater scripts (Telegram cron, etc.) push price
+    changes to Tiny ERP via their REST API. Without writing back to the
+    mirror DB, the next sync cycle will not catch up for 24h and analyses
+    that read from ``products.prices->>'cost_price'`` (queima, reposição,
+    cost-updater divergence detection) will still see the old value —
+    causing duplicate Tiny updates and message flood.
+
+    This endpoint surgically updates ONLY the cost_price key inside the
+    JSONB blob, leaving the rest of ``prices`` (price, promotional_price,
+    average_cost_price) untouched. ``updated_at`` and ``synced_at`` are
+    NOT touched on purpose — the next Tiny sync will refresh them
+    organically.
+    """
+    stmt = text(
+        """
+        UPDATE products
+        SET prices = jsonb_set(
+            COALESCE(prices, '{}'::jsonb),
+            '{cost_price}',
+            to_jsonb(:cost_price::numeric)
+        )
+        WHERE tiny_id = :tiny_id
+        RETURNING tiny_id, sku, (prices->>'cost_price')::numeric AS cost_price
+        """
+    )
+    result = await session.execute(stmt, {"tiny_id": tiny_id, "cost_price": payload.cost_price})
+    row = result.first()
+    if row is None:
+        await session.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    await session.commit()
+    return CostPriceUpdateResponse(
+        tiny_id=int(row.tiny_id),
+        sku=str(row.sku),
+        cost_price=float(row.cost_price or 0.0),
+    )
 
 
 # ---------------------------------------------------------------------------
