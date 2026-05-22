@@ -169,16 +169,18 @@ async def update_cost_price(
     NOT touched on purpose — the next Tiny sync will refresh them
     organically.
     """
+    # NOTA: asyncpg não entende `:cost_price::numeric` (mistura SQLAlchemy bind
+    # com cast PostgreSQL). Usar CAST() é equivalente e parseia corretamente.
     stmt = text(
         """
         UPDATE products
         SET prices = jsonb_set(
-            COALESCE(prices, '{}'::jsonb),
+            COALESCE(prices, CAST('{}' AS jsonb)),
             '{cost_price}',
-            to_jsonb(:cost_price::numeric)
+            to_jsonb(CAST(:cost_price AS numeric))
         )
         WHERE tiny_id = :tiny_id
-        RETURNING tiny_id, sku, (prices->>'cost_price')::numeric AS cost_price
+        RETURNING tiny_id, sku, CAST(prices->>'cost_price' AS numeric) AS cost_price
         """
     )
     result = await session.execute(stmt, {"tiny_id": tiny_id, "cost_price": payload.cost_price})
