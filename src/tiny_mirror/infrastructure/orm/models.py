@@ -965,6 +965,12 @@ class TinyFLStockSnapshotORM(Base):
         primary_key=True,
     )
     tiny_fl_qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Paired with tiny_fl_qty for the webhook corroboration rule: a real
+    # galpão→Full transfer drops galpão by approximately the FL gain, while
+    # sale cancellations leave galpão untouched. Defaults to 0 only for
+    # rows that pre-date the column — webhook code treats 0 prev as
+    # "no corroboration possible, skip".
+    stock_galpao_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -153,6 +153,18 @@ class Settings(BaseSettings):
     # the stock cron races the webhook.
     fl_webhook_delta_idempotency_minutes: int = 30
 
+    # Corroboration threshold for the FL webhook delta detector. When the
+    # Tiny FL deposit grows by N units we accept it as a real transfer only
+    # if the galpão deposit dropped by at least N * this fraction in the
+    # same window. Sale cancellations and Tiny↔ML reconciliations leave
+    # galpão untouched, so a low |galpao_delta| flags them as
+    # false-positives and we skip the insert.
+    #
+    # 0.8 = "galpão must have dropped by 80% of the FL gain". Calibrated to
+    # tolerate small races (operator types the transfer in two passes) and
+    # to catch obvious cancellations (galpao_delta ≈ 0).
+    fl_webhook_galpao_corroboration_ratio: float = 0.8
+
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

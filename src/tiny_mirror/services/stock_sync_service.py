@@ -174,10 +174,11 @@ class StockSyncService:
         deposits = StockMapper.extract_deposits(raw)
         sku = stock_data.get("sku") or ""
 
-        # Raw Tiny FL value BEFORE any ML overlay. Drives the webhook
-        # delta path so we don't compare the ML-overlaid stock_deposits
-        # row against the next raw Tiny reading.
+        # Raw Tiny FL + galpão values BEFORE any ML overlay. Both drive
+        # the webhook corroboration path so we never compare the
+        # ML-overlaid stock_deposits row against the next raw Tiny reading.
         new_tiny_fl_qty = _sum_tiny_fl_available(deposits)
+        new_stock_galpao_qty = _sum_tiny_galpao_available(deposits)
 
         # Same isolation pattern as product_sync_service: capture errors
         # so the sync-log update always runs in a fresh session and never
@@ -244,6 +245,7 @@ class StockSyncService:
                     product_tiny_id=product_tiny_id,
                     sku=sku,
                     new_tiny_fl_qty=new_tiny_fl_qty,
+                    new_stock_galpao_qty=new_stock_galpao_qty,
                     product_data=product_data,
                 )
             except Exception as exc:
@@ -280,10 +282,11 @@ class StockSyncService:
 
     # ------------------------------------------------------------------
     # Webhook delta path — compares the raw Tiny FL value vs the previous
-    # snapshot. On a positive delta with no overlapping pending transfer
-    # in the idempotency window, insert a pending row marked
-    # source='tiny_webhook'. This catches manual Tiny transfers we'd
-    # otherwise miss (operator skipped POST /fulfillment/transfer).
+    # snapshot. On a positive delta we also require the galpão deposit to
+    # have dropped by approximately the same amount (configurable ratio)
+    # before inserting a pending transfer; otherwise the +FL is likely a
+    # sale cancellation or Tiny↔ML reconciliation, not a real
+    # galpão→Full move.
     # ------------------------------------------------------------------
     async def _maybe_record_webhook_transfer(
         self,
@@ -291,27 +294,53 @@ class StockSyncService:
         sku: str,
         new_tiny_fl_qty: int,
         product_data: dict[str, Any] | None,
+        new_stock_galpao_qty: int,
     ) -> None:
         async with AsyncSessionLocal() as session:
             snapshots = TinyFLStockSnapshotRepository(session)
             previous = await snapshots.get(product_tiny_id)
-            await snapshots.upsert(product_tiny_id, new_tiny_fl_qty)
+            await snapshots.upsert(
+                product_tiny_id,
+                tiny_fl_qty=new_tiny_fl_qty,
+                stock_galpao_qty=new_stock_galpao_qty,
+            )
 
-            # First time we see this product → seed the snapshot only.
-            # We have no prior reference value, so we cannot infer a
-            # transfer happened. The next webhook with a positive delta
-            # will trigger the path.
+            # First observation: seed both snapshots, can't infer a
+            # transfer yet (no prior reference).
             if previous is None:
                 logger.debug(
                     "FL snapshot seeded (first observation)",
                     product_tiny_id=product_tiny_id,
                     sku=sku,
                     tiny_fl_qty=new_tiny_fl_qty,
+                    stock_galpao_qty=new_stock_galpao_qty,
                 )
                 return
 
-            delta = new_tiny_fl_qty - previous
-            if delta <= 0:
+            fl_delta = new_tiny_fl_qty - previous.tiny_fl_qty
+            if fl_delta <= 0:
+                return
+
+            # Corroboration rule (2026-05-25): a real galpão→Full transfer
+            # drops galpão by ~fl_delta. Sale cancellations and
+            # Tiny↔ML reconciliations leave galpão untouched (galpao_delta
+            # ≈ 0). Skip when galpão didn't decrease by enough.
+            galpao_delta = new_stock_galpao_qty - previous.stock_galpao_qty
+            required_drop = fl_delta * settings.fl_webhook_galpao_corroboration_ratio
+            galpao_drop = -galpao_delta  # positive when galpão decreased
+            if galpao_drop + 0.01 < required_drop:
+                logger.info(
+                    "FL positive delta detected but galpão did not drop "
+                    "enough — likely sale cancellation or reconciliation, "
+                    "not a real transfer; skipping",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    fl_delta=fl_delta,
+                    galpao_delta=galpao_delta,
+                    required_drop=required_drop,
+                    new_tiny_fl_qty=new_tiny_fl_qty,
+                    new_stock_galpao_qty=new_stock_galpao_qty,
+                )
                 return
 
             transfers = FulfillmentTransferRepository(session)
@@ -319,11 +348,11 @@ class StockSyncService:
             window_start = now - timedelta(minutes=settings.fl_webhook_delta_idempotency_minutes)
             if await transfers.has_recent_pending(sku, since=window_start):
                 logger.info(
-                    "FL positive delta detected but a recent pending transfer "
-                    "already exists — skipping duplicate",
+                    "FL positive delta corroborated but a recent pending "
+                    "transfer already exists — skipping duplicate",
                     product_tiny_id=product_tiny_id,
                     sku=sku,
-                    delta=delta,
+                    fl_delta=fl_delta,
                     new_tiny_fl_qty=new_tiny_fl_qty,
                 )
                 return
@@ -332,12 +361,13 @@ class StockSyncService:
             await transfers.create(
                 product_tiny_id=product_tiny_id,
                 product_sku=sku,
-                quantity=delta,
+                quantity=fl_delta,
                 cost_per_unit=cost,
                 transferred_at=now,
                 notes=(
                     "Detected via Tiny stock webhook: Full ML deposit grew "
-                    f"from {previous} to {new_tiny_fl_qty}."
+                    f"from {previous.tiny_fl_qty} to {new_tiny_fl_qty} "
+                    f"(galpão {previous.stock_galpao_qty} → {new_stock_galpao_qty})."
                 ),
                 source="tiny_webhook",
             )
@@ -347,9 +377,10 @@ class StockSyncService:
                 "FL pending transfer recorded from webhook delta",
                 product_tiny_id=product_tiny_id,
                 sku=sku,
-                previous_tiny_fl=previous,
+                previous_tiny_fl=previous.tiny_fl_qty,
                 new_tiny_fl=new_tiny_fl_qty,
-                delta=delta,
+                fl_delta=fl_delta,
+                galpao_delta=galpao_delta,
             )
 
     # ------------------------------------------------------------------
@@ -496,6 +527,22 @@ def _sum_tiny_fl_available(deposits: list[dict[str, Any]]) -> int:
     for d in deposits:
         name = (d.get("deposit_name") or "").lower()
         if "full mercado livre" in name:
+            total += float(d.get("available") or 0)
+    return max(0, int(total))
+
+
+def _sum_tiny_galpao_available(deposits: list[dict[str, Any]]) -> int:
+    """Sum of ``available`` across Tiny's 'Galpão' deposits.
+
+    Used by the webhook delta detector to corroborate that a positive FL
+    delta is matched by a galpão drop (= real transfer) rather than a
+    sale cancellation (= galpão untouched). Same case-insensitive name
+    match as ``_sum_tiny_fl_available``; floors at 0 for symmetry.
+    """
+    total = 0.0
+    for d in deposits:
+        name = (d.get("deposit_name") or "").lower()
+        if "galpão" in name or "galpao" in name:
             total += float(d.get("available") or 0)
     return max(0, int(total))
 
