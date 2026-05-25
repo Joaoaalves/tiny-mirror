@@ -289,7 +289,11 @@ def decide_for_item(
             margin_floor_price=floor_price,
             list_price=orig_price,
         )
-        if scored is None:
+        # score agora sempre retorna dict pra promos parseables (com flag
+        # accepted). Pulamos os negados aqui — quem decide ativar é só os
+        # que passam no cap+floor. enumerate_activations_for_item registra
+        # os negados pra UI.
+        if scored is None or not scored.get("accepted"):
             continue
         achievable_total = float(scored["target_total_pct"] or 0)
         target_price = float(scored["target_price"] or 0)
@@ -814,6 +818,8 @@ class MLPromotionService:
             "candidates_eligible": 0,
             "decisions_inserted": 0,
             "decisions_skipped_existing": 0,
+            "decisions_denied_inserted": 0,
+            "decisions_active_inserted": 0,
         }
 
         for sku in skus:
@@ -849,9 +855,24 @@ class MLPromotionService:
                     excluded_types=cap.excluded_promo_types or (),
                 )
                 for entry in entries:
-                    if entry["status"] != "would_activate":
-                        continue
-                    stats["candidates_eligible"] += 1
+                    entry_status = entry.get("status")
+                    # Persistimos as 3 categorias:
+                    #   - would_activate → status=pending (operador decide)
+                    #   - already_active → status=ignored (só pra visibilidade)
+                    #   - denied         → status=ignored (idem)
+                    if entry_status == "would_activate":
+                        db_status = "pending"
+                        decision_kind = "would_activate"
+                        stats["candidates_eligible"] += 1
+                    elif entry_status == "already_active":
+                        db_status = "ignored"
+                        decision_kind = "already_active"
+                    elif entry_status == "denied":
+                        db_status = "ignored"
+                        decision_kind = "denied"
+                    else:
+                        continue  # forma desconhecida
+
                     promo_id = entry.get("promo_id")
                     promo_key = (
                         promo_id if promo_id else f"CREATE-{entry.get('constraint') or 'unknown'}"
@@ -863,7 +884,7 @@ class MLPromotionService:
                         promo_id=promo_id,
                         promo_type=entry.get("promo_type") or "?",
                         promo_name=entry.get("promo_name"),
-                        decision_kind="would_activate",
+                        decision_kind=decision_kind,
                         target_price=_to_dec(entry.get("target_price")),
                         target_total_pct=_to_dec(entry.get("target_total_pct")),
                         target_seller_pct=_to_dec(entry.get("target_seller_pct")),
@@ -873,9 +894,15 @@ class MLPromotionService:
                         cap_pct=cap.max_seller_share_pct,
                         floor_price=cap.margin_floor_price,
                         reason=entry.get("reason") or "",
+                        status=db_status,
                     )
                     if inserted is not None:
-                        stats["decisions_inserted"] += 1
+                        if decision_kind == "would_activate":
+                            stats["decisions_inserted"] += 1
+                        elif decision_kind == "denied":
+                            stats["decisions_denied_inserted"] += 1
+                        else:
+                            stats["decisions_active_inserted"] += 1
                     else:
                         stats["decisions_skipped_existing"] += 1
         await session.commit()
@@ -915,9 +942,14 @@ def score_candidate_promo(
     5. ``price`` + ``original_price`` only — generic fallback (compute
        total% from the two prices)
 
-    Returns a dict ``{target_price, target_total_pct, target_seller_pct,
-    meli_percentage, constraint, reason}`` when the candidate fits the
-    cap + floor envelope; returns ``None`` otherwise.
+    Returns:
+      - ``None`` when the promo doesn't match any known shape (data
+        integrity issue) — caller should skip silently.
+      - ``dict`` always with ``accepted: bool`` and ``denied_reason: str |
+        None``. When accepted, the dict carries the activation plan
+        (target_price, total_pct, etc). When denied, the same fields
+        carry what WOULD have been if cap/floor allowed — so the UI can
+        show "would have been R$ X (-Y%) but blocked by floor R$ Z".
     """
     if list_price is None or list_price <= 0:
         return None
@@ -925,34 +957,74 @@ def score_candidate_promo(
     meli_pct = float(p.get("meli_percentage") or 0)
     cap_total = cap_seller_pct + meli_pct
 
+    def _build(
+        *,
+        target_price: float,
+        target_total_pct: float,
+        target_seller_pct: float,
+        constraint: str,
+        reason: str,
+        cap_check_value: float,
+        cap_check_limit: float,
+        cap_label: str,
+    ) -> dict[str, Any]:
+        accepted = True
+        denied_reason: str | None = None
+        if cap_check_value > cap_check_limit + 0.01:
+            accepted = False
+            denied_reason = (
+                f"cap_exceeded: {cap_label} {cap_check_value:.2f}% > "
+                f"limite {cap_check_limit:.2f}%"
+            )
+        elif target_price + 0.01 < floor:
+            accepted = False
+            denied_reason = f"floor_violation: R$ {target_price:.2f} < piso R$ {floor:.2f}"
+        return {
+            "accepted": accepted,
+            "denied_reason": denied_reason,
+            "target_price": target_price,
+            "target_total_pct": target_total_pct,
+            "target_seller_pct": target_seller_pct,
+            "meli_percentage": meli_pct,
+            "constraint": constraint,
+            "reason": reason,
+        }
+
     # 1. fixed_percentage (cupons).
     fixed = p.get("fixed_percentage")
     if fixed is not None:
         fixed_f = float(fixed)
-        if fixed_f > cap_total + 0.01:
-            return None
         target = round(list_price * (1 - fixed_f / 100), 2)
-        if target + 0.01 < floor:
-            return None
-        return {
-            "target_price": target,
-            "target_total_pct": fixed_f,
-            "target_seller_pct": round(fixed_f - meli_pct, 2),
-            "meli_percentage": meli_pct,
-            "constraint": "fixed_percentage",
-            "reason": f"fixed -{fixed_f}% @ R$ {target}",
-        }
+        return _build(
+            target_price=target,
+            target_total_pct=fixed_f,
+            target_seller_pct=round(fixed_f - meli_pct, 2),
+            constraint="fixed_percentage",
+            reason=f"fixed -{fixed_f}% @ R$ {target}",
+            cap_check_value=fixed_f,
+            cap_check_limit=cap_total,
+            cap_label="total",
+        )
 
     # 2. min_discounted_price (price-floor candidates).
     min_price = p.get("min_discounted_price")
     if min_price is not None:
         min_f = float(min_price)
-        if min_f + 0.01 < floor:
-            return None
         target_at_cap = round(list_price * (1 - cap_total / 100), 2)
         target = round(max(min_f, floor, target_at_cap), 2)
         total_pct = round((list_price - target) / list_price * 100, 2)
+        # Esta variante NÃO viola cap por construção (target_at_cap respeita cap).
+        # Pode violar floor quando min_f < floor (e o "max" elevou target a
+        # floor, mas a regra do ML pode exigir min_f exato — registramos como
+        # denied pra transparência).
+        denied = min_f + 0.01 < floor
         return {
+            "accepted": not denied,
+            "denied_reason": (
+                f"floor_violation: min_discounted_price R$ {min_f:.2f} < " f"piso R$ {floor:.2f}"
+                if denied
+                else None
+            ),
             "target_price": target,
             "target_total_pct": total_pct,
             "target_seller_pct": round(total_pct - meli_pct, 2),
@@ -966,18 +1038,16 @@ def score_candidate_promo(
     if sugg is not None:
         sugg_f = float(sugg)
         total_pct = round((list_price - sugg_f) / list_price * 100, 2)
-        if total_pct > cap_total + 0.01:
-            return None
-        if sugg_f + 0.01 < floor:
-            return None
-        return {
-            "target_price": sugg_f,
-            "target_total_pct": total_pct,
-            "target_seller_pct": round(total_pct - meli_pct, 2),
-            "meli_percentage": meli_pct,
-            "constraint": "suggested_discounted_price",
-            "reason": f"suggested -{total_pct}% @ R$ {sugg_f}",
-        }
+        return _build(
+            target_price=sugg_f,
+            target_total_pct=total_pct,
+            target_seller_pct=round(total_pct - meli_pct, 2),
+            constraint="suggested_discounted_price",
+            reason=f"suggested -{total_pct}% @ R$ {sugg_f}",
+            cap_check_value=total_pct,
+            cap_check_limit=cap_total,
+            cap_label="total",
+        )
 
     # 3. price + seller_percentage (SMART / PRICE_MATCHING).
     ml_price = p.get("price")
@@ -985,41 +1055,37 @@ def score_candidate_promo(
     if ml_price is not None and seller_raw is not None:
         price_f = float(ml_price)
         seller_f = float(seller_raw)
-        if seller_f > cap_seller_pct + 0.01:
-            return None
-        if price_f + 0.01 < floor:
-            return None
         total_pct = round(seller_f + meli_pct, 2)
-        return {
-            "target_price": price_f,
-            "target_total_pct": total_pct,
-            "target_seller_pct": seller_f,
-            "meli_percentage": meli_pct,
-            "constraint": "ml_priced",
-            "reason": f"{p.get('type')} -{total_pct}% @ R$ {price_f} (seller -{seller_f}%)",
-        }
+        return _build(
+            target_price=price_f,
+            target_total_pct=total_pct,
+            target_seller_pct=seller_f,
+            constraint="ml_priced",
+            reason=f"{p.get('type')} -{total_pct}% @ R$ {price_f} (seller -{seller_f}%)",
+            cap_check_value=seller_f,
+            cap_check_limit=cap_seller_pct,
+            cap_label="seller",
+        )
 
     # 4. seller_percentage only — derive target price from original.
     if seller_raw is not None:
         orig = p.get("original_price") or list_price
         seller_f = float(seller_raw)
         total_pct = round(seller_f + meli_pct, 2)
-        if seller_f > cap_seller_pct + 0.01:
-            return None
         derived_price = round(float(orig) * (1 - total_pct / 100), 2)
-        if derived_price + 0.01 < floor:
-            return None
-        return {
-            "target_price": derived_price,
-            "target_total_pct": total_pct,
-            "target_seller_pct": seller_f,
-            "meli_percentage": meli_pct,
-            "constraint": "seller_pct_only",
-            "reason": (
+        return _build(
+            target_price=derived_price,
+            target_total_pct=total_pct,
+            target_seller_pct=seller_f,
+            constraint="seller_pct_only",
+            reason=(
                 f"{p.get('type')} seller -{seller_f}% → R$ {derived_price} "
                 f"(derivado de original R$ {orig})"
             ),
-        }
+            cap_check_value=seller_f,
+            cap_check_limit=cap_seller_pct,
+            cap_label="seller",
+        )
 
     # 5. price + original_price only (generic fallback).
     if ml_price is not None:
@@ -1027,18 +1093,16 @@ def score_candidate_promo(
         if orig:
             price_f = float(ml_price)
             total_pct = round((float(orig) - price_f) / float(orig) * 100, 2)
-            if total_pct > cap_total + 0.01:
-                return None
-            if price_f + 0.01 < floor:
-                return None
-            return {
-                "target_price": price_f,
-                "target_total_pct": total_pct,
-                "target_seller_pct": round(total_pct - meli_pct, 2),
-                "meli_percentage": meli_pct,
-                "constraint": "price_only",
-                "reason": f"{p.get('type')} -{total_pct}% @ R$ {price_f}",
-            }
+            return _build(
+                target_price=price_f,
+                target_total_pct=total_pct,
+                target_seller_pct=round(total_pct - meli_pct, 2),
+                constraint="price_only",
+                reason=f"{p.get('type')} -{total_pct}% @ R$ {price_f}",
+                cap_check_value=total_pct,
+                cap_check_limit=cap_total,
+                cap_label="total",
+            )
 
     return None
 
@@ -1114,13 +1178,23 @@ def enumerate_activations_for_item(
             list_price=list_price,
         )
         if scored is None:
+            # Forma não reconhecida (sem fixed/min/sugg/price+seller). Pulamos
+            # silencioso — não temos como julgar.
             continue
+        accepted = scored.get("accepted", False)
+        # Quando denied, sobrescrevemos `reason` pelo motivo da rejeição
+        # pra UI mostrar diretamente. O cálculo original (-X% @ R$Y) fica
+        # em scored.reason ainda — caller pode acessar via constraint/etc.
+        if not accepted:
+            scored = dict(scored)
+            denial = scored.get("denied_reason") or "denied"
+            scored["reason"] = f"{denial} · alvo: {scored.get('reason', '')}"
         out.append(
             {
                 "promo_id": p.get("id"),
                 "promo_type": p.get("type"),
                 "promo_name": p.get("name"),
-                "status": "would_activate",
+                "status": "would_activate" if accepted else "denied",
                 **scored,
             }
         )

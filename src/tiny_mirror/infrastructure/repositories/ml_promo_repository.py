@@ -371,9 +371,16 @@ class MLPromoDecisionRepository:
         cap_pct: Decimal | None,
         floor_price: Decimal | None,
         reason: str,
+        status: str = "pending",
     ) -> MLPromoDecisionORM | None:
-        """Insert a pending decision; return the new row, or None if a
-        row with the same ``(mlb_id, promo_key)`` already exists."""
+        """Insert a decision; return the new row, or None if a row with the
+        same ``(mlb_id, promo_key)`` already exists.
+
+        ``status`` defaults to ``pending`` (operator must approve/reject).
+        Denied / already-active engine outputs should pass ``ignored`` —
+        they end up in the table for visibility but don't pollute the
+        operator's pending queue.
+        """
         stmt = (
             pg_insert(MLPromoDecisionORM)
             .values(
@@ -393,6 +400,7 @@ class MLPromoDecisionRepository:
                 cap_pct=cap_pct,
                 floor_price=floor_price,
                 reason=reason,
+                status=status,
             )
             .on_conflict_do_nothing(constraint="uq_ml_promo_decisions_mlb_promo")
             .returning(MLPromoDecisionORM)
