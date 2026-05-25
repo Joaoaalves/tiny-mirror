@@ -17,6 +17,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.api.dependencies import db_session
@@ -1037,3 +1038,21 @@ async def ignore_decision(
         )
     await session.commit()
     return DecisionOut.model_validate(row)
+
+
+@router.get("/trends", response_model=dict[str, float | None])
+async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, float | None]:
+    """Retorna ``{sku: momentum_15v30}`` da mv_coverage pra todos os SKUs ativos.
+
+    Usado pelo front-end da mission-control pra anotar cada decisão de
+    promoção com a tendência do anúncio (caindo / estável / subindo).
+
+    momentum_15v30: ratio (sold_15d/15) / daily_rate. <0.8 caindo,
+    0.8-1.2 estável, ≥1.2 subindo. NULL quando não há baseline (SKU
+    sem vendas no mês). View mv_coverage v15 atualiza a cada 15 min via
+    cron de REFRESH MATERIALIZED VIEW.
+    """
+    result = await session.execute(
+        text("SELECT sku, momentum_15v30 FROM mv_coverage WHERE momentum_15v30 IS NOT NULL")
+    )
+    return {sku: float(mom) for sku, mom in result.all()}
