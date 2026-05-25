@@ -42,6 +42,25 @@ logger = structlog.get_logger(__name__)
 
 ML_API_BASE = "https://api.mercadolibre.com"
 
+# Promo types that get extra exposure in ML's UI (interval-based deals).
+# Boost is informational — surfaced in the decision so the UI/operator can
+# weigh exposure vs margin. Not used for filtering.
+EXPOSURE_BOOST_TYPES = frozenset({"DEAL", "DOD", "LIGHTNING"})
+EXPOSURE_BOOST_FACTOR = 1.3
+
+# Fixed-price types: ML sets the price; seller can't choose within an
+# interval. Interval types let the seller pick a price in [min, max].
+FIXED_PRICE_TYPES = frozenset(
+    {
+        "SMART",
+        "PRICE_MATCHING",
+        "MARKETPLACE_CAMPAIGN",
+        "PRE_NEGOTIATED",
+        "PIX",
+        "VOLUME",
+    }
+)
+
 
 # ===========================================================================
 # Decision algorithm — pure
@@ -933,14 +952,15 @@ def score_candidate_promo(
 
     1. ``fixed_percentage``       — SELLER_COUPON_CAMPAIGN
     2. ``min_discounted_price``   — DEAL / DOD / LIGHTNING / PRICE_DISCOUNT
-                                    / SELLER_CAMPAIGN (and falls back to
-                                    ``suggested_discounted_price`` if the
-                                    minimum field is missing)
-    3. ``price`` + ``seller_percentage`` — SMART / PRICE_MATCHING
+                                    / SELLER_CAMPAIGN (interval: seller
+                                    picks any price in [min, max], with
+                                    ``suggested_discounted_price`` as ML's
+                                    recommendation for best exposure)
+    3. ``price`` + ``seller_percentage`` — SMART / PRICE_MATCHING (ML sets
+                                    the price; seller accepts or skips)
     4. ``seller_percentage`` only (no price) — UNHEALTHY_STOCK; we derive
        the target price from ``original_price * (1 - (seller% + meli%)/100)``
-    5. ``price`` + ``original_price`` only — generic fallback (compute
-       total% from the two prices)
+    5. ``price`` + ``original_price`` only — generic fallback
 
     Returns:
       - ``None`` when the promo doesn't match any known shape (data
@@ -948,14 +968,27 @@ def score_candidate_promo(
       - ``dict`` always with ``accepted: bool`` and ``denied_reason: str |
         None``. When accepted, the dict carries the activation plan
         (target_price, total_pct, etc). When denied, the same fields
-        carry what WOULD have been if cap/floor allowed — so the UI can
-        show "would have been R$ X (-Y%) but blocked by floor R$ Z".
+        carry what WOULD have been — UI can show "would have been R$ X
+        (-Y%) but blocked by floor R$ Z".
+
+    Extra fields on every entry:
+      - ``structure_type``: FIXED_PCT | FIXED_PRICE | INTERVAL | SUGG_ONLY
+      - ``is_fixed_price``: True when ML pins the price (no seller choice)
+      - ``exposure_boost``: 1.3 for DOD/LIGHTNING/DEAL (extra UI exposure),
+        1.0 otherwise — informational, not used for filtering.
     """
     if list_price is None or list_price <= 0:
         return None
     floor = margin_floor_price or 0.0
     meli_pct = float(p.get("meli_percentage") or 0)
     cap_total = cap_seller_pct + meli_pct
+    promo_type = (p.get("type") or "").upper()
+    exposure_boost = EXPOSURE_BOOST_FACTOR if promo_type in EXPOSURE_BOOST_TYPES else 1.0
+
+    def _copay(total_pct: float, seller_pct: float) -> str:
+        if meli_pct > 0.01:
+            return f" [seller {seller_pct:.1f}% + ML {meli_pct:.1f}% = {total_pct:.1f}%]"
+        return ""
 
     def _build(
         *,
@@ -967,6 +1000,7 @@ def score_candidate_promo(
         cap_check_value: float,
         cap_check_limit: float,
         cap_label: str,
+        structure_type: str,
     ) -> dict[str, Any]:
         accepted = True
         denied_reason: str | None = None
@@ -987,7 +1021,10 @@ def score_candidate_promo(
             "target_seller_pct": target_seller_pct,
             "meli_percentage": meli_pct,
             "constraint": constraint,
-            "reason": reason,
+            "reason": reason + _copay(target_total_pct, target_seller_pct),
+            "structure_type": structure_type,
+            "is_fixed_price": structure_type in ("FIXED_PCT", "FIXED_PRICE"),
+            "exposure_boost": exposure_boost,
         }
 
     # 1. fixed_percentage (cupons).
@@ -1004,36 +1041,88 @@ def score_candidate_promo(
             cap_check_value=fixed_f,
             cap_check_limit=cap_total,
             cap_label="total",
+            structure_type="FIXED_PCT",
         )
 
-    # 2. min_discounted_price (price-floor candidates).
+    # 2. min_discounted_price (INTERVAL types: DEAL/DOD/LIGHTNING/etc).
+    # The seller picks any price in [min, max] (max optional). We choose
+    # the highest price that respects: ML's min, our margin floor, and
+    # our cap_total. If ML publishes ``suggested_discounted_price`` and
+    # it falls inside our admissible band, we prefer it (best exposure).
     min_price = p.get("min_discounted_price")
     if min_price is not None:
         min_f = float(min_price)
+        max_raw = p.get("max_discounted_price")
+        max_f = float(max_raw) if max_raw is not None else None
+        sugg_raw = p.get("suggested_discounted_price")
+        sugg_f = float(sugg_raw) if sugg_raw is not None else None
         target_at_cap = round(list_price * (1 - cap_total / 100), 2)
-        target = round(max(min_f, floor, target_at_cap), 2)
+
+        # Lower bound: must respect ML min, our floor, and our cap.
+        lower = max(min_f, floor, target_at_cap)
+        # Upper bound: ML max if published, else list_price.
+        upper = max_f if max_f is not None else list_price
+
+        # If the admissible band is empty, deny — but still surface the
+        # would-have-been target so the UI shows why.
+        if lower > upper + 0.01:
+            target = round(lower, 2)
+            total_pct = round((list_price - target) / list_price * 100, 2)
+            seller_pct = round(total_pct - meli_pct, 2)
+            if floor > upper + 0.01:
+                reason = f"interval_empty: piso R$ {floor:.2f} > " f"max R$ {upper:.2f}"
+            elif target_at_cap > upper + 0.01:
+                reason = (
+                    f"interval_empty: cap_target R$ {target_at_cap:.2f} > " f"max R$ {upper:.2f}"
+                )
+            else:
+                reason = f"interval_empty: lower R$ {lower:.2f} > max R$ {upper:.2f}"
+            return {
+                "accepted": False,
+                "denied_reason": reason,
+                "target_price": target,
+                "target_total_pct": total_pct,
+                "target_seller_pct": seller_pct,
+                "meli_percentage": meli_pct,
+                "constraint": "min_discounted_price",
+                "reason": f"min R$ {min_f} max R$ {upper} → {reason}"
+                + _copay(total_pct, seller_pct),
+                "structure_type": "INTERVAL",
+                "is_fixed_price": False,
+                "exposure_boost": exposure_boost,
+            }
+
+        # Prefer ML's suggested price when it lies inside our band.
+        if sugg_f is not None and lower - 0.01 <= sugg_f <= upper + 0.01:
+            target = round(sugg_f, 2)
+            constraint = "suggested_within_interval"
+            reason_prefix = f"suggested R$ {sugg_f}"
+        else:
+            target = round(lower, 2)
+            constraint = "min_discounted_price"
+            reason_prefix = (
+                f"min R$ {min_f} → R$ {target}"
+                if abs(target - min_f) < 0.01
+                else f"lower R$ {target} (min={min_f}, floor={floor}, cap={target_at_cap})"
+            )
+
         total_pct = round((list_price - target) / list_price * 100, 2)
-        # Esta variante NÃO viola cap por construção (target_at_cap respeita cap).
-        # Pode violar floor quando min_f < floor (e o "max" elevou target a
-        # floor, mas a regra do ML pode exigir min_f exato — registramos como
-        # denied pra transparência).
-        denied = min_f + 0.01 < floor
+        seller_pct = round(total_pct - meli_pct, 2)
         return {
-            "accepted": not denied,
-            "denied_reason": (
-                f"floor_violation: min_discounted_price R$ {min_f:.2f} < " f"piso R$ {floor:.2f}"
-                if denied
-                else None
-            ),
+            "accepted": True,
+            "denied_reason": None,
             "target_price": target,
             "target_total_pct": total_pct,
-            "target_seller_pct": round(total_pct - meli_pct, 2),
+            "target_seller_pct": seller_pct,
             "meli_percentage": meli_pct,
-            "constraint": "min_discounted_price",
-            "reason": f"min_price R$ {min_f} → R$ {target} (-{total_pct}%)",
+            "constraint": constraint,
+            "reason": f"{reason_prefix} (-{total_pct}%)" + _copay(total_pct, seller_pct),
+            "structure_type": "INTERVAL",
+            "is_fixed_price": False,
+            "exposure_boost": exposure_boost,
         }
 
-    # 2b. suggested_discounted_price (fallback when min isn't published).
+    # 2b. suggested_discounted_price only (no min/max published).
     sugg = p.get("suggested_discounted_price")
     if sugg is not None:
         sugg_f = float(sugg)
@@ -1047,9 +1136,10 @@ def score_candidate_promo(
             cap_check_value=total_pct,
             cap_check_limit=cap_total,
             cap_label="total",
+            structure_type="SUGG_ONLY",
         )
 
-    # 3. price + seller_percentage (SMART / PRICE_MATCHING).
+    # 3. price + seller_percentage (SMART / PRICE_MATCHING) — ML pins price.
     ml_price = p.get("price")
     seller_raw = p.get("seller_percentage")
     if ml_price is not None and seller_raw is not None:
@@ -1061,13 +1151,14 @@ def score_candidate_promo(
             target_total_pct=total_pct,
             target_seller_pct=seller_f,
             constraint="ml_priced",
-            reason=f"{p.get('type')} -{total_pct}% @ R$ {price_f} (seller -{seller_f}%)",
+            reason=f"{p.get('type')} -{total_pct}% @ R$ {price_f}",
             cap_check_value=seller_f,
             cap_check_limit=cap_seller_pct,
             cap_label="seller",
+            structure_type="FIXED_PRICE",
         )
 
-    # 4. seller_percentage only — derive target price from original.
+    # 4. seller_percentage only — derive target from original_price.
     if seller_raw is not None:
         orig = p.get("original_price") or list_price
         seller_f = float(seller_raw)
@@ -1085,9 +1176,10 @@ def score_candidate_promo(
             cap_check_value=seller_f,
             cap_check_limit=cap_seller_pct,
             cap_label="seller",
+            structure_type="FIXED_PCT",
         )
 
-    # 5. price + original_price only (generic fallback).
+    # 5. price + original_price only (generic fallback) — ML pins price.
     if ml_price is not None:
         orig = p.get("original_price")
         if orig:
@@ -1102,6 +1194,7 @@ def score_candidate_promo(
                 cap_check_value=total_pct,
                 cap_check_limit=cap_total,
                 cap_label="total",
+                structure_type="FIXED_PRICE",
             )
 
     return None
@@ -1144,6 +1237,21 @@ def enumerate_activations_for_item(
             continue
         status = (p.get("status") or "").lower()
         meli_pct = float(p.get("meli_percentage") or 0)
+        promo_type = (p.get("type") or "").upper()
+        # Structure inference for STARTED entries (no candidate fields):
+        if promo_type in FIXED_PRICE_TYPES:
+            started_structure = "FIXED_PRICE"
+            started_fixed = True
+        elif promo_type in EXPOSURE_BOOST_TYPES or promo_type in {
+            "PRICE_DISCOUNT",
+            "SELLER_CAMPAIGN",
+        }:
+            started_structure = "INTERVAL"
+            started_fixed = False
+        else:
+            started_structure = "FIXED_PCT"
+            started_fixed = True
+        exposure_boost = EXPOSURE_BOOST_FACTOR if promo_type in EXPOSURE_BOOST_TYPES else 1.0
 
         # STARTED promos: report as already-active for the operator audit.
         if status == "started":
@@ -1164,6 +1272,9 @@ def enumerate_activations_for_item(
                     "reason": f"{p.get('type')} já STARTED -{total_pct:.1f}%"
                     if total_pct
                     else "STARTED",
+                    "structure_type": started_structure,
+                    "is_fixed_price": started_fixed,
+                    "exposure_boost": exposure_boost,
                 }
             )
             continue
