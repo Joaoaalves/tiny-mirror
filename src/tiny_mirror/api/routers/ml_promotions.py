@@ -430,32 +430,54 @@ async def refresh_costs(
 
 @router.post("/costs/refresh-all", response_model=dict[str, int])
 async def refresh_all_costs(
+    request: Request,
     session: AsyncSession = Depends(db_session),
-    service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, int]:
-    """Itera por todos os MLBs ativos e refresca o snapshot do GAS endpoint.
+    """Atualiza snapshots de custo via bulk endpoint do GAS.
 
-    Idempotente; commit por batches de 25 pra não bloquear conexão.
-    Usado pelo cron diário ml-costs-refresh-daily.
+    Antes: loop com 1 GET ``?action=cost`` por MLB ativo no ml_listings.
+    Para ~370 MLBs isso levava ~25 min e estourava o curl timeout.
+
+    Agora: 1 GET ``?action=costs_all`` que devolve todo o dump da planilha
+    de uma vez (~15-30s independente de N). Implementação compartilhada
+    com ``/caps/recompute?refresh_costs_first=true``.
+
+    Idempotente. Cron diário ``ml-costs-refresh-daily`` continua hitting
+    esse endpoint — apenas o motor mudou.
+
+    Mantém shape de resposta ``{total, ok, errors}`` por compat com o
+    shell wrapper ``refresh-costs.sh``.
     """
-    listings = MLListingRepository(session)
-    pairs = await listings.get_all_active_mlb_ids()
-    ok = 0
-    errors = 0
-    for i, (mlb_id, _sku) in enumerate(pairs):
-        try:
-            result = await service.refresh_costs_for_mlb(session, mlb_id)
-            if result is None or (isinstance(result, dict) and result.get("error")):
-                errors += 1
-            else:
-                ok += 1
-        except Exception:
-            errors += 1
-        # Commit em batches de 25 para liberar locks
-        if (i + 1) % 25 == 0:
-            await session.commit()
-    await session.commit()
-    return {"total": len(pairs), "ok": ok, "errors": errors}
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.cost_refresh_service import (
+        CostRefreshError,
+        refresh_all_from_bulk,
+    )
+    from tiny_mirror.services.gas_client import GASClient
+
+    if not settings.gas_base_url or not settings.gas_token:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="GAS base URL / token not configured in env",
+        )
+    gas = GASClient(
+        http=request.app.state.http_client,
+        base_url=settings.gas_base_url,
+        token=settings.gas_token,
+        timeout_seconds=settings.gas_http_timeout_seconds,
+    )
+    try:
+        stats = await refresh_all_from_bulk(session, gas)
+    except CostRefreshError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"GAS bulk refresh failed: {exc}",
+        ) from exc
+    return {
+        "total": stats["received"],
+        "ok": stats["upserted"],
+        "errors": stats["skipped_no_data"] + stats["skipped_invalid_id"],
+    }
 
 
 # ---------------------------------------------------------------------------
