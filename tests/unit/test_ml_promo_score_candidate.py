@@ -61,6 +61,7 @@ def test_suggested_within_band_is_preferred():
     assert out["constraint"] == "suggested_within_interval"
     assert out["exposure_boost"] == 1.3
     assert "ML 5.0%" in out["reason"]
+    assert "Sugerido ML" in out["reason"]
 
 
 def test_suggested_outside_band_falls_back_to_lower():
@@ -95,8 +96,11 @@ def test_interval_empty_when_floor_above_max():
         list_price=50.0,
     )
     assert out["accepted"] is False
+    # English machine code in denied_reason, Portuguese in user-facing reason.
     assert "interval_empty" in out["denied_reason"]
     assert "piso R$ 42.00" in out["denied_reason"]
+    assert "Piso R$ 42.00" in out["reason"]
+    assert "máx ML" in out["reason"]
 
 
 def test_smart_marks_fixed_price():
@@ -140,9 +144,9 @@ def test_copay_breakdown_in_reason_when_meli_pct():
         margin_floor_price=35.0,
         list_price=50.0,
     )
-    assert "seller 15.0%" in out["reason"]
+    # PT format: "...· você 15.0% + ML 5.0%"
+    assert "você 15.0%" in out["reason"]
     assert "ML 5.0%" in out["reason"]
-    assert "20.0%" in out["reason"]
 
 
 def test_copay_omitted_when_meli_pct_zero():
@@ -153,6 +157,7 @@ def test_copay_omitted_when_meli_pct_zero():
         list_price=50.0,
     )
     assert "ML " not in out["reason"]
+    assert "você" not in out["reason"]
 
 
 def test_cap_exceeded_still_denies_fixed_pct():
@@ -165,3 +170,24 @@ def test_cap_exceeded_still_denies_fixed_pct():
     )
     assert out["accepted"] is False
     assert "cap_exceeded" in out["denied_reason"]
+    assert "Cap excedido" in out["reason"]
+
+
+def test_reason_uses_portuguese_for_accepted_interval():
+    """Smoke that the user-facing reason is in PT (no English keywords)."""
+    out = score_candidate_promo(
+        {
+            "type": "DEAL",
+            "min_discounted_price": 35.0,
+            "max_discounted_price": 50.0,
+            "meli_percentage": 0,
+        },
+        cap_seller_pct=20.0,
+        margin_floor_price=42.0,
+        list_price=50.0,
+    )
+    # English tokens must not appear in the user-facing reason.
+    assert "lower" not in out["reason"]
+    assert "suggested" not in out["reason"]
+    assert "min " not in out["reason"]
+    assert "floor" not in out["reason"].lower() or "piso" in out["reason"].lower()

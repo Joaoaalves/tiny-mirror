@@ -985,10 +985,13 @@ def score_candidate_promo(
     promo_type = (p.get("type") or "").upper()
     exposure_boost = EXPOSURE_BOOST_FACTOR if promo_type in EXPOSURE_BOOST_TYPES else 1.0
 
-    def _copay(total_pct: float, seller_pct: float) -> str:
+    def _copay(seller_pct: float) -> str:
         if meli_pct > 0.01:
-            return f" [seller {seller_pct:.1f}% + ML {meli_pct:.1f}% = {total_pct:.1f}%]"
+            return f" · você {seller_pct:.1f}% + ML {meli_pct:.1f}%"
         return ""
+
+    # Portuguese labels for the cap_label machine token.
+    cap_label_pt = {"total": "total", "seller": "seller"}
 
     def _build(
         *,
@@ -1004,15 +1007,24 @@ def score_candidate_promo(
     ) -> dict[str, Any]:
         accepted = True
         denied_reason: str | None = None
+        # On denial we replace `reason` with the human PT denial message —
+        # the would-have-been target is still surfaced via target_price /
+        # target_total_pct so the UI doesn't need it repeated in text.
+        ui_reason = reason + _copay(target_seller_pct)
         if cap_check_value > cap_check_limit + 0.01:
             accepted = False
             denied_reason = (
                 f"cap_exceeded: {cap_label} {cap_check_value:.2f}% > "
                 f"limite {cap_check_limit:.2f}%"
             )
+            ui_reason = (
+                f"Cap excedido ({cap_label_pt.get(cap_label, cap_label)} "
+                f"{cap_check_value:.1f}% > limite {cap_check_limit:.1f}%)"
+            )
         elif target_price + 0.01 < floor:
             accepted = False
             denied_reason = f"floor_violation: R$ {target_price:.2f} < piso R$ {floor:.2f}"
+            ui_reason = f"Abaixo do piso (R$ {target_price:.2f} < piso R$ {floor:.2f})"
         return {
             "accepted": accepted,
             "denied_reason": denied_reason,
@@ -1021,7 +1033,7 @@ def score_candidate_promo(
             "target_seller_pct": target_seller_pct,
             "meli_percentage": meli_pct,
             "constraint": constraint,
-            "reason": reason + _copay(target_total_pct, target_seller_pct),
+            "reason": ui_reason,
             "structure_type": structure_type,
             "is_fixed_price": structure_type in ("FIXED_PCT", "FIXED_PRICE"),
             "exposure_boost": exposure_boost,
@@ -1037,7 +1049,7 @@ def score_candidate_promo(
             target_total_pct=fixed_f,
             target_seller_pct=round(fixed_f - meli_pct, 2),
             constraint="fixed_percentage",
-            reason=f"fixed -{fixed_f}% @ R$ {target}",
+            reason=f"Cupom fixo -{fixed_f:.1f}%",
             cap_check_value=fixed_f,
             cap_check_limit=cap_total,
             cap_label="total",
@@ -1063,30 +1075,33 @@ def score_candidate_promo(
         # Upper bound: ML max if published, else list_price.
         upper = max_f if max_f is not None else list_price
 
-        # If the admissible band is empty, deny — but still surface the
-        # would-have-been target so the UI shows why.
+        # If the admissible band is empty, deny — the would-have-been
+        # target (target_price/total_pct) is still surfaced so the UI shows
+        # what would have happened.
         if lower > upper + 0.01:
             target = round(lower, 2)
             total_pct = round((list_price - target) / list_price * 100, 2)
             seller_pct = round(total_pct - meli_pct, 2)
             if floor > upper + 0.01:
-                reason = f"interval_empty: piso R$ {floor:.2f} > " f"max R$ {upper:.2f}"
+                code_reason = f"interval_empty: piso R$ {floor:.2f} > max R$ {upper:.2f}"
+                ui_reason = f"Piso R$ {floor:.2f} > máx ML R$ {upper:.2f}"
             elif target_at_cap > upper + 0.01:
-                reason = (
-                    f"interval_empty: cap_target R$ {target_at_cap:.2f} > " f"max R$ {upper:.2f}"
+                code_reason = (
+                    f"interval_empty: cap_target R$ {target_at_cap:.2f} > max R$ {upper:.2f}"
                 )
+                ui_reason = f"Cap exige R$ {target_at_cap:.2f} mas máx ML é R$ {upper:.2f}"
             else:
-                reason = f"interval_empty: lower R$ {lower:.2f} > max R$ {upper:.2f}"
+                code_reason = f"interval_empty: lower R$ {lower:.2f} > max R$ {upper:.2f}"
+                ui_reason = f"Intervalo vazio (R$ {lower:.2f} > máx ML R$ {upper:.2f})"
             return {
                 "accepted": False,
-                "denied_reason": reason,
+                "denied_reason": code_reason,
                 "target_price": target,
                 "target_total_pct": total_pct,
                 "target_seller_pct": seller_pct,
                 "meli_percentage": meli_pct,
                 "constraint": "min_discounted_price",
-                "reason": f"min R$ {min_f} max R$ {upper} → {reason}"
-                + _copay(total_pct, seller_pct),
+                "reason": ui_reason,
                 "structure_type": "INTERVAL",
                 "is_fixed_price": False,
                 "exposure_boost": exposure_boost,
@@ -1096,15 +1111,18 @@ def score_candidate_promo(
         if sugg_f is not None and lower - 0.01 <= sugg_f <= upper + 0.01:
             target = round(sugg_f, 2)
             constraint = "suggested_within_interval"
-            reason_prefix = f"suggested R$ {sugg_f}"
+            ui_reason_prefix = f"Sugerido ML R$ {sugg_f:.2f}"
         else:
             target = round(lower, 2)
             constraint = "min_discounted_price"
-            reason_prefix = (
-                f"min R$ {min_f} → R$ {target}"
-                if abs(target - min_f) < 0.01
-                else f"lower R$ {target} (min={min_f}, floor={floor}, cap={target_at_cap})"
-            )
+            if abs(target - min_f) < 0.01:
+                ui_reason_prefix = f"Mínimo ML R$ {min_f:.2f}"
+            elif abs(target - floor) < 0.01:
+                ui_reason_prefix = f"Limitado pelo piso R$ {floor:.2f}"
+            elif abs(target - target_at_cap) < 0.01:
+                ui_reason_prefix = f"Limitado pelo cap R$ {target_at_cap:.2f}"
+            else:
+                ui_reason_prefix = f"Alvo R$ {target:.2f}"
 
         total_pct = round((list_price - target) / list_price * 100, 2)
         seller_pct = round(total_pct - meli_pct, 2)
@@ -1116,7 +1134,7 @@ def score_candidate_promo(
             "target_seller_pct": seller_pct,
             "meli_percentage": meli_pct,
             "constraint": constraint,
-            "reason": f"{reason_prefix} (-{total_pct}%)" + _copay(total_pct, seller_pct),
+            "reason": f"{ui_reason_prefix} · -{total_pct:.1f}%" + _copay(seller_pct),
             "structure_type": "INTERVAL",
             "is_fixed_price": False,
             "exposure_boost": exposure_boost,
@@ -1132,7 +1150,7 @@ def score_candidate_promo(
             target_total_pct=total_pct,
             target_seller_pct=round(total_pct - meli_pct, 2),
             constraint="suggested_discounted_price",
-            reason=f"suggested -{total_pct}% @ R$ {sugg_f}",
+            reason=f"Sugerido ML R$ {sugg_f:.2f} · -{total_pct:.1f}%",
             cap_check_value=total_pct,
             cap_check_limit=cap_total,
             cap_label="total",
@@ -1151,7 +1169,7 @@ def score_candidate_promo(
             target_total_pct=total_pct,
             target_seller_pct=seller_f,
             constraint="ml_priced",
-            reason=f"{p.get('type')} -{total_pct}% @ R$ {price_f}",
+            reason=f"Preço fixado pelo ML R$ {price_f:.2f} · -{total_pct:.1f}%",
             cap_check_value=seller_f,
             cap_check_limit=cap_seller_pct,
             cap_label="seller",
@@ -1169,10 +1187,7 @@ def score_candidate_promo(
             target_total_pct=total_pct,
             target_seller_pct=seller_f,
             constraint="seller_pct_only",
-            reason=(
-                f"{p.get('type')} seller -{seller_f}% → R$ {derived_price} "
-                f"(derivado de original R$ {orig})"
-            ),
+            reason=f"Seller -{seller_f:.1f}% sobre R$ {orig:.2f} → R$ {derived_price:.2f}",
             cap_check_value=seller_f,
             cap_check_limit=cap_seller_pct,
             cap_label="seller",
@@ -1190,7 +1205,7 @@ def score_candidate_promo(
                 target_total_pct=total_pct,
                 target_seller_pct=round(total_pct - meli_pct, 2),
                 constraint="price_only",
-                reason=f"{p.get('type')} -{total_pct}% @ R$ {price_f}",
+                reason=f"Preço fixado pelo ML R$ {price_f:.2f} · -{total_pct:.1f}%",
                 cap_check_value=total_pct,
                 cap_check_limit=cap_total,
                 cap_label="total",
@@ -1293,13 +1308,9 @@ def enumerate_activations_for_item(
             # silencioso — não temos como julgar.
             continue
         accepted = scored.get("accepted", False)
-        # Quando denied, sobrescrevemos `reason` pelo motivo da rejeição
-        # pra UI mostrar diretamente. O cálculo original (-X% @ R$Y) fica
-        # em scored.reason ainda — caller pode acessar via constraint/etc.
-        if not accepted:
-            scored = dict(scored)
-            denial = scored.get("denied_reason") or "denied"
-            scored["reason"] = f"{denial} · alvo: {scored.get('reason', '')}"
+        # score_candidate_promo already writes the human PT reason for
+        # both accepted and denied entries; denied_reason carries the
+        # English machine code separately. Nothing to reshape here.
         out.append(
             {
                 "promo_id": p.get("id"),
