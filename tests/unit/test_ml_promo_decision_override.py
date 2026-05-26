@@ -43,42 +43,53 @@ def _repo(row: SimpleNamespace | None) -> MagicMock:
 
 async def test_override_returns_recomputed_pcts_when_valid() -> None:
     repo = _repo(_row())
-    out = await _apply_target_override(repo, decision_id=1, override_price=Decimal("45.00"))
+    out, warning = await _apply_target_override(
+        repo, decision_id=1, override_price=Decimal("45.00")
+    )
     assert out["target_price"] == Decimal("45.00")
     # (50 - 45) / 50 * 100 = 10.00
     assert out["target_total_pct"] == Decimal("10.00")
     # no co-pay → seller = total
     assert out["target_seller_pct"] == Decimal("10.00")
+    assert warning is None
 
 
 async def test_override_subtracts_meli_copay_from_seller_pct() -> None:
     repo = _repo(_row(meli_percentage=Decimal("3")))
-    out = await _apply_target_override(repo, decision_id=1, override_price=Decimal("45.00"))
+    out, _ = await _apply_target_override(repo, decision_id=1, override_price=Decimal("45.00"))
     # total 10% - ML 3% = seller 7%
     assert out["target_seller_pct"] == Decimal("7.00")
 
 
-async def test_override_rejects_below_floor() -> None:
+async def test_override_below_floor_returns_warning_not_error() -> None:
+    """SOFT floor: piso violado retorna warning string, não 422."""
     repo = _repo(_row(floor_price=Decimal("42.00")))
-    with pytest.raises(HTTPException) as exc:
-        await _apply_target_override(repo, decision_id=1, override_price=Decimal("41.00"))
-    assert exc.value.status_code == 422
-    assert "piso" in exc.value.detail
+    out, warning = await _apply_target_override(
+        repo, decision_id=1, override_price=Decimal("41.00")
+    )
+    assert out["target_price"] == Decimal("41.00")
+    assert warning is not None
+    assert "piso" in warning
+    assert "margem em risco" in warning
 
 
 async def test_override_rejects_seller_cap_exceeded() -> None:
+    """HARD cap: seller > cap_pct continua 422 (cap do canal ML)."""
     # cap 5% → seller% must stay ≤ 5%. For list=50 and target=40, total=20%.
     repo = _repo(_row(cap_pct=Decimal("5.00"), floor_price=None))
     with pytest.raises(HTTPException) as exc:
         await _apply_target_override(repo, decision_id=1, override_price=Decimal("40.00"))
     assert exc.value.status_code == 422
-    assert "cap" in exc.value.detail
+    assert "cap ML" in exc.value.detail
 
 
 async def test_override_allows_equal_to_floor() -> None:
     repo = _repo(_row(floor_price=Decimal("42.00")))
-    out = await _apply_target_override(repo, decision_id=1, override_price=Decimal("42.00"))
+    out, warning = await _apply_target_override(
+        repo, decision_id=1, override_price=Decimal("42.00")
+    )
     assert out["target_price"] == Decimal("42.00")
+    assert warning is None
 
 
 async def test_override_rejects_zero_or_negative() -> None:

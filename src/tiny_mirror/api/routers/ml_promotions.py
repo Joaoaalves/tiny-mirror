@@ -996,13 +996,18 @@ async def _apply_target_override(
     repo: MLPromoDecisionRepository,
     decision_id: int,
     override_price: Decimal,
-) -> dict[str, Decimal]:
-    """Validate a target_price override against the row's stored cap/
-    floor and return the recomputed pct fields for ``repo.decide``.
+) -> tuple[dict[str, Decimal], str | None]:
+    """Validate a target_price override and return the recomputed pct
+    fields plus an optional warning string.
 
-    Raises HTTPException(422) when the override would violate the
-    margin floor or the seller-share cap stamped on the decision at
-    creation time. Operator can still nudge above floor freely.
+    Limites diferentes:
+    - **cap_pct** (limite do ML pra share do seller) é HARD: viola → 422.
+    - **floor_price** (nosso piso de margem) é SOFT: o operador pode
+      aprovar mesmo abaixo, mas devolvemos uma string de aviso que o
+      caller anexa nas `notes` da linha pra audit ("margem em risco").
+
+    Raises HTTPException(422) só quando o override viola o cap do ML
+    (ou o preço é inválido). O piso só gera warning.
     """
     row = await repo.get(decision_id)
     if row is None:
@@ -1015,32 +1020,43 @@ async def _apply_target_override(
 
     if override_price <= 0:
         raise HTTPException(status_code=422, detail="target_price must be > 0")
-    if row.floor_price is not None and override_price + Decimal("0.005") < row.floor_price:
-        raise HTTPException(
-            status_code=422,
-            detail=(f"target_price R$ {override_price} viola piso R$ {row.floor_price}"),
-        )
 
     list_price = Decimal(row.list_price)
     meli_pct = Decimal(row.meli_percentage or 0)
     new_total_pct = ((list_price - override_price) / list_price * 100).quantize(Decimal("0.01"))
     new_seller_pct = (new_total_pct - meli_pct).quantize(Decimal("0.01"))
 
-    # cap_pct é o teto da parte do seller (sem co-pay do ML).
+    # HARD: cap_pct é o teto da parte do seller (sem co-pay do ML). Pra
+    # promoções como SMART/DEAL, ML usa esse cap pra definir se o seller
+    # está jogando dentro da regra do canal. Override que viola é
+    # bloqueado.
     if row.cap_pct is not None and new_seller_pct > row.cap_pct + Decimal("0.01"):
         raise HTTPException(
             status_code=422,
             detail=(
-                f"seller {new_seller_pct}% > cap {row.cap_pct}% (target_price "
-                f"R$ {override_price} requer desconto de seller maior que o permitido)"
+                f"seller {new_seller_pct}% > cap ML {row.cap_pct}% "
+                f"(target_price R$ {override_price} ultrapassa o cap do canal)"
             ),
         )
 
-    return {
-        "target_price": override_price.quantize(Decimal("0.01")),
-        "target_total_pct": new_total_pct,
-        "target_seller_pct": new_seller_pct,
-    }
+    # SOFT: piso de margem é nosso, não do ML. Operador pode forçar
+    # abaixo (ex: pra match preço de concorrente, ou pra giro). Volta
+    # uma warning string pra ser anexada na audit; o status code fica 200.
+    warning: str | None = None
+    if row.floor_price is not None and override_price + Decimal("0.005") < row.floor_price:
+        warning = (
+            f"[forçado abaixo do piso] target R$ {override_price} < "
+            f"piso R$ {row.floor_price} — margem em risco"
+        )
+
+    return (
+        {
+            "target_price": override_price.quantize(Decimal("0.01")),
+            "target_total_pct": new_total_pct,
+            "target_seller_pct": new_seller_pct,
+        },
+        warning,
+    )
 
 
 @router.post("/decisions/{decision_id}/approve", response_model=DecisionOut)
@@ -1051,13 +1067,18 @@ async def approve_decision(
 ) -> DecisionOut:
     repo = MLPromoDecisionRepository(session)
     override: dict[str, Decimal] = {}
+    notes = body.notes
     if body.target_price is not None:
-        override = await _apply_target_override(repo, decision_id, body.target_price)
+        override, warning = await _apply_target_override(repo, decision_id, body.target_price)
+        if warning:
+            # Anexa o aviso de piso violado nas notas pra audit. Se o
+            # operador já passou um `notes`, preserva no início.
+            notes = f"{notes}\n{warning}".strip() if notes else warning
     row = await repo.decide(
         decision_id,
         status="approved",
         by=body.decided_by,
-        notes=body.notes,
+        notes=notes,
         **override,
     )
     if row is None:
