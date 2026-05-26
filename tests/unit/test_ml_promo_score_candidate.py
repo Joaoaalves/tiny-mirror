@@ -60,8 +60,8 @@ def test_suggested_within_band_is_preferred():
     assert out["target_price"] == 45.0
     assert out["constraint"] == "suggested_within_interval"
     assert out["exposure_boost"] == 1.3
-    assert "ML 5.0%" in out["reason"]
-    assert "Sugerido ML" in out["reason"]
+    assert "ML banca 5.0%" in out["reason"]
+    assert "ML recomenda" in out["reason"]
 
 
 def test_suggested_outside_band_falls_back_to_lower():
@@ -99,8 +99,8 @@ def test_interval_empty_when_floor_above_max():
     # English machine code in denied_reason, Portuguese in user-facing reason.
     assert "interval_empty" in out["denied_reason"]
     assert "piso R$ 42.00" in out["denied_reason"]
-    assert "Piso R$ 42.00" in out["reason"]
-    assert "máx ML" in out["reason"]
+    assert "Bloqueado pelo piso" in out["reason"]
+    assert "R$ 42.00" in out["reason"]
 
 
 def test_smart_marks_fixed_price():
@@ -144,9 +144,9 @@ def test_copay_breakdown_in_reason_when_meli_pct():
         margin_floor_price=35.0,
         list_price=50.0,
     )
-    # PT format: "...· você 15.0% + ML 5.0%"
-    assert "você 15.0%" in out["reason"]
-    assert "ML 5.0%" in out["reason"]
+    # PT format clear: "...(seller paga 15.0% · ML banca 5.0%)"
+    assert "seller paga 15.0%" in out["reason"]
+    assert "ML banca 5.0%" in out["reason"]
 
 
 def test_copay_omitted_when_meli_pct_zero():
@@ -156,8 +156,8 @@ def test_copay_omitted_when_meli_pct_zero():
         margin_floor_price=20.0,
         list_price=50.0,
     )
-    assert "ML " not in out["reason"]
-    assert "você" not in out["reason"]
+    assert "ML banca" not in out["reason"]
+    assert "seller paga" not in out["reason"]
 
 
 def test_cap_exceeded_still_denies_fixed_pct():
@@ -170,7 +170,7 @@ def test_cap_exceeded_still_denies_fixed_pct():
     )
     assert out["accepted"] is False
     assert "cap_exceeded" in out["denied_reason"]
-    assert "Cap excedido" in out["reason"]
+    assert "Bloqueado pelo cap" in out["reason"]
 
 
 def test_reason_uses_portuguese_for_accepted_interval():
