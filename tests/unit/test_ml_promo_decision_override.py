@@ -1,0 +1,102 @@
+"""Unit coverage for `_apply_target_override` in the ml_promotions router.
+
+Validates that the server re-checks floor/cap when the operator
+overrides ``target_price`` before approving. The check uses the
+``floor_price`` / ``cap_pct`` / ``meli_percentage`` / ``list_price``
+snapshot stored on the decision row at creation time (not the live
+cap which may have moved since).
+"""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from fastapi import HTTPException
+
+from tiny_mirror.api.routers.ml_promotions import _apply_target_override
+
+pytestmark = pytest.mark.unit
+
+
+def _row(
+    list_price: Decimal | None = Decimal("50.00"),
+    floor_price: Decimal | None = Decimal("40.00"),
+    cap_pct: Decimal | None = Decimal("20.00"),
+    meli_percentage: Decimal | None = Decimal("0"),
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        list_price=list_price,
+        floor_price=floor_price,
+        cap_pct=cap_pct,
+        meli_percentage=meli_percentage,
+    )
+
+
+def _repo(row: SimpleNamespace | None) -> MagicMock:
+    repo = MagicMock()
+    repo.get = AsyncMock(return_value=row)
+    return repo
+
+
+async def test_override_returns_recomputed_pcts_when_valid() -> None:
+    repo = _repo(_row())
+    out = await _apply_target_override(repo, decision_id=1, override_price=Decimal("45.00"))
+    assert out["target_price"] == Decimal("45.00")
+    # (50 - 45) / 50 * 100 = 10.00
+    assert out["target_total_pct"] == Decimal("10.00")
+    # no co-pay → seller = total
+    assert out["target_seller_pct"] == Decimal("10.00")
+
+
+async def test_override_subtracts_meli_copay_from_seller_pct() -> None:
+    repo = _repo(_row(meli_percentage=Decimal("3")))
+    out = await _apply_target_override(repo, decision_id=1, override_price=Decimal("45.00"))
+    # total 10% - ML 3% = seller 7%
+    assert out["target_seller_pct"] == Decimal("7.00")
+
+
+async def test_override_rejects_below_floor() -> None:
+    repo = _repo(_row(floor_price=Decimal("42.00")))
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("41.00"))
+    assert exc.value.status_code == 422
+    assert "piso" in exc.value.detail
+
+
+async def test_override_rejects_seller_cap_exceeded() -> None:
+    # cap 5% → seller% must stay ≤ 5%. For list=50 and target=40, total=20%.
+    repo = _repo(_row(cap_pct=Decimal("5.00"), floor_price=None))
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("40.00"))
+    assert exc.value.status_code == 422
+    assert "cap" in exc.value.detail
+
+
+async def test_override_allows_equal_to_floor() -> None:
+    repo = _repo(_row(floor_price=Decimal("42.00")))
+    out = await _apply_target_override(repo, decision_id=1, override_price=Decimal("42.00"))
+    assert out["target_price"] == Decimal("42.00")
+
+
+async def test_override_rejects_zero_or_negative() -> None:
+    repo = _repo(_row())
+    with pytest.raises(HTTPException):
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("0"))
+
+
+async def test_override_404_when_decision_missing() -> None:
+    repo = _repo(None)
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=999, override_price=Decimal("45"))
+    assert exc.value.status_code == 404
+
+
+async def test_override_422_when_list_price_missing() -> None:
+    repo = _repo(_row(list_price=None))
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("45"))
+    assert exc.value.status_code == 422
+    assert "list_price" in exc.value.detail

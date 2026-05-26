@@ -440,6 +440,9 @@ class MLPromoDecisionRepository:
         status: str,
         by: str | None = None,
         notes: str | None = None,
+        target_price: Decimal | None = None,
+        target_total_pct: Decimal | None = None,
+        target_seller_pct: Decimal | None = None,
     ) -> MLPromoDecisionORM | None:
         """Move a pending decision to a terminal state.
 
@@ -447,6 +450,12 @@ class MLPromoDecisionRepository:
         All three dedupe equally — the cron will not re-prompt for a
         row that has been touched by the operator. ``ignored`` is the
         "skip this without committing yes/no" lane.
+
+        When the operator overrides ``target_price`` before approving,
+        the caller passes the recomputed pct values too. Repo trusts
+        the validated values — server-side validation happens in the
+        router layer (where ``list_price``/``floor_price``/``cap_pct``
+        live as decision columns).
         """
         if status not in ("approved", "rejected", "ignored"):
             raise ValueError(f"invalid decision status: {status}")
@@ -458,5 +467,30 @@ class MLPromoDecisionRepository:
         row.decided_by = by
         if notes is not None:
             row.notes = notes
+        if target_price is not None:
+            row.target_price = target_price
+        if target_total_pct is not None:
+            row.target_total_pct = target_total_pct
+        if target_seller_pct is not None:
+            row.target_seller_pct = target_seller_pct
+        await self._session.flush()
+        return row
+
+    async def revert_to_pending(
+        self,
+        decision_id: int,
+    ) -> MLPromoDecisionORM | None:
+        """Undo a terminal decision back to pending.
+
+        Keeps ``decided_at`` / ``decided_by`` populated as audit of the
+        last action — the row simply re-enters the queue. The cron's
+        dedupe still respects (mlb_id, promo_key) so a fresh `generate`
+        won't create a duplicate row; the operator just gets another
+        chance to decide.
+        """
+        row = await self.get(decision_id)
+        if row is None or row.status == "pending":
+            return None
+        row.status = "pending"
         await self._session.flush()
         return row

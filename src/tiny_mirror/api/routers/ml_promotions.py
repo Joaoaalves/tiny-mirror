@@ -212,6 +212,12 @@ class DecisionDecideIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
     decided_by: str | None = None
     notes: str | None = None
+    # Override do alvo digitado pelo operador antes de aprovar. Quando
+    # presente, o servidor re-valida contra floor_price/cap_pct + meli
+    # da própria linha; rejeita 422 se violar. target_total_pct e
+    # target_seller_pct são recalculados a partir do novo target_price
+    # + list_price + meli_percentage.
+    target_price: Decimal | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -986,6 +992,57 @@ async def list_decisions(
     return [DecisionOut.model_validate(r) for r in rows]
 
 
+async def _apply_target_override(
+    repo: MLPromoDecisionRepository,
+    decision_id: int,
+    override_price: Decimal,
+) -> dict[str, Decimal]:
+    """Validate a target_price override against the row's stored cap/
+    floor and return the recomputed pct fields for ``repo.decide``.
+
+    Raises HTTPException(422) when the override would violate the
+    margin floor or the seller-share cap stamped on the decision at
+    creation time. Operator can still nudge above floor freely.
+    """
+    row = await repo.get(decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"decision {decision_id} not found")
+    if row.list_price is None or row.list_price <= 0:
+        raise HTTPException(
+            status_code=422,
+            detail="decision has no list_price snapshot; override not supported",
+        )
+
+    if override_price <= 0:
+        raise HTTPException(status_code=422, detail="target_price must be > 0")
+    if row.floor_price is not None and override_price + Decimal("0.005") < row.floor_price:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"target_price R$ {override_price} viola piso R$ {row.floor_price}"),
+        )
+
+    list_price = Decimal(row.list_price)
+    meli_pct = Decimal(row.meli_percentage or 0)
+    new_total_pct = ((list_price - override_price) / list_price * 100).quantize(Decimal("0.01"))
+    new_seller_pct = (new_total_pct - meli_pct).quantize(Decimal("0.01"))
+
+    # cap_pct é o teto da parte do seller (sem co-pay do ML).
+    if row.cap_pct is not None and new_seller_pct > row.cap_pct + Decimal("0.01"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"seller {new_seller_pct}% > cap {row.cap_pct}% (target_price "
+                f"R$ {override_price} requer desconto de seller maior que o permitido)"
+            ),
+        )
+
+    return {
+        "target_price": override_price.quantize(Decimal("0.01")),
+        "target_total_pct": new_total_pct,
+        "target_seller_pct": new_seller_pct,
+    }
+
+
 @router.post("/decisions/{decision_id}/approve", response_model=DecisionOut)
 async def approve_decision(
     decision_id: int,
@@ -993,7 +1050,16 @@ async def approve_decision(
     session: AsyncSession = Depends(db_session),
 ) -> DecisionOut:
     repo = MLPromoDecisionRepository(session)
-    row = await repo.decide(decision_id, status="approved", by=body.decided_by, notes=body.notes)
+    override: dict[str, Decimal] = {}
+    if body.target_price is not None:
+        override = await _apply_target_override(repo, decision_id, body.target_price)
+    row = await repo.decide(
+        decision_id,
+        status="approved",
+        by=body.decided_by,
+        notes=body.notes,
+        **override,
+    )
     if row is None:
         raise HTTPException(
             status_code=404,
@@ -1035,6 +1101,27 @@ async def ignore_decision(
         raise HTTPException(
             status_code=404,
             detail=f"decision {decision_id} not found or already decided",
+        )
+    await session.commit()
+    return DecisionOut.model_validate(row)
+
+
+@router.post("/decisions/{decision_id}/undo", response_model=DecisionOut)
+async def undo_decision(
+    decision_id: int,
+    session: AsyncSession = Depends(db_session),
+) -> DecisionOut:
+    """Reverter uma decisão terminal (approved/rejected/ignored) de
+    volta para pending. Mantém ``decided_at`` / ``decided_by`` como
+    audit da última ação — o operador volta a ter o item na fila
+    pendente e pode revisar/aprovar/rejeitar de novo.
+    """
+    repo = MLPromoDecisionRepository(session)
+    row = await repo.revert_to_pending(decision_id)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"decision {decision_id} not found or already pending",
         )
     await session.commit()
     return DecisionOut.model_validate(row)
