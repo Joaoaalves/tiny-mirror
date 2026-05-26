@@ -98,6 +98,23 @@ async def test_override_rejects_zero_or_negative() -> None:
         await _apply_target_override(repo, decision_id=1, override_price=Decimal("0"))
 
 
+async def test_override_rejects_price_above_list() -> None:
+    """Promoção nunca aumenta preço — target > list_price recusa 422."""
+    repo = _repo(_row(list_price=Decimal("50.00")))
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("55.00"))
+    assert exc.value.status_code == 422
+    assert "não pode aumentar" in exc.value.detail
+
+
+async def test_override_allows_equal_to_list_price() -> None:
+    """Edge case: target = list_price (desconto zero) é permitido — algumas
+    campanhas SMART/PriceMatching ML define preço igual ao list."""
+    repo = _repo(_row(list_price=Decimal("50.00"), cap_pct=None, floor_price=None))
+    out, _ = await _apply_target_override(repo, decision_id=1, override_price=Decimal("50.00"))
+    assert out["target_total_pct"] == Decimal("0.00")
+
+
 async def test_override_404_when_decision_missing() -> None:
     repo = _repo(None)
     with pytest.raises(HTTPException) as exc:

@@ -1022,6 +1022,20 @@ async def _apply_target_override(
         raise HTTPException(status_code=422, detail="target_price must be > 0")
 
     list_price = Decimal(row.list_price)
+
+    # Promoção nunca aumenta preço: target tem que ser ≤ list_price.
+    # Tolerância de 0.01 pra arredondamento. Acima disso recusa porque
+    # significa que o operador está tentando subir o preço (desconto
+    # negativo), o que não faz sentido como promo.
+    if override_price > list_price + Decimal("0.01"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"target_price R$ {override_price} > preço atual R$ {list_price} "
+                f"(promoção não pode aumentar o preço)"
+            ),
+        )
+
     meli_pct = Decimal(row.meli_percentage or 0)
     new_total_pct = ((list_price - override_price) / list_price * 100).quantize(Decimal("0.01"))
     new_seller_pct = (new_total_pct - meli_pct).quantize(Decimal("0.01"))
