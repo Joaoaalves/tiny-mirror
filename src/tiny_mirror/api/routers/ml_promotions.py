@@ -1164,17 +1164,43 @@ async def undo_decision(
 
 @router.get("/trends", response_model=dict[str, float | None])
 async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, float | None]:
-    """Retorna ``{sku: momentum_15v30}`` da mv_coverage pra todos os SKUs ativos.
+    """Retorna ``{sku: momentum_15v30}`` para todos os SKUs com vendas.
 
-    Usado pelo front-end da mission-control pra anotar cada decisão de
-    promoção com a tendência do anúncio (caindo / estável / subindo).
+    Inclui SKUs base (próprios em mv_coverage) e também kits/combos
+    cujo componente único tem momentum — assim a aba Decisões consegue
+    mostrar tendência mesmo pros SKUs como `10U-FOO` ou `COM-BAR` que
+    a view não rastreia diretamente. Pra kits com múltiplos componentes
+    (`COM-X`), o momentum sai do componente principal.
 
     momentum_15v30: ratio (sold_15d/15) / daily_rate. <0.8 caindo,
     0.8-1.2 estável, ≥1.2 subindo. NULL quando não há baseline (SKU
-    sem vendas no mês). View mv_coverage v15 atualiza a cada 15 min via
+    sem vendas no mês). View mv_coverage atualiza a cada 15 min via
     cron de REFRESH MATERIALIZED VIEW.
     """
-    result = await session.execute(
+    # SKUs base — direto da view.
+    base_q = await session.execute(
         text("SELECT sku, momentum_15v30 FROM mv_coverage WHERE momentum_15v30 IS NOT NULL")
     )
-    return {sku: float(mom) for sku, mom in result.all()}
+    out: dict[str, float | None] = {sku: float(mom) for sku, mom in base_q.all()}
+
+    # Kits/variantes: pega o momentum do primeiro componente da composição.
+    # Pra kit puro (1 componente) é o próprio base; pra combo (N), a query
+    # ainda devolve um deles — útil como sinal aproximado da demanda.
+    kit_q = await session.execute(
+        text(
+            """
+            SELECT DISTINCT ON (p.sku) p.sku, m.momentum_15v30
+            FROM product_kit_components kc
+            JOIN products p ON p.tiny_id = kc.kit_product_tiny_id
+            JOIN mv_coverage m ON m.sku = kc.component_sku
+            WHERE m.momentum_15v30 IS NOT NULL
+            ORDER BY p.sku, kc.id
+            """
+        )
+    )
+    for kit_sku, mom in kit_q.all():
+        # Não sobrescreve um SKU que já tem momentum próprio (improvável,
+        # mas defensivo — kit puro tem sempre o mesmo valor que o base).
+        if kit_sku not in out:
+            out[kit_sku] = float(mom)
+    return out
