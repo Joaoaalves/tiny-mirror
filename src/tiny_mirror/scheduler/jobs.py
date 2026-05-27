@@ -102,6 +102,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "fl_stock_correction": CronTrigger.from_crontab(
                 settings.sync_fl_correction_cron, timezone="UTC"
             ),
+            "phantom_detection": CronTrigger.from_crontab(
+                settings.sync_phantom_detection_cron, timezone="UTC"
+            ),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
@@ -160,6 +163,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _fl_stock_correction() -> None:
         await fl_stock_correction_job(publisher)
+
+    async def _phantom_detection() -> None:
+        await phantom_detection_job(publisher)
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
@@ -253,6 +259,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _fl_stock_correction,
         trigger=triggers["fl_stock_correction"],
         id="fl_stock_correction",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _phantom_detection,
+        trigger=triggers["phantom_detection"],
+        id="phantom_detection",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -606,6 +618,20 @@ async def fl_stock_correction_job(publisher: QueuePublisher) -> None:
         publisher,
         sync_type="fl_stock_correction",
         queue_type="fl_stock_correction.full",
+        message_extra={"triggered_by": "scheduler"},
+        log_metadata={"triggered_by": "scheduler"},
+    )
+
+
+async def phantom_detection_job(publisher: QueuePublisher) -> None:
+    """Daily: identifies phantom products (SKUs with excluded duplicates
+    absorbing ML orders) and logs them in phantom_products_log for
+    operator review."""
+    logger.info("Phantom detection job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="phantom_detection",
+        queue_type="phantom_detection.full",
         message_extra={"triggered_by": "scheduler"},
         log_metadata={"triggered_by": "scheduler"},
     )

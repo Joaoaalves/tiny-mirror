@@ -46,6 +46,7 @@ from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
+from tiny_mirror.services.phantom_detection_service import PhantomDetectionService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.purchase_order_sync_service import PurchaseOrderSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
@@ -139,6 +140,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
 
         fl_stock_correction = FLStockCorrectionService(tiny_client=tiny_client)
+        phantom_detection = PhantomDetectionService()
 
         app.state.consumers = await start_consumers(
             channel,
@@ -163,6 +165,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             purchase_order_sync=PurchaseOrderSyncService(tiny_client=tiny_client),
             ml_listing_sync=ml_listing_sync,
             fl_stock_correction=fl_stock_correction,
+            phantom_detection=phantom_detection,
         )
 
         scheduler = setup_scheduler(app)

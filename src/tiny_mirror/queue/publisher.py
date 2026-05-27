@@ -39,6 +39,7 @@ class QueuePublisher:
         "ml_listings.full": (EXCHANGE_MAIN, "sync.ml_listings.full"),
         "ml_fl_stock.full": (EXCHANGE_MAIN, "sync.ml_fl_stock.full"),
         "fl_stock_correction.full": (EXCHANGE_MAIN, "sync.fl_stock_correction.full"),
+        "phantom_detection.full": (EXCHANGE_MAIN, "sync.phantom_detection.full"),
         "webhooks.orders": (EXCHANGE_MAIN, "webhooks.orders"),
         "webhooks.stock": (EXCHANGE_MAIN, "webhooks.stock"),
     }

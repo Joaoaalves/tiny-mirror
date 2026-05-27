@@ -28,7 +28,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from tiny_mirror.database import Base
@@ -1318,5 +1318,57 @@ class FLStockCorrectionLogORM(Base):
         ),
     )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# phantom_products_log
+# ---------------------------------------------------------------------------
+class PhantomProductsLogORM(Base):
+    __tablename__ = "phantom_products_log"
+    __table_args__ = (
+        Index("ix_phantom_log_sku", "sku"),
+        Index("ix_phantom_log_run", "detection_run_id"),
+        Index("ix_phantom_log_detected_at", "detected_at"),
+        {
+            "comment": (
+                "Audit trail of phantom products (Tiny SKUs with excluded "
+                "duplicates absorbing ML orders). One row per (run, sku). "
+                "Append-only — never delete; the trend across runs is the value."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    detection_run_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    product_active_tiny_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        nullable=True,
+        comment=(
+            "tiny_id of the 'real' active/inactive product with this SKU. "
+            "NULL when the catalog has zero non-excluded copies (critical)."
+        ),
+    )
+    num_excluded: Mapped[int] = mapped_column(Integer, nullable=False)
+    excluded_tiny_ids: Mapped[list[int]] = mapped_column(
+        ARRAY(BigInteger),
+        nullable=False,
+        server_default=text("'{}'::bigint[]"),
+    )
+    orders_ml_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    units_ml: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    first_sale_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    last_sale_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    investigation_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Forensic snapshot per phantom: descriptions of active+excluded "
+            "products, recent ML orders that hit this SKU, suggested action."
+        ),
+    )
+    detected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

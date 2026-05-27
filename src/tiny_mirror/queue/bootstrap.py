@@ -19,6 +19,9 @@ from tiny_mirror.queue.consumers.order_consumers import (
     OrderFullSyncConsumer,
     OrderItemConsumer,
 )
+from tiny_mirror.queue.consumers.phantom_detection_consumers import (
+    PhantomDetectionConsumer,
+)
 from tiny_mirror.queue.consumers.product_consumers import (
     ProductFullSyncConsumer,
     ProductItemConsumer,
@@ -41,6 +44,7 @@ from tiny_mirror.services.fl_stock_correction_service import FLStockCorrectionSe
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
+from tiny_mirror.services.phantom_detection_service import PhantomDetectionService
 from tiny_mirror.services.product_sync_service import ProductSyncService
 from tiny_mirror.services.purchase_order_sync_service import PurchaseOrderSyncService
 from tiny_mirror.services.sale_bucket_service import SaleBucketService
@@ -63,6 +67,7 @@ async def start_consumers(
     purchase_order_sync: PurchaseOrderSyncService,
     ml_listing_sync: MLListingSyncService | None = None,
     fl_stock_correction: FLStockCorrectionService | None = None,
+    phantom_detection: PhantomDetectionService | None = None,
 ) -> list[BaseConsumer]:
     """Register every consumer on the shared channel and return the instances.
 
@@ -90,6 +95,8 @@ async def start_consumers(
         consumers.append(MLListingFullSyncConsumer(channel, queue_publisher, ml_listing_sync))
     if fl_stock_correction is not None:
         consumers.append(FLStockCorrectionConsumer(channel, queue_publisher, fl_stock_correction))
+    if phantom_detection is not None:
+        consumers.append(PhantomDetectionConsumer(channel, queue_publisher, phantom_detection))
     for consumer in consumers:
         await consumer.start_consuming()
     logger.info("All consumers started", count=len(consumers))

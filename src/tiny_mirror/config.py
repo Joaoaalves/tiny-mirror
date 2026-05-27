@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     # detected drift can be later investigated. Excludes kits/combos
     # (Tiny auto-calculates them from components — see docs/05).
     sync_fl_correction_cron: str = "0 * * * *"
+    # Daily phantom detection: identifies SKUs where the Tiny catalog has
+    # excluded duplicates AND ML orders kept arriving (= the listing's
+    # SELLER_SKU points to nothing and Tiny auto-creates a phantom per
+    # order). Writes to phantom_products_log for operator review.
+    # Runs after products sync (02:00) and ml_listings sync (00:30).
+    sync_phantom_detection_cron: str = "30 6 * * *"
 
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90
