@@ -44,3 +44,27 @@ class StockItemConsumer(BaseConsumer):
             product_tiny_id=int(message_body["product_tiny_id"]),
             sync_log_id=int(message_body["sync_log_id"]),
         )
+
+
+class MLFLStockSyncConsumer(BaseConsumer):
+    """High-frequency (every ~15 min) ML-only Full stock refresh.
+
+    Does not fan out per-SKU — the in-process loop in
+    :meth:`StockSyncService.run_ml_fl_only_sync` walks ~100 FL-exposed
+    products in <30s, well below any reasonable interval. One message
+    per cron tick → one consumer task.
+    """
+
+    QUEUE_NAME = "tiny.sync.ml_fl_stock.full"
+
+    def __init__(
+        self,
+        channel: AbstractChannel,
+        queue_publisher: QueuePublisher,
+        stock_sync_service: StockSyncService,
+    ) -> None:
+        super().__init__(channel, queue_publisher)
+        self._service = stock_sync_service
+
+    async def handle(self, message_body: dict[str, Any]) -> None:
+        await self._service.run_ml_fl_only_sync(int(message_body["sync_log_id"]))

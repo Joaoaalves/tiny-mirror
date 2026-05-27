@@ -106,6 +106,13 @@ class Settings(BaseSettings):
     sync_purchase_orders_cron: str = "0 6 * * 0"
     # ML listings (full snapshot of seller's active listings): daily at 00:30 UTC
     sync_ml_listings_cron: str = "30 0 * * *"
+    # ML-only Full stock refresh. Runs every 15 min to keep the 'Full
+    # Mercado Livre' deposit row in stock_deposits fresh against ML's
+    # Inventory API. Bypasses Tiny entirely so it stays well under the
+    # Tiny rate limit; only ~100 FL-exposed products x 1 ML call each.
+    # Daily Tiny stock_full_sync still runs at 03:00 UTC for the other
+    # deposits (galpão, A Caminho, etc.).
+    sync_ml_fl_stock_cron: str = "*/15 * * * *"
 
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90

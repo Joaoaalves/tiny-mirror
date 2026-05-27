@@ -185,6 +185,48 @@ class PostgreSQLProductRepository(ProductRepository):
         )
         return [(sku, int(qty)) for sku, qty in result.all()]
 
+    async def list_fl_exposed_active(self) -> list[tuple[int, str, str]]:
+        """Return (tiny_id, sku, type) for every active product whose Full ML
+        stock can be non-zero — own SKU has an active fulfillment listing
+        OR appears as a component of a kit that has one.
+
+        Used by the high-frequency ML-only stock refresh: any product NOT
+        in this set has stock_full_ml = 0 by construction and does not
+        need an ML API call. Built with raw SQL because the OR-EXISTS
+        pattern is awkward in SQLAlchemy ORM.
+        """
+        from sqlalchemy import text
+
+        result = await self._session.execute(
+            text(
+                """
+                SELECT DISTINCT p.tiny_id, p.sku, p.type
+                FROM products p
+                WHERE p.situation = 'A'
+                  AND p.sku IS NOT NULL
+                  AND p.sku <> ''
+                  AND (
+                    EXISTS (
+                      SELECT 1 FROM ml_listings ml
+                      WHERE ml.sku = p.sku
+                        AND ml.logistic_type = 'fulfillment'
+                        AND ml.status = 'active'
+                    )
+                    OR EXISTS (
+                      SELECT 1
+                      FROM product_kit_components kc
+                      JOIN products kp ON kp.tiny_id = kc.kit_product_tiny_id
+                      JOIN ml_listings ml ON ml.sku = kp.sku
+                      WHERE kc.component_sku = p.sku
+                        AND ml.logistic_type = 'fulfillment'
+                        AND ml.status = 'active'
+                    )
+                  )
+                """
+            )
+        )
+        return [(int(tid), str(sku), str(t or "S")) for tid, sku, t in result.all()]
+
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
     return {col.name: getattr(row, col.name) for col in row.__table__.columns}

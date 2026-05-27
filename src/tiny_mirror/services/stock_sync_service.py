@@ -155,6 +155,96 @@ class StockSyncService:
         )
 
     # ------------------------------------------------------------------
+    # High-frequency ML-only refresh — bypasses Tiny entirely
+    # ------------------------------------------------------------------
+    async def run_ml_fl_only_sync(self, sync_log_id: int) -> None:
+        """Refresh the 'Full Mercado Livre' stock_deposits row for every
+        product whose Full ML stock can be non-zero (own FL listing or
+        component of a kit with an FL listing).
+
+        Skips Tiny completely: only hits ML's Inventory API and writes the
+        single FL deposit row via :meth:`upsert_ml_full_deposit`. Galpão,
+        A Caminho and Avaria are left untouched — those are the daily
+        Tiny stock_full_sync's job.
+
+        Designed to run every ~15 min: ~100 products x 1 ML call ~ 30s,
+        well under any reasonable cron interval. No fan-out per item —
+        the in-process loop is simpler and keeps ordering predictable.
+        """
+        if self._ml is None:
+            logger.warning(
+                "ML FL stock sync skipped: ML client not configured",
+                sync_log_id=sync_log_id,
+            )
+            async with AsyncSessionLocal() as session:
+                await SyncLogRepository(session).try_finalize(sync_log_id)
+            return
+
+        async with AsyncSessionLocal() as session:
+            product_repo = PostgreSQLProductRepository(session)
+            fl_products = await product_repo.list_fl_exposed_active()
+
+        logger.info(
+            "Starting ML FL-only stock sync",
+            sync_log_id=sync_log_id,
+            products_count=len(fl_products),
+        )
+
+        processed = 0
+        failed = 0
+        for tiny_id, sku, ptype in fl_products:
+            try:
+                async with AsyncSessionLocal() as session:
+                    product_repo = PostgreSQLProductRepository(session)
+                    parent_kits = await product_repo.get_parent_kits_for_sku(sku)
+
+                ml_qty = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
+                # _fetch_ml_full_qty returns None on transient failure; treat
+                # as "skip this product" (don't zero out a stale row over a
+                # blip). Next tick recovers.
+                if ml_qty is None:
+                    logger.debug(
+                        "ML FL fetch returned None, skipping update",
+                        sku=sku,
+                        tiny_id=tiny_id,
+                    )
+                    continue
+
+                async with AsyncSessionLocal() as session:
+                    stock_repo = PostgreSQLStockRepository(session)
+                    await stock_repo.upsert_ml_full_deposit(
+                        tiny_id,
+                        int(ml_qty),
+                        deposit_name=ML_FULL_DEPOSIT_NAME,
+                        sentinel_deposit_id=ML_FULL_DEPOSIT_SENTINEL_ID,
+                    )
+                processed += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning(
+                    "ML FL stock refresh failed for product, continuing",
+                    tiny_id=tiny_id,
+                    sku=sku,
+                    error=str(exc),
+                )
+
+        async with AsyncSessionLocal() as session:
+            sync_logs = SyncLogRepository(session)
+            for _ in range(processed):
+                await sync_logs.increment_processed(sync_log_id)
+            for _ in range(failed):
+                await sync_logs.increment_failed(sync_log_id)
+            await sync_logs.try_finalize(sync_log_id)
+
+        logger.info(
+            "ML FL-only stock sync completed",
+            sync_log_id=sync_log_id,
+            processed=processed,
+            failed=failed,
+            total=len(fl_products),
+        )
+
+    # ------------------------------------------------------------------
     # Per-product — used both by the queue consumer and the webhook
     # consumer. ``sync_log_id`` is None for webhook-driven calls.
     # ------------------------------------------------------------------

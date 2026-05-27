@@ -37,6 +37,7 @@ class QueuePublisher:
         "stock_history.full": (EXCHANGE_MAIN, "sync.stock_history.full"),
         "purchase_orders.full": (EXCHANGE_MAIN, "sync.purchase_orders.full"),
         "ml_listings.full": (EXCHANGE_MAIN, "sync.ml_listings.full"),
+        "ml_fl_stock.full": (EXCHANGE_MAIN, "sync.ml_fl_stock.full"),
         "webhooks.orders": (EXCHANGE_MAIN, "webhooks.orders"),
         "webhooks.stock": (EXCHANGE_MAIN, "webhooks.stock"),
     }

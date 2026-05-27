@@ -63,6 +63,84 @@ class PostgreSQLStockRepository(StockRepository):
         await self._session.execute(pg_insert(StockDepositORM).values(rows))
         await self._session.commit()
 
+    async def upsert_ml_full_deposit(
+        self,
+        product_tiny_id: int,
+        ml_qty: int,
+        *,
+        deposit_name: str,
+        sentinel_deposit_id: int,
+    ) -> None:
+        """Insert-or-update only the 'Full Mercado Livre' deposit row.
+
+        Surgical alternative to :meth:`upsert_deposits` for the high-frequency
+        ML-only refresh: leaves galpão / A Caminho / Avaria untouched so we
+        never wipe Tiny-sourced values between full syncs.
+
+        Matches the existing FL row by ``deposit_name`` (case-sensitive — Tiny
+        always returns 'Full Mercado Livre'). If absent, appends a synthetic
+        row with ``deposit_tiny_id = sentinel_deposit_id`` so the unique
+        constraint per (product, deposit_tiny_id) is honored.
+        """
+        existing = await self._session.execute(
+            select(StockDepositORM.id, StockDepositORM.deposit_tiny_id).where(
+                StockDepositORM.product_tiny_id == product_tiny_id,
+                StockDepositORM.deposit_name == deposit_name,
+            )
+        )
+        row = existing.first()
+        if row is not None:
+            stmt = (
+                pg_insert(StockDepositORM)
+                .values(
+                    product_tiny_id=product_tiny_id,
+                    deposit_tiny_id=row.deposit_tiny_id,
+                    deposit_name=deposit_name,
+                    ignore=False,
+                    balance=ml_qty,
+                    reserved=0,
+                    available=ml_qty,
+                    company="Mercado Livre",
+                )
+                .on_conflict_do_update(
+                    index_elements=["product_tiny_id", "deposit_tiny_id"],
+                    set_={
+                        "balance": ml_qty,
+                        "available": ml_qty,
+                        "reserved": 0,
+                        "ignore": False,
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+            await self._session.execute(stmt)
+        else:
+            stmt = (
+                pg_insert(StockDepositORM)
+                .values(
+                    product_tiny_id=product_tiny_id,
+                    deposit_tiny_id=sentinel_deposit_id,
+                    deposit_name=deposit_name,
+                    ignore=False,
+                    balance=ml_qty,
+                    reserved=0,
+                    available=ml_qty,
+                    company="Mercado Livre",
+                )
+                .on_conflict_do_update(
+                    index_elements=["product_tiny_id", "deposit_tiny_id"],
+                    set_={
+                        "balance": ml_qty,
+                        "available": ml_qty,
+                        "reserved": 0,
+                        "ignore": False,
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+            await self._session.execute(stmt)
+        await self._session.commit()
+
     async def get_product_tiny_ids_to_sync(self) -> list[int]:
         result = await self._session.execute(
             select(ProductORM.tiny_id).where(ProductORM.situation == "A")

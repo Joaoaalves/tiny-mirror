@@ -25,6 +25,7 @@ from tiny_mirror.queue.consumers.purchase_order_consumers import (
     StockHistoryFullSyncConsumer,
 )
 from tiny_mirror.queue.consumers.stock_consumers import (
+    MLFLStockSyncConsumer,
     StockFullSyncConsumer,
     StockItemConsumer,
 )
@@ -72,6 +73,7 @@ async def start_consumers(
         OrderItemConsumer(channel, queue_publisher, order_sync),
         StockFullSyncConsumer(channel, queue_publisher, stock_sync),
         StockItemConsumer(channel, queue_publisher, stock_sync),
+        MLFLStockSyncConsumer(channel, queue_publisher, stock_sync),
         BucketRefreshConsumer(channel, queue_publisher, sale_buckets),
         InvoiceFullSyncConsumer(channel, queue_publisher, invoice_sync),
         StockHistoryFullSyncConsumer(channel, queue_publisher, stock_history_sync),

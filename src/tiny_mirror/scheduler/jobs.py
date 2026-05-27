@@ -96,6 +96,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_listings_sync": CronTrigger.from_crontab(
                 settings.sync_ml_listings_cron, timezone="UTC"
             ),
+            "ml_fl_stock_sync": CronTrigger.from_crontab(
+                settings.sync_ml_fl_stock_cron, timezone="UTC"
+            ),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
@@ -148,6 +151,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_listings_sync() -> None:
         await ml_listings_sync_job(publisher)
+
+    async def _ml_fl_stock_sync() -> None:
+        await ml_fl_stock_sync_job(publisher)
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
@@ -229,6 +235,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_listings_sync,
         trigger=triggers["ml_listings_sync"],
         id="ml_listings_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_fl_stock_sync,
+        trigger=triggers["ml_fl_stock_sync"],
+        id="ml_fl_stock_sync",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -552,6 +564,21 @@ async def ml_listings_sync_job(publisher: QueuePublisher) -> None:
         publisher,
         sync_type="ml_listings",
         queue_type="ml_listings.full",
+        message_extra={"triggered_by": "scheduler"},
+        log_metadata={"triggered_by": "scheduler"},
+    )
+
+
+async def ml_fl_stock_sync_job(publisher: QueuePublisher) -> None:
+    """Every 15 min: refresh the Full Mercado Livre stock_deposits row
+    for every FL-exposed product, sourcing the truth from ML's Inventory
+    API (no Tiny round-trip).
+    """
+    logger.info("ML FL stock sync job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="ml_fl_stock",
+        queue_type="ml_fl_stock.full",
         message_extra={"triggered_by": "scheduler"},
         log_metadata={"triggered_by": "scheduler"},
     )
