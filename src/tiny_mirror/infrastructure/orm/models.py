@@ -1273,3 +1273,50 @@ class MLPromoDecisionORM(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     decided_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# fl_stock_corrections_log
+# ---------------------------------------------------------------------------
+class FLStockCorrectionLogORM(Base):
+    __tablename__ = "fl_stock_corrections_log"
+    __table_args__ = (
+        Index("ix_fl_corrections_log_sku", "sku"),
+        Index("ix_fl_corrections_log_created_at", "created_at"),
+        {
+            "comment": (
+                "Audit trail of FL stock corrections: every mismatch detected by the "
+                "hourly cron, whether or not the correction succeeded. Append-only — "
+                "never delete rows. Investigation payload preserves enough context to "
+                "diagnose recurring drift causes (Hypothesis 1 = NFs not cancelled, "
+                "Hypothesis 2 = phantom products — see docs/03)."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    product_tiny_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    tiny_saldo_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    ml_qty: Mapped[int] = mapped_column(Integer, nullable=False)
+    delta: Mapped[int] = mapped_column(Integer, nullable=False)
+    correction_applied: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    tiny_id_lancamento: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tiny_saldo_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    investigation_payload: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Snapshot for forensic analysis: tiny estoque response (all deposits "
+            "+ saldo/reservado/disponivel), recent orders affecting the SKU, "
+            "recent fulfillment_transfers, recent stock_history. Captured BEFORE "
+            "the correction POST so we can later prove what state the SKU was in."
+        ),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

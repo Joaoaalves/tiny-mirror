@@ -112,9 +112,15 @@ class TinyAPIClient:
         data: str,
         observacoes: str = "",
     ) -> dict[str, Any]:
-        """POST /estoque/{product_id} — record a stock entry (E) or exit (S).
+        """POST /estoque/{product_id} — record a stock movement.
 
-        tipo: "E" = entrada (stock in), "S" = saída (stock out).
+        tipo:
+          "E" = entrada (stock in) — adds ``quantity`` to the deposit.
+          "S" = saída (stock out) — subtracts ``quantity`` from the deposit.
+          "B" = balanço — sets the deposit saldo to ``quantity`` (absolute).
+                Validated 2026-05-27 — Tiny accepts B for non-kit products only
+                (kits/combos auto-calc from components; returns HTTP 400).
+
         data: "YYYY-MM-DD HH:MM:SS" format required by Tiny v3.
         """
         return await self._request(

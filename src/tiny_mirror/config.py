@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     # Daily Tiny stock_full_sync still runs at 03:00 UTC for the other
     # deposits (galpão, A Caminho, etc.).
     sync_ml_fl_stock_cron: str = "*/15 * * * *"
+    # Hourly Tiny correction: detect mismatch between Tiny FL deposit
+    # saldo and our DB (= ML truth), apply tipo=B balance for base SKUs,
+    # capture full forensic snapshot in fl_stock_corrections_log so each
+    # detected drift can be later investigated. Excludes kits/combos
+    # (Tiny auto-calculates them from components — see docs/05).
+    sync_fl_correction_cron: str = "0 * * * *"
 
     sync_log_watchdog_cron: str = "*/5 * * * *"
     sync_log_running_max_minutes: int = 90

@@ -41,6 +41,7 @@ from tiny_mirror.scheduler.jobs import (
     setup_scheduler,
     shutdown_scheduler,
 )
+from tiny_mirror.services.fl_stock_correction_service import FLStockCorrectionService
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
 from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService
@@ -137,6 +138,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             queue_publisher=app.state.queue_publisher,
         )
 
+        fl_stock_correction = FLStockCorrectionService(tiny_client=tiny_client)
+
         app.state.consumers = await start_consumers(
             channel,
             queue_publisher=app.state.queue_publisher,
@@ -159,6 +162,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             stock_history_sync=StockHistorySyncService(tiny_v2=tiny_v2_client),
             purchase_order_sync=PurchaseOrderSyncService(tiny_client=tiny_client),
             ml_listing_sync=ml_listing_sync,
+            fl_stock_correction=fl_stock_correction,
         )
 
         scheduler = setup_scheduler(app)

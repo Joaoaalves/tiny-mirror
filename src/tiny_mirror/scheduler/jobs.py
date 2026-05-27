@@ -99,6 +99,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_fl_stock_sync": CronTrigger.from_crontab(
                 settings.sync_ml_fl_stock_cron, timezone="UTC"
             ),
+            "fl_stock_correction": CronTrigger.from_crontab(
+                settings.sync_fl_correction_cron, timezone="UTC"
+            ),
             "sync_log_watchdog": CronTrigger.from_crontab(
                 settings.sync_log_watchdog_cron, timezone="UTC"
             ),
@@ -154,6 +157,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_fl_stock_sync() -> None:
         await ml_fl_stock_sync_job(publisher)
+
+    async def _fl_stock_correction() -> None:
+        await fl_stock_correction_job(publisher)
 
     async def _sync_log_watchdog() -> None:
         await sync_log_watchdog_job()
@@ -241,6 +247,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_fl_stock_sync,
         trigger=triggers["ml_fl_stock_sync"],
         id="ml_fl_stock_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _fl_stock_correction,
+        trigger=triggers["fl_stock_correction"],
+        id="fl_stock_correction",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -579,6 +591,21 @@ async def ml_fl_stock_sync_job(publisher: QueuePublisher) -> None:
         publisher,
         sync_type="ml_fl_stock",
         queue_type="ml_fl_stock.full",
+        message_extra={"triggered_by": "scheduler"},
+        log_metadata={"triggered_by": "scheduler"},
+    )
+
+
+async def fl_stock_correction_job(publisher: QueuePublisher) -> None:
+    """Hourly: detects FL deposit mismatch in Tiny (vs our ML-truth DB)
+    and applies tipo=B balance for base SKUs, capturing forensic context
+    in fl_stock_corrections_log.
+    """
+    logger.info("FL stock correction job started")
+    await _trigger_sync(
+        publisher,
+        sync_type="fl_stock_correction",
+        queue_type="fl_stock_correction.full",
         message_extra={"triggered_by": "scheduler"},
         log_metadata={"triggered_by": "scheduler"},
     )
