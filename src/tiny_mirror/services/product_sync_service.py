@@ -48,10 +48,19 @@ class ProductSyncService:
         logger.info("Starting full product sync", sync_log_id=sync_log_id)
 
         total_published = 0
-        # Tiny v3 /produtos accepts a single value per request; paginate
-        # active and inactive in two passes. Excluded ("E") is intentionally
-        # skipped — those are products deleted from the operator's catalog.
-        for situation in ("A", "I"):
+        # Tiny v3 /produtos accepts a single value per request. We paginate
+        # all 3 situations (Ativo/Inativo/Excluído).
+        #
+        # Why E (excluded) matters: Tiny auto-creates phantom products when
+        # an ML order arrives and the listing's SELLER_SKU doesn't map to a
+        # known product. Operators later excluir those manually. But the
+        # phantoms keep absorbing new orders until the listing's SELLER_SKU
+        # is fixed, AND they still hold stock movements that distort the
+        # estoque history. We need visibility into them so the phantom
+        # detector (docs/04) and the FL stock corrector can avoid treating
+        # them as real products. Queries that need "active only" must
+        # explicitly filter WHERE situation IN ('A', 'I').
+        for situation in ("A", "I", "E"):
             total_published += await self._enqueue_situation(sync_log_id, situation)
 
         await self._record_total_enqueued(sync_log_id, total_published)
