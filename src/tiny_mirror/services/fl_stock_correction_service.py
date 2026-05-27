@@ -240,95 +240,101 @@ class FLStockCorrectionService:
           - recent_fulfillment_transfers
           - recent_stock_history snapshots (if available)
 
-        Designed to give the operator enough context to investigate the drift
-        cause later without re-running queries.
+        Each query is independently fault-tolerant — failures here are logged
+        but never abort the correction itself (the audit row still gets written).
         """
         cutoff = datetime.now(UTC) - timedelta(days=7)
+        out: dict[str, Any] = {"tiny_estoque_before": tiny_estoque}
 
         async with AsyncSessionLocal() as session:
-            orders_result = await session.execute(
-                text(
-                    """
-                    SELECT o.tiny_id, o.ecommerce_order_number, o.order_date::text,
-                           o.ecommerce_name, oi.quantity::int, o.situation
-                    FROM orders o
-                    JOIN order_items oi ON oi.order_tiny_id = o.tiny_id
-                    WHERE oi.product_sku = :sku
-                      AND o.order_date >= :cutoff
-                    ORDER BY o.order_date DESC
-                    LIMIT 50;
-                    """
-                ),
-                {"sku": sku, "cutoff": cutoff.date()},
-            )
-            orders = [
-                {
-                    "tiny_id": int(r[0]),
-                    "ecommerce_order_number": r[1],
-                    "order_date": r[2],
-                    "ecommerce_name": r[3],
-                    "quantity": int(r[4]),
-                    "situation": int(r[5]) if r[5] is not None else None,
-                }
-                for r in orders_result.all()
-            ]
+            try:
+                orders_result = await session.execute(
+                    text(
+                        """
+                        SELECT o.tiny_id, o.ecommerce_order_number, o.order_date::text,
+                               o.ecommerce_name, oi.quantity::int, o.situation
+                        FROM orders o
+                        JOIN order_items oi ON oi.order_tiny_id = o.tiny_id
+                        WHERE oi.product_sku = :sku
+                          AND o.order_date >= :cutoff
+                        ORDER BY o.order_date DESC
+                        LIMIT 50;
+                        """
+                    ),
+                    {"sku": sku, "cutoff": cutoff.date()},
+                )
+                out["recent_orders_7d"] = [
+                    {
+                        "tiny_id": int(r[0]),
+                        "ecommerce_order_number": r[1],
+                        "order_date": r[2],
+                        "ecommerce_name": r[3],
+                        "quantity": int(r[4]),
+                        "situation": int(r[5]) if r[5] is not None else None,
+                    }
+                    for r in orders_result.all()
+                ]
+            except Exception as exc:
+                logger.warning("Investigation orders query failed", sku=sku, error=str(exc))
+                out["recent_orders_7d_error"] = str(exc)
 
-            transfers_result = await session.execute(
-                text(
-                    """
-                    SELECT id, quantity, transferred_at::text, received_at::text,
-                           status, source
-                    FROM fulfillment_transfers
-                    WHERE product_tiny_id = :tiny_id
-                      AND transferred_at >= :cutoff
-                    ORDER BY transferred_at DESC
-                    LIMIT 30;
-                    """
-                ),
-                {"tiny_id": tiny_id, "cutoff": cutoff},
-            )
-            transfers = [
-                {
-                    "id": int(r[0]),
-                    "quantity": int(r[1]),
-                    "transferred_at": r[2],
-                    "received_at": r[3],
-                    "status": r[4],
-                    "source": r[5],
-                }
-                for r in transfers_result.all()
-            ]
+            try:
+                transfers_result = await session.execute(
+                    text(
+                        """
+                        SELECT id, quantity, transferred_at::text, received_at::text,
+                               status, source
+                        FROM fulfillment_transfers
+                        WHERE product_tiny_id = :tiny_id
+                          AND transferred_at >= :cutoff
+                        ORDER BY transferred_at DESC
+                        LIMIT 30;
+                        """
+                    ),
+                    {"tiny_id": tiny_id, "cutoff": cutoff},
+                )
+                out["recent_fulfillment_transfers_7d"] = [
+                    {
+                        "id": int(r[0]),
+                        "quantity": int(r[1]),
+                        "transferred_at": r[2],
+                        "received_at": r[3],
+                        "status": r[4],
+                        "source": r[5],
+                    }
+                    for r in transfers_result.all()
+                ]
+            except Exception as exc:
+                logger.warning("Investigation transfers query failed", sku=sku, error=str(exc))
+                out["recent_fulfillment_transfers_7d_error"] = str(exc)
 
-            # stock_history might be empty for some SKUs — handled gracefully
-            history_result = await session.execute(
-                text(
-                    """
-                    SELECT snapshot_date::text, deposit_name, balance::int, available::int
-                    FROM stock_history
-                    WHERE product_tiny_id = :tiny_id
-                      AND snapshot_date >= :cutoff_date
-                    ORDER BY snapshot_date DESC, deposit_name
-                    LIMIT 50;
-                    """
-                ),
-                {"tiny_id": tiny_id, "cutoff_date": cutoff.date()},
-            )
-            history = [
-                {
-                    "snapshot_date": r[0],
-                    "deposit_name": r[1],
-                    "balance": int(r[2]),
-                    "available": int(r[3]),
-                }
-                for r in history_result.all()
-            ]
+            try:
+                history_result = await session.execute(
+                    text(
+                        """
+                        SELECT snapshot_date::text, deposit_name, balance::int
+                        FROM stock_history
+                        WHERE product_tiny_id = :tiny_id
+                          AND snapshot_date >= :cutoff_date
+                        ORDER BY snapshot_date DESC, deposit_name
+                        LIMIT 50;
+                        """
+                    ),
+                    {"tiny_id": tiny_id, "cutoff_date": cutoff.date()},
+                )
+                out["recent_stock_history_7d"] = [
+                    {
+                        "snapshot_date": r[0],
+                        "deposit_name": r[1],
+                        "balance": int(r[2]),
+                    }
+                    for r in history_result.all()
+                ]
+            except Exception as exc:
+                logger.warning("Investigation stock_history query failed", sku=sku, error=str(exc))
+                out["recent_stock_history_7d_error"] = str(exc)
 
-        return {
-            "tiny_estoque_before": tiny_estoque,
-            "recent_orders_7d": orders,
-            "recent_fulfillment_transfers_7d": transfers,
-            "recent_stock_history_7d": history,
-        }
+        return out
 
 
 # ---------------------------------------------------------------------------
