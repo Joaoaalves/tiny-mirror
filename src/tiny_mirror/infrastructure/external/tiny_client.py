@@ -150,6 +150,15 @@ class TinyAPIClient:
             params["dataFinal"] = _format_date_only(date_final)
         return await self._request("GET", "/notas", params=params)
 
+    async def get_invoice(self, invoice_tiny_id: int) -> dict[str, Any]:
+        """Detail call: returns the full NF including its ``itens`` array.
+
+        The list endpoint omits line items, so phantom detection (and any
+        per-SKU sales view) must pull this per invoice. Schema:
+        ``{ "id", "itens": [{"idItem","idProduto","codigo","quantidade",...}], ... }``.
+        """
+        return await self._request("GET", f"/notas/{invoice_tiny_id}")
+
     async def list_purchase_orders(self, offset: int = 0, limit: int = 100) -> dict[str, Any]:
         """Return a page of Ordens de Compra from Tiny v3.
 

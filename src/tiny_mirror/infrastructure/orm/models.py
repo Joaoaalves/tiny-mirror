@@ -865,6 +865,58 @@ class InvoiceORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# invoice_items
+# ---------------------------------------------------------------------------
+class InvoiceItemORM(Base):
+    __tablename__ = "invoice_items"
+    __table_args__ = (
+        Index("ix_invoice_items_invoice_tiny_id", "invoice_tiny_id"),
+        Index("ix_invoice_items_product_tiny_id", "product_tiny_id"),
+        Index("ix_invoice_items_product_sku", "product_sku"),
+        UniqueConstraint(
+            "invoice_tiny_id",
+            "tiny_item_id",
+            name="uq_invoice_items_invoice_line",
+        ),
+        {
+            "comment": (
+                "Line items of each Nota Fiscal. Each row = one product line "
+                "on the NF, captured from GET /notas/{id}. Source of truth for "
+                "which SKU actually shipped on this NF, including kit "
+                "components that order_items never sees."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    invoice_tiny_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("invoices.tiny_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    tiny_item_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    product_tiny_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    product_sku: Mapped[str] = mapped_column(String(100), nullable=False, server_default=text("''"))
+    product_description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ncm: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    unit: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    quantity: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, server_default=text("0")
+    )
+    unit_value: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, server_default=text("0")
+    )
+    total_value: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, server_default=text("0")
+    )
+    cfop: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    operation_nature: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_listings
 # ---------------------------------------------------------------------------
 class MLListingORM(Base):

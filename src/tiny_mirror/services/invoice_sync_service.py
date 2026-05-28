@@ -19,12 +19,16 @@ increments ``items_processed`` on the sync_log.
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
+from typing import Any
 
 import structlog
 
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import TinyAPIException
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
+from tiny_mirror.infrastructure.repositories.invoice_item_repository import (
+    PostgreSQLInvoiceItemRepository,
+)
 from tiny_mirror.infrastructure.repositories.invoice_repository import (
     PostgreSQLInvoiceRepository,
 )
@@ -138,8 +142,16 @@ class InvoiceSyncService:
         date_from: date,
         date_to: date,
         sync_log_id: int | None,
+        *,
+        fetch_items: bool = True,
     ) -> int:
         """Paginate Tiny /notas for ``[date_from, date_to]``, map and upsert.
+
+        When ``fetch_items`` is True (default), every invoice in the window
+        also gets a ``GET /notas/{id}`` detail call so its ``itens`` are
+        persisted into ``invoice_items``. Cold-start passes False to keep
+        the historical full-catalog backfill cheap — items are populated
+        later by a focused backfill script for the relevant date window.
 
         Returns the total number of NFs upserted. When ``sync_log_id`` is
         not None, atomically increments ``items_processed`` after each page
@@ -194,6 +206,9 @@ class InvoiceSyncService:
                     await sync_logs.add_to_processed(sync_log_id, count)
                     await sync_logs.try_finalize(sync_log_id)
 
+            if fetch_items:
+                await self._sync_items_for_invoices(invoices)
+
             logger.debug(
                 "Invoice page upserted",
                 date_from=date_from.isoformat(),
@@ -202,6 +217,7 @@ class InvoiceSyncService:
                 page_count=len(items),
                 api_total=total,
                 cumulative=total_processed,
+                fetched_items=fetch_items,
             )
 
             offset += PAGE_SIZE
@@ -215,6 +231,41 @@ class InvoiceSyncService:
             total_processed=total_processed,
         )
         return total_processed
+
+    # ------------------------------------------------------------------
+    # Items detail backfill helper
+    # ------------------------------------------------------------------
+    async def sync_items_for_invoice(self, invoice_tiny_id: int) -> int:
+        """Fetch ``GET /notas/{id}`` and persist its ``itens`` array.
+
+        Returns the number of lines persisted. Tolerates per-NF failures —
+        callers can retry the same invoice without side effects because the
+        repo replaces the line set atomically.
+        """
+        detail = await self._tiny.get_invoice(invoice_tiny_id)
+        items = InvoiceMapper.items_from_tiny_detail(invoice_tiny_id, detail)
+        async with AsyncSessionLocal() as session:
+            repo = PostgreSQLInvoiceItemRepository(session)
+            return await repo.replace_for_invoice(invoice_tiny_id, items)
+
+    async def _sync_items_for_invoices(self, invoices: list[dict[str, Any]]) -> None:
+        """Best-effort items fetch for a batch of invoices already upserted.
+
+        One Tiny call per NF, run sequentially because the client already
+        rate-limits at a global level. Failures are logged and swallowed —
+        we keep the header upsert even when the detail call fails so the
+        next incremental run can retry just the items.
+        """
+        for inv in invoices:
+            tiny_id = int(inv["tiny_id"])
+            try:
+                await self.sync_items_for_invoice(tiny_id)
+            except Exception as exc:
+                logger.warning(
+                    "Invoice items detail fetch failed, continuing",
+                    invoice_tiny_id=tiny_id,
+                    error=str(exc),
+                )
 
 
 # ---------------------------------------------------------------------------

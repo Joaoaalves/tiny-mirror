@@ -1,9 +1,13 @@
 """Translation between the Tiny ERP NF schema (PT) and ours (EN).
 
-The shape returned by ``GET /notas`` already contains all fields we need —
-unlike orders, no separate detail call is required. Tiny sends empty strings
-instead of null for missing optional fields; this mapper normalises those to
-Python ``None`` before persisting.
+The list endpoint ``GET /notas`` returns enough for the header table. To
+get ``itens`` (one row per product line on the NF — the source of truth
+for which SKU actually shipped, including kit components) the caller must
+also hit ``GET /notas/{id}``; ``items_from_tiny_detail`` parses that
+response into rows for ``invoice_items``.
+
+Tiny sends empty strings instead of null for missing optional fields; this
+mapper normalises those to Python ``None`` before persisting.
 """
 
 from __future__ import annotations
@@ -14,6 +18,38 @@ from typing import Any
 
 
 class InvoiceMapper:
+    @staticmethod
+    def items_from_tiny_detail(
+        invoice_tiny_id: int, raw_detail: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """Extract one row per ``itens[]`` entry from ``GET /notas/{id}``.
+
+        Tiny returns each line under top-level ``itens`` (not nested under a
+        ``produto`` object). Empty strings are normalised to None; quantity
+        and value fields default to 0.
+        """
+        out: list[dict[str, Any]] = []
+        for line in raw_detail.get("itens") or []:
+            if not isinstance(line, dict):
+                continue
+            out.append(
+                {
+                    "invoice_tiny_id": invoice_tiny_id,
+                    "tiny_item_id": _to_int_or_none(line.get("idItem")),
+                    "product_tiny_id": _to_int_or_none(line.get("idProduto")),
+                    "product_sku": (line.get("codigo") or "").strip(),
+                    "product_description": _str_or_none(line.get("descricao")),
+                    "ncm": _str_or_none(line.get("ncm")),
+                    "unit": _str_or_none(line.get("unidade")),
+                    "quantity": _to_decimal(line.get("quantidade")),
+                    "unit_value": _to_decimal(line.get("valorUnitario")),
+                    "total_value": _to_decimal(line.get("valorTotal")),
+                    "cfop": _str_or_none(line.get("cfop")),
+                    "operation_nature": _str_or_none(line.get("naturezaOperacao")),
+                }
+            )
+        return out
+
     @staticmethod
     def from_tiny_api(raw: dict[str, Any]) -> dict[str, Any]:
         ecommerce = raw.get("ecommerce") or {}

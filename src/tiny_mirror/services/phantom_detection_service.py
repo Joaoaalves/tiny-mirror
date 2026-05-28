@@ -9,14 +9,15 @@ the FL inventory.
 
 Detection criterion (need ANY of):
   - SKU has >= 2 products with situacao='E' (excluded) — multiple duplicates
-    is a strong phantom signal even if our DB has no orders for the SKU.
-  - SKU has >= 1 excluded AND >= 1 order_item from Mercado Livre — phantom
-    that already absorbed sales.
+    is a strong phantom signal on its own.
+  - SKU has >= 1 excluded AND >= 1 ML invoice line in ``invoice_items`` —
+    phantom that already absorbed real sales.
 
-  We deliberately do NOT require `orders_ml_count >= 1`: Tiny sometimes
-  creates phantoms via channels whose order_items don't reach our DB (kit
-  explosions, third-party integrations), so any SKU with multiple excluded
-  copies is suspicious regardless of our local order trail.
+Source-of-truth for ML sales is ``invoice_items`` (mirrors the ``itens``
+array of ``GET /notas/{id}``), populated by the incremental NF sync plus
+the ``backfill_invoice_items.py`` script. ``order_items`` is intentionally
+NOT consulted: it only carries the parent kit SKU, so kit-component
+phantoms would be invisible.
 
 Per phantom SKU, we record:
   - active vs excluded counts
@@ -101,70 +102,28 @@ class PhantomDetectionService:
         copy (A preferred over I). Falls back to a LEFT JOIN on order_counts so
         SKUs with no orders in our DB still come through.
         """
+        # invoice_items is the ground truth for ML sales by SKU. order_items
+        # only carries the parent kit SKU, so kit-component sales (e.g.
+        # CAMP-CNJ-FACPEG inside KIT-FACAPEG-ESCV-GARR) are invisible there.
+        # invoice_items mirrors GET /notas/{id}.itens which records the
+        # actual decremented SKU per line. We aggregate across every tiny_id
+        # sharing the SKU (so phantom duplicates that absorbed sales also
+        # count) and filter on the originating invoice's ecommerce channel.
         sql = text(
             """
-            WITH order_counts AS (
-                SELECT oi.product_sku,
-                       COUNT(DISTINCT oi.order_tiny_id) FILTER (
-                           WHERE o.ecommerce_name LIKE 'Mercado Livre%'
-                       ) AS orders_ml_count,
-                       SUM(oi.quantity) FILTER (
-                           WHERE o.ecommerce_name LIKE 'Mercado Livre%'
-                       )::int AS units_ml,
-                       MIN(o.order_date) FILTER (
-                           WHERE o.ecommerce_name LIKE 'Mercado Livre%'
-                       ) AS first_sale,
-                       MAX(o.order_date) FILTER (
-                           WHERE o.ecommerce_name LIKE 'Mercado Livre%'
-                       ) AS last_sale
-                FROM order_items oi
-                JOIN orders o ON o.tiny_id = oi.order_tiny_id
-                WHERE oi.product_sku <> ''
-                GROUP BY oi.product_sku
-            ),
-            -- Stock drain over 30d aggregated across every tiny_id sharing the SKU.
-            -- This is the ground truth for "stock is being absorbed" — kit
-            -- sales decrement components in Tiny but never write to our
-            -- order_items, so order_counts misses them entirely.
-            -- Per-(sku, tiny_id, deposit) endpoints in the 30d window:
-            --   first_bal/last_bal → drained units
-            --   plus a per-day balance-drop event count → minimum sales-event count
-            stock_drain AS (
+            WITH invoice_sales AS (
                 SELECT
-                    product_sku,
-                    SUM(GREATEST(first_bal - last_bal, 0))::int AS units_drained,
-                    MIN(first_date) AS first_seen,
-                    MAX(last_date)  AS last_seen
-                FROM (
-                    SELECT DISTINCT
-                        product_sku, product_tiny_id, deposit_name,
-                        FIRST_VALUE(balance) OVER w_asc  AS first_bal,
-                        FIRST_VALUE(balance) OVER w_desc AS last_bal,
-                        FIRST_VALUE(snapshot_date) OVER w_asc  AS first_date,
-                        FIRST_VALUE(snapshot_date) OVER w_desc AS last_date
-                    FROM stock_history
-                    WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
-                    WINDOW
-                        w_asc  AS (PARTITION BY product_sku, product_tiny_id, deposit_name
-                                   ORDER BY snapshot_date ASC),
-                        w_desc AS (PARTITION BY product_sku, product_tiny_id, deposit_name
-                                   ORDER BY snapshot_date DESC)
-                ) d
-                GROUP BY product_sku
-            ),
-            -- Sales-event count from stock history: each day where balance
-            -- dropped vs the previous snapshot. Lower bound on # of sales.
-            stock_events AS (
-                SELECT product_sku,
-                       count(*) FILTER (WHERE prev IS NOT NULL AND balance < prev) AS drop_events
-                FROM (
-                    SELECT product_sku, product_tiny_id, deposit_name, snapshot_date, balance,
-                           LAG(balance) OVER (PARTITION BY product_sku, product_tiny_id, deposit_name
-                                              ORDER BY snapshot_date) AS prev
-                    FROM stock_history
-                    WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
-                ) e
-                GROUP BY product_sku
+                    ii.product_sku,
+                    count(DISTINCT ii.invoice_tiny_id) AS invoices_ml_count,
+                    SUM(ii.quantity)::int AS units_ml,
+                    MIN(inv.issue_date)   AS first_sale,
+                    MAX(inv.issue_date)   AS last_sale
+                FROM invoice_items ii
+                JOIN invoices inv ON inv.tiny_id = ii.invoice_tiny_id
+                WHERE ii.product_sku <> ''
+                  AND inv.ecommerce IS NOT NULL
+                  AND inv.ecommerce->>'nome' LIKE 'Mercado Livre%'
+                GROUP BY ii.product_sku
             ),
             sku_summary AS (
                 SELECT
@@ -183,37 +142,23 @@ class PhantomDetectionService:
                 s.sku,
                 s.active_id,
                 COALESCE(s.excluded_ids, ARRAY[]::bigint[]) AS excluded_ids,
-                -- Effective sales-event count = max(order_items orders, stock drop events).
-                -- The first signal misses kit-component sales (the order line is the
-                -- parent kit), but Tiny still records the balance drop on the
-                -- component — counting per-day drops in stock_history catches them.
-                GREATEST(
-                    COALESCE(oc.orders_ml_count, 0),
-                    COALESCE(se.drop_events, 0)
-                ) AS orders_ml_count,
-                -- Effective units = max(order_items units, stock drain over 30d).
-                GREATEST(
-                    COALESCE(oc.units_ml, 0),
-                    COALESCE(sd.units_drained, 0)
-                ) AS units_ml,
-                COALESCE(oc.first_sale, sd.first_seen) AS first_sale,
-                COALESCE(oc.last_sale,  sd.last_seen)  AS last_sale
+                COALESCE(isales.invoices_ml_count, 0) AS orders_ml_count,
+                COALESCE(isales.units_ml, 0)          AS units_ml,
+                isales.first_sale AS first_sale,
+                isales.last_sale  AS last_sale
             FROM sku_summary s
-            LEFT JOIN order_counts oc ON oc.product_sku = s.sku
-            LEFT JOIN stock_drain  sd ON sd.product_sku = s.sku
-            LEFT JOIN stock_events se ON se.product_sku = s.sku
+            LEFT JOIN invoice_sales isales ON isales.product_sku = s.sku
             WHERE s.excluded_ids IS NOT NULL
               AND array_length(s.excluded_ids, 1) >= 1
               AND (
                    array_length(s.excluded_ids, 1) >= 2
-                   OR COALESCE(oc.orders_ml_count, 0) >= 1
-                   OR COALESCE(sd.units_drained, 0)  >= 1
+                   OR COALESCE(isales.invoices_ml_count, 0) >= 1
               )
             ORDER BY
                 -- critical (no active) first, then highest exclusion count, then most units sold
                 (s.active_id IS NULL) DESC,
                 array_length(s.excluded_ids, 1) DESC,
-                GREATEST(COALESCE(oc.units_ml, 0), COALESCE(sd.units_drained, 0)) DESC,
+                COALESCE(isales.units_ml, 0) DESC,
                 s.sku;
             """
         )
@@ -289,32 +234,45 @@ class PhantomDetectionService:
             except Exception as exc:
                 out["products_in_tiny_error"] = str(exc)
 
+            # Recent ML invoice lines that touched the SKU. This pulls from
+            # invoice_items (ground truth) — kit components show up here even
+            # though order_items only stores the parent kit SKU.
             try:
-                orders_result = await session.execute(
+                invoices_result = await session.execute(
                     text(
                         """
-                        SELECT o.tiny_id, o.ecommerce_order_number, o.order_date::text,
-                               o.ecommerce_name, oi.quantity::int, o.situation
-                        FROM order_items oi
-                        JOIN orders o ON o.tiny_id = oi.order_tiny_id
-                        WHERE oi.product_sku = :sku
-                          AND o.ecommerce_name LIKE 'Mercado Livre%'
-                        ORDER BY o.order_date DESC
-                        LIMIT 20;
+                        SELECT inv.tiny_id, inv.number, inv.issue_date::text,
+                               inv.ecommerce->>'nome' AS ecommerce_name,
+                               inv.ecommerce->>'numeroPedidoEcommerce' AS ecom_order_number,
+                               ii.quantity::int, ii.product_tiny_id,
+                               inv.status
+                        FROM invoice_items ii
+                        JOIN invoices inv ON inv.tiny_id = ii.invoice_tiny_id
+                        WHERE ii.product_sku = :sku
+                          AND inv.ecommerce IS NOT NULL
+                          AND inv.ecommerce->>'nome' LIKE 'Mercado Livre%'
+                        ORDER BY inv.issue_date DESC, inv.tiny_id DESC
+                        LIMIT 50;
                         """
                     ),
                     {"sku": sku},
                 )
                 out["recent_ml_orders"] = [
                     {
+                        # Field names match the dashboard's OrderRow type so the
+                        # existing modal table renders without changes. The
+                        # numeric tiny_id here is the *invoice* tiny_id.
                         "tiny_id": int(r[0]),
-                        "ecommerce_order_number": r[1],
+                        "invoice_number": r[1],
                         "order_date": r[2],
                         "ecommerce_name": r[3],
-                        "quantity": int(r[4]),
-                        "situation": int(r[5]) if r[5] is not None else None,
+                        "ecommerce_order_number": r[4],
+                        "quantity": int(r[5]),
+                        "product_tiny_id": int(r[6]) if r[6] is not None else None,
+                        "situation": None,  # invoice status (str) ≠ order situation (int)
+                        "invoice_status": r[7],
                     }
-                    for r in orders_result.all()
+                    for r in invoices_result.all()
                 ]
             except Exception as exc:
                 out["recent_ml_orders_error"] = str(exc)

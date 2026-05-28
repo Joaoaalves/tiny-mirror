@@ -55,10 +55,15 @@ class InvoiceFullSyncConsumer(BaseConsumer):
             if message_body.get("is_cold_start_window") and sync_log_id is not None:
                 # Cold-start window: run without per-invoice tracking, then
                 # increment the window counter (total_enqueued = num windows).
-                await self._service.run_date_range_sync(date_from, date_to, sync_log_id=None)
+                # Skip detail/items fetch — historical backfills are run by a
+                # focused script (90-day window) to keep the cold-start cheap.
+                await self._service.run_date_range_sync(
+                    date_from, date_to, sync_log_id=None, fetch_items=False
+                )
                 await self._service.finalize_cold_start_window(sync_log_id)
             else:
-                # Incremental range (order-triggered or scheduler).
+                # Incremental range (order-triggered or scheduler) — fetch
+                # items so phantom detection / sales views stay current.
                 await self._service.run_date_range_sync(date_from, date_to, sync_log_id)
         else:
             # No date range → incremental with default lookback.
