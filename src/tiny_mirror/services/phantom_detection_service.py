@@ -122,6 +122,33 @@ class PhantomDetectionService:
                 WHERE oi.product_sku <> ''
                 GROUP BY oi.product_sku
             ),
+            -- Stock drain over 30d aggregated across every tiny_id sharing the SKU.
+            -- This is the ground truth for "stock is being absorbed" — kit
+            -- sales decrement components in Tiny but never write to our
+            -- order_items, so order_counts misses them entirely.
+            stock_drain AS (
+                SELECT
+                    product_sku,
+                    SUM(GREATEST(first_bal - last_bal, 0))::int AS units_drained,
+                    MIN(first_date) AS first_seen,
+                    MAX(last_date)  AS last_seen
+                FROM (
+                    SELECT DISTINCT
+                        product_sku, product_tiny_id, deposit_name,
+                        FIRST_VALUE(balance) OVER w_asc  AS first_bal,
+                        FIRST_VALUE(balance) OVER w_desc AS last_bal,
+                        FIRST_VALUE(snapshot_date) OVER w_asc  AS first_date,
+                        FIRST_VALUE(snapshot_date) OVER w_desc AS last_date
+                    FROM stock_history
+                    WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+                    WINDOW
+                        w_asc  AS (PARTITION BY product_sku, product_tiny_id, deposit_name
+                                   ORDER BY snapshot_date ASC),
+                        w_desc AS (PARTITION BY product_sku, product_tiny_id, deposit_name
+                                   ORDER BY snapshot_date DESC)
+                ) d
+                GROUP BY product_sku
+            ),
             sku_summary AS (
                 SELECT
                     p.sku,
@@ -140,22 +167,30 @@ class PhantomDetectionService:
                 s.active_id,
                 COALESCE(s.excluded_ids, ARRAY[]::bigint[]) AS excluded_ids,
                 COALESCE(oc.orders_ml_count, 0) AS orders_ml_count,
-                COALESCE(oc.units_ml, 0)        AS units_ml,
-                oc.first_sale,
-                oc.last_sale
+                -- Effective units = max(order_items count, stock drain over 30d).
+                -- Order items undercounts when the SKU only ships as a kit
+                -- component; stock drain catches the latent drain too.
+                GREATEST(
+                    COALESCE(oc.units_ml, 0),
+                    COALESCE(sd.units_drained, 0)
+                ) AS units_ml,
+                COALESCE(oc.first_sale, sd.first_seen) AS first_sale,
+                COALESCE(oc.last_sale,  sd.last_seen)  AS last_sale
             FROM sku_summary s
             LEFT JOIN order_counts oc ON oc.product_sku = s.sku
+            LEFT JOIN stock_drain  sd ON sd.product_sku = s.sku
             WHERE s.excluded_ids IS NOT NULL
               AND array_length(s.excluded_ids, 1) >= 1
               AND (
                    array_length(s.excluded_ids, 1) >= 2
                    OR COALESCE(oc.orders_ml_count, 0) >= 1
+                   OR COALESCE(sd.units_drained, 0)  >= 1
               )
             ORDER BY
                 -- critical (no active) first, then highest exclusion count, then most units sold
                 (s.active_id IS NULL) DESC,
                 array_length(s.excluded_ids, 1) DESC,
-                COALESCE(oc.units_ml, 0) DESC,
+                GREATEST(COALESCE(oc.units_ml, 0), COALESCE(sd.units_drained, 0)) DESC,
                 s.sku;
             """
         )
@@ -260,5 +295,62 @@ class PhantomDetectionService:
                 ]
             except Exception as exc:
                 out["recent_ml_orders_error"] = str(exc)
+
+            # Stock history snapshot across every tiny_id sharing this SKU.
+            # Kit-sale phantoms don't show up in order_items (the order line is
+            # the parent kit), but Tiny still decrements the component balance
+            # — so stock_history is the ground truth for "this SKU is draining".
+            try:
+                stock_result = await session.execute(
+                    text(
+                        """
+                        SELECT product_tiny_id, snapshot_date::text, deposit_name, balance
+                        FROM stock_history
+                        WHERE product_sku = :sku
+                          AND snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+                        ORDER BY snapshot_date DESC, product_tiny_id, deposit_name
+                        LIMIT 400;
+                        """
+                    ),
+                    {"sku": sku},
+                )
+                rows = stock_result.all()
+                out["stock_history"] = [
+                    {
+                        "tiny_id": int(r[0]),
+                        "snapshot_date": r[1],
+                        "deposit_name": r[2],
+                        "balance": int(r[3]),
+                    }
+                    for r in rows
+                ]
+                # Net drain over the window: sum of (earliest - latest) per
+                # (tiny_id, deposit). Positive = stock left the catalog.
+                drain_result = await session.execute(
+                    text(
+                        """
+                        WITH ranked AS (
+                            SELECT product_tiny_id, deposit_name, balance, snapshot_date,
+                                   FIRST_VALUE(balance) OVER (
+                                       PARTITION BY product_tiny_id, deposit_name
+                                       ORDER BY snapshot_date ASC
+                                   ) AS first_bal,
+                                   FIRST_VALUE(balance) OVER (
+                                       PARTITION BY product_tiny_id, deposit_name
+                                       ORDER BY snapshot_date DESC
+                                   ) AS last_bal
+                            FROM stock_history
+                            WHERE product_sku = :sku
+                              AND snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+                        )
+                        SELECT COALESCE(SUM(GREATEST(first_bal - last_bal, 0)), 0)::int
+                        FROM (SELECT DISTINCT product_tiny_id, deposit_name, first_bal, last_bal FROM ranked) d;
+                        """
+                    ),
+                    {"sku": sku},
+                )
+                out["units_drained_stock_30d"] = int(drain_result.scalar_one() or 0)
+            except Exception as exc:
+                out["stock_history_error"] = str(exc)
 
         return out
