@@ -179,13 +179,11 @@ async def test_run_correction_with_no_candidates(
     mock_session.execute = AsyncMock(return_value=fake_result)
 
     sync_logs = MagicMock()
-    sync_logs.increment_processed = AsyncMock()
-    sync_logs.increment_failed = AsyncMock()
-    sync_logs.try_finalize = AsyncMock()
+    sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
     await service.run_correction(sync_log_id=7)
 
-    sync_logs.try_finalize.assert_awaited_once_with(7)
-    sync_logs.increment_processed.assert_not_awaited()
-    sync_logs.increment_failed.assert_not_awaited()
+    sync_logs.update_sync_log_complete.assert_awaited_once_with(
+        7, items_processed=0, items_failed=0
+    )

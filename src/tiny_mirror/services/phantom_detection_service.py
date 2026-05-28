@@ -72,13 +72,13 @@ class PhantomDetectionService:
                     error=str(exc),
                 )
 
+        # Single-pass cron: no fan-out, so flip 'running' → 'completed'
+        # synchronously. try_finalize requires metadata.total_enqueued and
+        # would silently leak the sync_log until the stale watchdog kicked in.
         async with AsyncSessionLocal() as session:
-            sync_logs = SyncLogRepository(session)
-            for _ in range(recorded):
-                await sync_logs.increment_processed(sync_log_id)
-            for _ in range(failed):
-                await sync_logs.increment_failed(sync_log_id)
-            await sync_logs.try_finalize(sync_log_id)
+            await SyncLogRepository(session).update_sync_log_complete(
+                sync_log_id, items_processed=recorded, items_failed=failed
+            )
 
         logger.info(
             "Phantom detection completed",

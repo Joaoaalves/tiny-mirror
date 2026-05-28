@@ -177,7 +177,9 @@ class StockSyncService:
                 sync_log_id=sync_log_id,
             )
             async with AsyncSessionLocal() as session:
-                await SyncLogRepository(session).try_finalize(sync_log_id)
+                await SyncLogRepository(session).update_sync_log_complete(
+                    sync_log_id, items_processed=0, items_failed=0
+                )
             return
 
         async with AsyncSessionLocal() as session:
@@ -228,13 +230,14 @@ class StockSyncService:
                     error=str(exc),
                 )
 
+        # Single-pass cron: no fan-out, so we can flip 'running' → 'completed'
+        # synchronously. try_finalize is gated on metadata.total_enqueued and
+        # would silently leave the row in 'running' until the stale watchdog
+        # marked it 'failed' 90 min later.
         async with AsyncSessionLocal() as session:
-            sync_logs = SyncLogRepository(session)
-            for _ in range(processed):
-                await sync_logs.increment_processed(sync_log_id)
-            for _ in range(failed):
-                await sync_logs.increment_failed(sync_log_id)
-            await sync_logs.try_finalize(sync_log_id)
+            await SyncLogRepository(session).update_sync_log_complete(
+                sync_log_id, items_processed=processed, items_failed=failed
+            )
 
         logger.info(
             "ML FL-only stock sync completed",

@@ -731,9 +731,7 @@ async def test_run_ml_fl_only_sync_writes_per_product(
     mock_stock_repo_cls.return_value = stock_repo
 
     sync_logs = MagicMock()
-    sync_logs.increment_processed = AsyncMock()
-    sync_logs.increment_failed = AsyncMock()
-    sync_logs.try_finalize = AsyncMock()
+    sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
     stock_service._fetch_ml_full_qty = AsyncMock(side_effect=[12, 7])  # type: ignore[method-assign]
@@ -744,8 +742,9 @@ async def test_run_ml_fl_only_sync_writes_per_product(
     calls = stock_repo.upsert_ml_full_deposit.await_args_list
     assert calls[0].args[0] == 100 and calls[0].args[1] == 12
     assert calls[1].args[0] == 200 and calls[1].args[1] == 7
-    assert sync_logs.increment_processed.await_count == 2
-    sync_logs.try_finalize.assert_awaited()
+    sync_logs.update_sync_log_complete.assert_awaited_once_with(
+        42, items_processed=2, items_failed=0
+    )
 
 
 @patch("tiny_mirror.services.stock_sync_service.SyncLogRepository")
@@ -774,9 +773,7 @@ async def test_run_ml_fl_only_sync_skips_when_fetch_returns_none(
     mock_stock_repo_cls.return_value = stock_repo
 
     sync_logs = MagicMock()
-    sync_logs.increment_processed = AsyncMock()
-    sync_logs.increment_failed = AsyncMock()
-    sync_logs.try_finalize = AsyncMock()
+    sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
     stock_service._fetch_ml_full_qty = AsyncMock(return_value=None)  # type: ignore[method-assign]
@@ -784,7 +781,9 @@ async def test_run_ml_fl_only_sync_skips_when_fetch_returns_none(
     await stock_service.run_ml_fl_only_sync(sync_log_id=99)
 
     stock_repo.upsert_ml_full_deposit.assert_not_awaited()
-    sync_logs.try_finalize.assert_awaited()
+    sync_logs.update_sync_log_complete.assert_awaited_once_with(
+        99, items_processed=0, items_failed=0
+    )
 
 
 @patch("tiny_mirror.services.stock_sync_service.SyncLogRepository")
@@ -804,12 +803,14 @@ async def test_run_ml_fl_only_sync_noop_when_ml_disabled(
     mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
 
     sync_logs = MagicMock()
-    sync_logs.try_finalize = AsyncMock()
+    sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
     await service.run_ml_fl_only_sync(sync_log_id=7)
 
-    sync_logs.try_finalize.assert_awaited_once_with(7)
+    sync_logs.update_sync_log_complete.assert_awaited_once_with(
+        7, items_processed=0, items_failed=0
+    )
 
 
 @patch("tiny_mirror.services.stock_sync_service.SyncLogRepository")
@@ -840,9 +841,7 @@ async def test_run_ml_fl_only_sync_counts_failures(
     mock_stock_repo_cls.return_value = stock_repo
 
     sync_logs = MagicMock()
-    sync_logs.increment_processed = AsyncMock()
-    sync_logs.increment_failed = AsyncMock()
-    sync_logs.try_finalize = AsyncMock()
+    sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
     # First product raises, second succeeds with qty=5.
@@ -853,5 +852,6 @@ async def test_run_ml_fl_only_sync_counts_failures(
     await stock_service.run_ml_fl_only_sync(sync_log_id=1)
 
     assert stock_repo.upsert_ml_full_deposit.await_count == 1
-    assert sync_logs.increment_processed.await_count == 1
-    assert sync_logs.increment_failed.await_count == 1
+    sync_logs.update_sync_log_complete.assert_awaited_once_with(
+        1, items_processed=1, items_failed=1
+    )
