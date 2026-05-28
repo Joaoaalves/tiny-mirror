@@ -183,13 +183,18 @@ class PhantomDetectionService:
                 s.sku,
                 s.active_id,
                 COALESCE(s.excluded_ids, ARRAY[]::bigint[]) AS excluded_ids,
-                -- Effective sales-event count = max(order_items orders, stock drop events).
-                -- The first signal misses kit-component sales (the order line is the
-                -- parent kit), but Tiny still records the balance drop on the
-                -- component — counting per-day drops in stock_history catches them.
+                -- Effective sales-event count = max of three lower bounds:
+                --   (a) direct order_items count — misses kit-component sales
+                --   (b) distinct snapshot dates where balance dropped — limited
+                --       to the 30d stock_history window we keep
+                --   (c) number of excluded phantom duplicates — each phantom was
+                --       created by Tiny because an ML order arrived with an
+                --       unmapped SKU, so it's a lower bound on cumulative sales
+                --       that absorbed stock through these phantoms
                 GREATEST(
                     COALESCE(oc.orders_ml_count, 0),
-                    COALESCE(se.drop_events, 0)
+                    COALESCE(se.drop_events, 0),
+                    COALESCE(array_length(s.excluded_ids, 1), 0)
                 ) AS orders_ml_count,
                 -- Effective units = max(order_items units, stock drain over 30d).
                 GREATEST(
