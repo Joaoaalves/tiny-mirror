@@ -7,10 +7,16 @@ keep arriving on the same SKU and the cycle repeats — each detection
 absorbs stock from a product that doesn't really exist and distorts
 the FL inventory.
 
-Detection criterion:
-  - SKU has >= 1 product with situacao='E' (excluded) in our products table
-  - Same SKU has >= 1 order_item linked to it from a Mercado Livre channel
-  - We record the run regardless of severity: the trend matters.
+Detection criterion (need ANY of):
+  - SKU has >= 2 products with situacao='E' (excluded) — multiple duplicates
+    is a strong phantom signal even if our DB has no orders for the SKU.
+  - SKU has >= 1 excluded AND >= 1 order_item from Mercado Livre — phantom
+    that already absorbed sales.
+
+  We deliberately do NOT require `orders_ml_count >= 1`: Tiny sometimes
+  creates phantoms via channels whose order_items don't reach our DB (kit
+  explosions, third-party integrations), so any SKU with multiple excluded
+  copies is suspicious regardless of our local order trail.
 
 Per phantom SKU, we record:
   - active vs excluded counts
@@ -83,10 +89,17 @@ class PhantomDetectionService:
 
     # ------------------------------------------------------------------
     async def _load_candidates(self) -> list[dict[str, Any]]:
-        """Return one row per SKU with >=1 excluded duplicate AND >=1 ML order.
+        """Return one row per SKU flagged as a phantom candidate.
+
+        A SKU is flagged when it has at least one excluded duplicate AND
+        either (a) >=2 excluded duplicates total — repeated phantom creation
+        is itself the signal — or (b) at least one Mercado Livre order_item
+        that absorbed sales on the SKU. Single isolated exclusions (typo
+        fixes, manual cleanup) are ignored.
 
         Skips test SKUs and empty SKUs. Active tiny_id is the first non-excluded
-        copy (A preferred over I).
+        copy (A preferred over I). Falls back to a LEFT JOIN on order_counts so
+        SKUs with no orders in our DB still come through.
         """
         sql = text(
             """
@@ -126,16 +139,24 @@ class PhantomDetectionService:
                 s.sku,
                 s.active_id,
                 COALESCE(s.excluded_ids, ARRAY[]::bigint[]) AS excluded_ids,
-                oc.orders_ml_count,
-                oc.units_ml,
+                COALESCE(oc.orders_ml_count, 0) AS orders_ml_count,
+                COALESCE(oc.units_ml, 0)        AS units_ml,
                 oc.first_sale,
                 oc.last_sale
             FROM sku_summary s
-            JOIN order_counts oc ON oc.product_sku = s.sku
+            LEFT JOIN order_counts oc ON oc.product_sku = s.sku
             WHERE s.excluded_ids IS NOT NULL
               AND array_length(s.excluded_ids, 1) >= 1
-              AND oc.orders_ml_count >= 1
-            ORDER BY oc.units_ml DESC NULLS LAST, s.sku;
+              AND (
+                   array_length(s.excluded_ids, 1) >= 2
+                   OR COALESCE(oc.orders_ml_count, 0) >= 1
+              )
+            ORDER BY
+                -- critical (no active) first, then highest exclusion count, then most units sold
+                (s.active_id IS NULL) DESC,
+                array_length(s.excluded_ids, 1) DESC,
+                COALESCE(oc.units_ml, 0) DESC,
+                s.sku;
             """
         )
         async with AsyncSessionLocal() as session:
