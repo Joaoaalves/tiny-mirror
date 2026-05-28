@@ -98,7 +98,8 @@ class FLStockCorrectionService:
 
     # ------------------------------------------------------------------
     async def _load_candidates(self) -> list[tuple[int, str, int]]:
-        """Returns [(tiny_id, sku, ml_qty)] for every base SKU with FL listing.
+        """Returns [(tiny_id, sku, ml_qty)] for every base SKU with FL listing
+        whose Tiny accounting has *settled* (no pending NFs for recent sales).
 
         Filters:
           - p.situation = 'A' (active product in Tiny)
@@ -108,6 +109,16 @@ class FLStockCorrectionService:
           - is NOT a component-only kit_product (no rows in product_kit_components
             where this product is the kit)
           - excludes test SKUs (SKU-TEST*)
+          - **quiet**: no Mercado Livre order activity in the last 6h.
+            Tiny's auto-NF + FL auto-baixa pipeline runs minutes after the
+            ML shipment, so any drift observed while the pipeline is still
+            in motion is likely a timing artifact, not real drift. Applying
+            a balance during that window risks racing the Tiny auto-baixa
+            and double-counting the units. The point of this cron is to
+            catch *real* drift (phantom products, cancelled NFs that left
+            stock dangling, kit decomposition bugs, manual lançamentos with
+            wrong sign, etc.), not to win a race against invoicing. SKUs
+            that aren't quiet this run will be picked up by the next one.
         """
         sql = text(
             """
@@ -131,6 +142,20 @@ class FLStockCorrectionService:
                   WHERE ml.sku = p.sku
                     AND ml.logistic_type = 'fulfillment'
                     AND ml.status = 'active'
+              )
+              AND NOT EXISTS (
+                  -- "quiet" check: any ML order activity on this SKU in the
+                  -- last 6h is treated as the Tiny invoicing pipeline still
+                  -- being in motion. Tiny pre-fills invoice_id on auto-NF
+                  -- orders, so that flag is useless as a "settled" signal —
+                  -- time-since-activity is the only reliable discriminator
+                  -- between real drift and a timing artifact.
+                  SELECT 1
+                  FROM order_items oi
+                  JOIN orders o ON o.tiny_id = oi.order_tiny_id
+                  WHERE oi.product_sku = p.sku
+                    AND o.ecommerce_name LIKE 'Mercado Livre%'
+                    AND o.synced_at >= NOW() - INTERVAL '6 hours'
               );
             """
         )

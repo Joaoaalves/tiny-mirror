@@ -113,12 +113,22 @@ class Settings(BaseSettings):
     # Daily Tiny stock_full_sync still runs at 03:00 UTC for the other
     # deposits (galpão, A Caminho, etc.).
     sync_ml_fl_stock_cron: str = "*/15 * * * *"
-    # Hourly Tiny correction: detect mismatch between Tiny FL deposit
-    # saldo and our DB (= ML truth), apply tipo=B balance for base SKUs,
-    # capture full forensic snapshot in fl_stock_corrections_log so each
-    # detected drift can be later investigated. Excludes kits/combos
-    # (Tiny auto-calculates them from components — see docs/05).
-    sync_fl_correction_cron: str = "0 * * * *"
+    # Twice-daily Tiny correction (06:00 and 18:00 UTC): detect mismatch
+    # between Tiny FL deposit saldo and our DB (= ML truth), apply tipo=B
+    # balance for base SKUs that have *settled* in Tiny accounting (no
+    # pending orders/NFs — see fl_stock_correction_service._load_candidates).
+    # Captures full forensic snapshot in fl_stock_corrections_log so each
+    # detected drift can be later investigated.
+    #
+    # The point of this job is NOT to be a permanent drift patcher running
+    # every hour — that would cause double-baixa when our correction and
+    # Tiny's own NF-driven decrement land out of order. The point is to
+    # surface (via the forensic log) the *cases* where Tiny's accounting
+    # is wrong (phantom products, cancelled NFs that never reversed stock,
+    # kit decomposition bugs, etc.) so the underlying Tiny problem can be
+    # fixed at the source. Twice/day is enough to keep base SKUs aligned
+    # with ML reality without racing the Tiny invoicing pipeline.
+    sync_fl_correction_cron: str = "0 6,18 * * *"
     # Daily phantom detection: identifies SKUs where the Tiny catalog has
     # excluded duplicates AND ML orders kept arriving (= the listing's
     # SELLER_SKU points to nothing and Tiny auto-creates a phantom per
