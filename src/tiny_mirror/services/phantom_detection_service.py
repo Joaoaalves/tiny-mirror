@@ -126,6 +126,9 @@ class PhantomDetectionService:
             -- This is the ground truth for "stock is being absorbed" — kit
             -- sales decrement components in Tiny but never write to our
             -- order_items, so order_counts misses them entirely.
+            -- Per-(sku, tiny_id, deposit) endpoints in the 30d window:
+            --   first_bal/last_bal → drained units
+            --   plus a per-day balance-drop event count → minimum sales-event count
             stock_drain AS (
                 SELECT
                     product_sku,
@@ -149,6 +152,20 @@ class PhantomDetectionService:
                 ) d
                 GROUP BY product_sku
             ),
+            -- Sales-event count from stock history: each day where balance
+            -- dropped vs the previous snapshot. Lower bound on # of sales.
+            stock_events AS (
+                SELECT product_sku,
+                       count(*) FILTER (WHERE prev IS NOT NULL AND balance < prev) AS drop_events
+                FROM (
+                    SELECT product_sku, product_tiny_id, deposit_name, snapshot_date, balance,
+                           LAG(balance) OVER (PARTITION BY product_sku, product_tiny_id, deposit_name
+                                              ORDER BY snapshot_date) AS prev
+                    FROM stock_history
+                    WHERE snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+                ) e
+                GROUP BY product_sku
+            ),
             sku_summary AS (
                 SELECT
                     p.sku,
@@ -166,10 +183,15 @@ class PhantomDetectionService:
                 s.sku,
                 s.active_id,
                 COALESCE(s.excluded_ids, ARRAY[]::bigint[]) AS excluded_ids,
-                COALESCE(oc.orders_ml_count, 0) AS orders_ml_count,
-                -- Effective units = max(order_items count, stock drain over 30d).
-                -- Order items undercounts when the SKU only ships as a kit
-                -- component; stock drain catches the latent drain too.
+                -- Effective sales-event count = max(order_items orders, stock drop events).
+                -- The first signal misses kit-component sales (the order line is the
+                -- parent kit), but Tiny still records the balance drop on the
+                -- component — counting per-day drops in stock_history catches them.
+                GREATEST(
+                    COALESCE(oc.orders_ml_count, 0),
+                    COALESCE(se.drop_events, 0)
+                ) AS orders_ml_count,
+                -- Effective units = max(order_items units, stock drain over 30d).
                 GREATEST(
                     COALESCE(oc.units_ml, 0),
                     COALESCE(sd.units_drained, 0)
@@ -179,6 +201,7 @@ class PhantomDetectionService:
             FROM sku_summary s
             LEFT JOIN order_counts oc ON oc.product_sku = s.sku
             LEFT JOIN stock_drain  sd ON sd.product_sku = s.sku
+            LEFT JOIN stock_events se ON se.product_sku = s.sku
             WHERE s.excluded_ids IS NOT NULL
               AND array_length(s.excluded_ids, 1) >= 1
               AND (
