@@ -1025,6 +1025,175 @@ class MLPromotionService:
         logger.info("decisions_expired", **stats)
         return stats
 
+    async def bulk_decide_pending(
+        self,
+        session: AsyncSession,
+        *,
+        action: str,
+        promo_types: list[str] | None = None,
+        min_delta_pct: float | None = None,
+        max_delta_pct: float | None = None,
+        skus: list[str] | None = None,
+        dry_run: bool = True,
+        decided_by: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Find every pending decision matching the filter set and
+        flip its status. Idempotent: only rows still in ``pending``
+        are touched, so a re-run after a partial failure picks up
+        what was missed.
+
+        Returns either a dry-run preview (``dry_run=True``) or the
+        post-commit count (``dry_run=False``). Both shapes share:
+
+          - ``matched``     int — rows passing the filter
+          - ``by_type``     dict[str,int] — count per promo_type
+          - ``sample``      list — first 5 (sku, mlb, type, target) so
+            the UI can render a sanity-check before the operator
+            commits
+          - ``avg_delta_pct`` float|None — population average of
+            (target - list) / list * 100; useful even for ignore so
+            the operator sees how steep the discounts are
+
+        The DRY-run shape additionally returns ``would_update`` (==
+        matched). The WET shape returns ``updated`` which equals
+        matched in the happy path; lower only when a concurrent
+        request moved some rows out of pending between the filter and
+        the UPDATE.
+
+        Approve is rejected at the router layer. Bulk-approve would
+        skip the per-row target_price / cap / floor revalidation so we
+        forbid it; ``ignore`` and ``reject`` are pure DB transitions
+        and safe.
+        """
+        from sqlalchemy import select, update
+
+        from tiny_mirror.infrastructure.orm.models import MLPromoDecisionORM
+
+        if action not in ("ignore", "reject"):
+            raise ValueError(f"bulk action not allowed: {action}")
+
+        # Build the filter once; reuse for the dry-run SELECT and the
+        # commit UPDATE so the two see exactly the same row set.
+        conditions = [MLPromoDecisionORM.status == "pending"]
+        if promo_types:
+            conditions.append(MLPromoDecisionORM.promo_type.in_(promo_types))
+        if skus:
+            conditions.append(MLPromoDecisionORM.sku.in_(skus))
+
+        # Δ% filter is done in Python rather than SQL because the
+        # decision row stores target_price and list_price as Numeric
+        # nullables; expressing (a-b)/b in SQL with NULL handling and
+        # divide-by-zero guards is messy. The dataset is bounded
+        # (today 2k rows) so an in-process filter is fine.
+        stmt = select(MLPromoDecisionORM).where(*conditions)
+        rows = list((await session.execute(stmt)).scalars().all())
+
+        matched_rows = [
+            r for r in rows if self._row_passes_delta_range(r, min_delta_pct, max_delta_pct)
+        ]
+
+        by_type: dict[str, int] = {}
+        deltas: list[float] = []
+        for r in matched_rows:
+            by_type[r.promo_type] = by_type.get(r.promo_type, 0) + 1
+            d = self._row_delta_pct(r)
+            if d is not None:
+                deltas.append(d)
+        avg_delta_pct = sum(deltas) / len(deltas) if deltas else None
+        sample = [
+            {
+                "id": r.id,
+                "sku": r.sku,
+                "mlb_id": r.mlb_id,
+                "promo_type": r.promo_type,
+                "target_price": float(r.target_price) if r.target_price else None,
+                "list_price": float(r.list_price) if r.list_price else None,
+            }
+            for r in matched_rows[:5]
+        ]
+
+        base = {
+            "matched": len(matched_rows),
+            "by_type": by_type,
+            "avg_delta_pct": avg_delta_pct,
+            "sample": sample,
+        }
+
+        if dry_run:
+            logger.info(
+                "decisions_bulk_dry_run",
+                action=action,
+                **{k: v for k, v in base.items() if k != "sample"},
+            )
+            return {**base, "would_update": len(matched_rows), "dry_run": True}
+
+        # Commit path. UPDATE-by-id with the same filter set; the WHERE
+        # still includes status='pending' so a row touched by another
+        # request between the SELECT and the UPDATE is safely skipped.
+        ids = [r.id for r in matched_rows]
+        if not ids:
+            return {**base, "updated": 0, "dry_run": False}
+
+        upd_stmt = (
+            update(MLPromoDecisionORM)
+            .where(
+                MLPromoDecisionORM.id.in_(ids),
+                MLPromoDecisionORM.status == "pending",
+            )
+            .values(
+                status=action,
+                decided_at=datetime.now(UTC),
+                decided_by=decided_by,
+                notes=notes,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        result = await session.execute(upd_stmt)
+        await session.commit()
+        updated = int(getattr(result, "rowcount", 0) or 0)
+        logger.info(
+            "decisions_bulk_committed",
+            action=action,
+            matched=len(matched_rows),
+            updated=updated,
+            decided_by=decided_by,
+        )
+        return {**base, "updated": updated, "dry_run": False}
+
+    @staticmethod
+    def _row_delta_pct(row: Any) -> float | None:
+        """Return (target - list) / list * 100 for a decision row, or
+        None when either side is missing or list is non-positive.
+        Negative = discount, positive = price hike.
+        """
+        if row.target_price is None or row.list_price is None or float(row.list_price) <= 0:
+            return None
+        return (float(row.target_price) - float(row.list_price)) / float(row.list_price) * 100.0
+
+    @classmethod
+    def _row_passes_delta_range(
+        cls,
+        row: Any,
+        min_delta_pct: float | None,
+        max_delta_pct: float | None,
+    ) -> bool:
+        """Range gate used by the bulk-act filter. When neither bound
+        is set the row passes unconditionally; otherwise a row whose
+        Δ% can't be computed (missing target/list) is REJECTED — the
+        operator asked for a Δ% slice and a row without one isn't in it.
+        """
+        if min_delta_pct is None and max_delta_pct is None:
+            return True
+        d = cls._row_delta_pct(row)
+        if d is None:
+            return False
+        if min_delta_pct is not None and d < min_delta_pct:
+            return False
+        if max_delta_pct is not None and d > max_delta_pct:
+            return False
+        return True
+
     @staticmethod
     def _stale_reason(
         row: Any,

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -224,6 +224,40 @@ class DecisionDecideIn(BaseModel):
     # target_seller_pct são recalculados a partir do novo target_price
     # + list_price + meli_percentage.
     target_price: Decimal | None = None
+
+
+class BulkDecideIn(BaseModel):
+    """Bulk-act on every pending decision matching a filter.
+
+    Designed for queue cleanup at scale — e.g. ignoring the 1k+ rows
+    SELLER_COUPON_CAMPAIGN tends to flood with — without the operator
+    having to checkbox every row. The endpoint is dry-run by default
+    so the UI can call it twice: first to preview the count and the
+    breakdown, then again with ``dry_run=False`` only after the
+    operator confirms.
+
+    Approve is intentionally NOT permitted here. Per-row approve has
+    extra validation (target_price override + floor/cap re-check); the
+    bulk lane never carries those overrides, so we restrict it to the
+    DB-only paths (ignore / reject) that need no validation. A future
+    bulk-approve would need to stream individual approves through the
+    per-row endpoint to preserve that validation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["ignore", "reject"]
+    # Filter knobs. None = match everything.
+    promo_types: list[str] | None = None
+    # Δ% relative to list_price: (target - list) / list * 100. Negative
+    # = price drop (the usual case). Defining the range as min/max
+    # gives the operator e.g. "ignore everything with discount >15%"
+    # via max_delta_pct=-15.
+    min_delta_pct: float | None = None
+    max_delta_pct: float | None = None
+    skus: list[str] | None = None
+    dry_run: bool = True
+    decided_by: str | None = None
+    notes: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1000,6 +1034,32 @@ async def generate_decisions(
     decisions already in the queue (pending / approved / rejected)."""
     return await service.generate_pending_decisions(
         session, only_sku=only_sku, limit_skus=limit_skus
+    )
+
+
+@router.post("/decisions/bulk-act")
+async def bulk_act_decisions(
+    body: BulkDecideIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Bulk-ignore or bulk-reject pending decisions matching a filter.
+
+    Defaults to dry-run; the operator-facing UI calls this twice
+    (preview, then commit). Approve is not supported here — bulk
+    approve would skip the per-row target/cap/floor revalidation that
+    the single-row endpoint enforces, and promotions cost money.
+    """
+    return await service.bulk_decide_pending(
+        session,
+        action=body.action,
+        promo_types=body.promo_types,
+        min_delta_pct=body.min_delta_pct,
+        max_delta_pct=body.max_delta_pct,
+        skus=body.skus,
+        dry_run=body.dry_run,
+        decided_by=body.decided_by,
+        notes=body.notes,
     )
 
 
