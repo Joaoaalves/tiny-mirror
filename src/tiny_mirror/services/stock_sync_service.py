@@ -203,23 +203,26 @@ class StockSyncService:
                     product_repo = PostgreSQLProductRepository(session)
                     parent_kits = await product_repo.get_parent_kits_for_sku(sku)
 
-                ml_qty = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
-                # _fetch_ml_full_qty returns None on transient failure; treat
-                # as "skip this product" (don't zero out a stale row over a
-                # blip). Next tick recovers.
-                if ml_qty is None:
+                breakdown = await self._fetch_ml_full_breakdown(
+                    sku, ptype=ptype, parent_kits=parent_kits
+                )
+                # None on transient failure → skip this product (don't zero
+                # out a stale row over a blip). Next tick recovers.
+                if breakdown is None:
                     logger.debug(
                         "ML FL fetch returned None, skipping update",
                         sku=sku,
                         tiny_id=tiny_id,
                     )
                     continue
+                available_qty, in_transfer_qty = breakdown
 
                 async with AsyncSessionLocal() as session:
                     stock_repo = PostgreSQLStockRepository(session)
                     await stock_repo.upsert_ml_full_deposit(
                         tiny_id,
-                        int(ml_qty),
+                        int(available_qty),
+                        in_transfer_qty=int(in_transfer_qty),
                         deposit_name=ML_FULL_DEPOSIT_NAME,
                         sentinel_deposit_id=ML_FULL_DEPOSIT_SENTINEL_ID,
                     )
@@ -303,13 +306,17 @@ class StockSyncService:
             # when the SKU has an active FL listing, zero otherwise.
             # Transient ML failures also force zero — see
             # _fetch_ml_full_qty's docstring for the rationale.
-            ml_qty = 0
+            ml_available = 0
+            ml_in_transfer = 0
             if self._ml is not None and sku:
                 ptype = (product_data or {}).get("type") or "S"
                 parent_kits = await product_repo.get_parent_kits_for_sku(sku)
-                fetched = await self._fetch_ml_full_qty(sku, ptype=ptype, parent_kits=parent_kits)
-                ml_qty = fetched or 0
-            _overlay_ml_full_deposit(deposits, ml_qty)
+                fetched = await self._fetch_ml_full_breakdown(
+                    sku, ptype=ptype, parent_kits=parent_kits
+                )
+                if fetched is not None:
+                    ml_available, ml_in_transfer = fetched
+            _overlay_ml_full_deposit(deposits, ml_available, ml_in_transfer)
 
             stock_repo = PostgreSQLStockRepository(session)
             try:
@@ -524,11 +531,17 @@ class StockSyncService:
         ptype: str = "S",
         parent_kits: list[tuple[str, int]] | None = None,
     ) -> int | None:
+        """Effective FL qty for a SKU. Since :meth:`_fl_for_sku` already
+        returns available + in_transfer (the effective at-FL stock), the
+        legacy summation here yields the correct total without separately
+        tracking the breakdown. Kept for callers that don't need the
+        breakdown; :meth:`_fetch_ml_full_breakdown` is preferred when
+        persisting to stock_deposits.
+        """
         if self._ml is None:
             return None
 
         try:
-            # Quantity kit (e.g. "3U-BASE-SKU"): divide base SKU inventory by X.
             m = _QUANTITY_KIT_RE.match(sku) if ptype == "K" else None
             if ptype == "K" and m:
                 x = int(m.group(1))
@@ -538,8 +551,6 @@ class StockSyncService:
                 base_fl = await self._fl_for_sku(base_sku)
                 return (base_fl // x) if base_fl is not None else None
 
-            # Simple (S) / variant (V) / combo (K without qty-kit pattern):
-            # own FL inventory + sum of parent-kit contributions.
             own_fl = await self._fl_for_sku(sku)
             has_any = own_fl is not None
             total = own_fl or 0
@@ -556,13 +567,73 @@ class StockSyncService:
             logger.warning("ML FL fetch failed, skipping ML overlay", sku=sku, error=str(exc))
             return None
 
-    async def _fl_for_sku(self, sku: str) -> int | None:
-        """Return total FL fulfillment inventory for a SKU.
+    async def _fetch_ml_full_breakdown(
+        self,
+        sku: str,
+        ptype: str = "S",
+        parent_kits: list[tuple[str, int]] | None = None,
+    ) -> tuple[int, int] | None:
+        """Return ``(available, in_transfer)`` aggregated across own listing
+        + parent-kit contributions.
 
-        Looks up ml_listings (populated by MLListingSyncService) for all
-        fulfillment listings matching the SKU, then calls the Inventory API for
-        each distinct inventory_id.  Returns None when no fulfillment listing
-        exists (caller should treat as "unknown"), or an int >= 0 otherwise.
+        Quantity kits (``XU-base-sku``) divide the base SKU's breakdown by
+        the multiplier. Simple/variant/combo SKUs sum their own breakdown
+        with parent-kit breakdowns scaled by component qty.
+        """
+        if self._ml is None:
+            return None
+
+        try:
+            # Quantity kit (e.g. "3U-BASE-SKU"): divide base SKU breakdown by X.
+            m = _QUANTITY_KIT_RE.match(sku) if ptype == "K" else None
+            if ptype == "K" and m:
+                x = int(m.group(1))
+                base_sku = m.group(2)
+                if x <= 0:
+                    return (0, 0)
+                base = await self._fl_breakdown_for_sku(base_sku)
+                if base is None:
+                    return None
+                return (base[0] // x, base[1] // x)
+
+            # Simple (S) / variant (V) / combo (K without qty-kit pattern):
+            # own FL inventory + sum of parent-kit contributions.
+            own = await self._fl_breakdown_for_sku(sku)
+            has_any = own is not None
+            available = own[0] if own else 0
+            in_transfer = own[1] if own else 0
+
+            for kit_sku, component_qty in parent_kits or []:
+                kit = await self._fl_breakdown_for_sku(kit_sku)
+                if kit is not None:
+                    has_any = True
+                    available += kit[0] * component_qty
+                    in_transfer += kit[1] * component_qty
+
+            return (available, in_transfer) if has_any else None
+
+        except Exception as exc:
+            logger.warning("ML FL fetch failed, skipping ML overlay", sku=sku, error=str(exc))
+            return None
+
+    async def _fl_for_sku(self, sku: str) -> int | None:
+        """Return *effective* FL inventory for a SKU (available + in_transfer).
+
+        See :meth:`_fl_breakdown_for_sku` for the breakdown variant. This
+        wrapper keeps the legacy int contract used by kit/multiplier paths.
+        """
+        breakdown = await self._fl_breakdown_for_sku(sku)
+        if breakdown is None:
+            return None
+        return breakdown[0] + breakdown[1]
+
+    async def _fl_breakdown_for_sku(self, sku: str) -> tuple[int, int] | None:
+        """Return ``(available, in_transfer)`` for a SKU's FL inventories.
+
+        Sums available_quantity and not_available_detail[status=transfer]
+        qty across every fulfillment inventory_id mapped to the SKU.
+        Returns None when no fulfillment listing exists (treat as "unknown"),
+        ``(0, 0)`` when listing(s) exist but resolve to no inventory.
         """
         async with AsyncSessionLocal() as session:
             listing_rows = (
@@ -601,14 +672,23 @@ class StockSyncService:
                     inv_ids.add(inventory_id)
 
         if not inv_ids:
-            return 0
+            return (0, 0)
 
         assert self._ml is not None
-        total = 0
+        available = 0
+        in_transfer = 0
         for inv_id in inv_ids:
             stock_data = await self._ml.get_inventory_stock(inv_id)
-            total += int(stock_data.get("available_quantity") or 0)
-        return total
+            available += int(stock_data.get("available_quantity") or 0)
+            # not_available_detail is an array of {status, quantity}.
+            # status='transfer' = ML moving units between its own warehouses;
+            # the units are still at FL and become available again within
+            # hours. Other statuses (rare in 2026-05 sample, mostly nil) we
+            # treat as truly unavailable.
+            for det in stock_data.get("not_available_detail") or []:
+                if isinstance(det, dict) and det.get("status") == "transfer":
+                    in_transfer += int(det.get("quantity") or 0)
+        return (available, in_transfer)
 
     # ------------------------------------------------------------------
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
@@ -684,20 +764,25 @@ def _extract_cost_price(product_data: dict[str, Any] | None) -> Decimal:
         return Decimal("0")
 
 
-def _overlay_ml_full_deposit(deposits: list[dict[str, Any]], ml_qty: int) -> None:
-    """Mutate `deposits` so the Full ML row reflects the authoritative ML
-    quantity and counts in coverage (``ignore=False``).
+def _overlay_ml_full_deposit(
+    deposits: list[dict[str, Any]],
+    available_qty: int,
+    in_transfer_qty: int = 0,
+) -> None:
+    """Mutate `deposits` so the Full ML row reflects ML's authoritative
+    available + in_transfer breakdown and counts in coverage (``ignore=False``).
 
-    If Tiny returned a row named "Full Mercado Livre", overwrite its
-    balance/available with `ml_qty` and flip ``ignore`` off. Otherwise
-    append a synthetic row with a sentinel ``deposit_tiny_id`` (the
-    table's unique constraint is per (product, deposit_tiny_id), so a
-    fixed sentinel is safe per product).
+    ``balance`` carries the physical total (available + in_transfer) for
+    downstream calculations that want "everything at FL"; ``available``
+    keeps the sell-now count; ``in_transfer`` is the ML-internal-move
+    bucket that mv_coverage adds back into stock_full_ml.
     """
+    balance_total = float(available_qty + in_transfer_qty)
     for d in deposits:
         if d.get("deposit_name") == ML_FULL_DEPOSIT_NAME:
-            d["balance"] = float(ml_qty)
-            d["available"] = float(ml_qty)
+            d["balance"] = balance_total
+            d["available"] = float(available_qty)
+            d["in_transfer"] = float(in_transfer_qty)
             d["reserved"] = 0.0
             d["ignore"] = False
             return
@@ -707,9 +792,10 @@ def _overlay_ml_full_deposit(deposits: list[dict[str, Any]], ml_qty: int) -> Non
             "deposit_tiny_id": ML_FULL_DEPOSIT_SENTINEL_ID,
             "deposit_name": ML_FULL_DEPOSIT_NAME,
             "ignore": False,
-            "balance": float(ml_qty),
+            "balance": balance_total,
             "reserved": 0.0,
-            "available": float(ml_qty),
+            "available": float(available_qty),
+            "in_transfer": float(in_transfer_qty),
             "company": "Mercado Livre",
         }
     )

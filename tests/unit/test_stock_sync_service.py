@@ -52,7 +52,7 @@ def test_overlay_overwrites_existing_full_ml_row() -> None:
         },
     ]
 
-    _overlay_ml_full_deposit(deposits, ml_qty=12)
+    _overlay_ml_full_deposit(deposits, available_qty=12)
 
     assert len(deposits) == 2
     full_row = next(d for d in deposits if d["deposit_name"] == "Full Mercado Livre")
@@ -76,7 +76,7 @@ def test_overlay_appends_synthetic_row_when_tiny_has_none() -> None:
         },
     ]
 
-    _overlay_ml_full_deposit(deposits, ml_qty=7)
+    _overlay_ml_full_deposit(deposits, available_qty=7)
 
     assert len(deposits) == 2
     full_row = next(d for d in deposits if d["deposit_name"] == ML_FULL_DEPOSIT_NAME)
@@ -99,7 +99,7 @@ def test_overlay_with_zero_qty_writes_zero_and_unignores() -> None:
         },
     ]
 
-    _overlay_ml_full_deposit(deposits, ml_qty=0)
+    _overlay_ml_full_deposit(deposits, available_qty=0)
 
     full_row = deposits[0]
     assert full_row["balance"] == 0.0
@@ -830,7 +830,7 @@ async def test_run_ml_fl_only_sync_writes_per_product(
     sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
-    stock_service._fetch_ml_full_qty = AsyncMock(side_effect=[12, 7])  # type: ignore[method-assign]
+    stock_service._fetch_ml_full_breakdown = AsyncMock(side_effect=[(12, 0), (7, 0)])  # type: ignore[method-assign]
 
     await stock_service.run_ml_fl_only_sync(sync_log_id=42)
 
@@ -872,7 +872,7 @@ async def test_run_ml_fl_only_sync_skips_when_fetch_returns_none(
     sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
-    stock_service._fetch_ml_full_qty = AsyncMock(return_value=None)  # type: ignore[method-assign]
+    stock_service._fetch_ml_full_breakdown = AsyncMock(return_value=None)  # type: ignore[method-assign]
 
     await stock_service.run_ml_fl_only_sync(sync_log_id=99)
 
@@ -940,9 +940,9 @@ async def test_run_ml_fl_only_sync_counts_failures(
     sync_logs.update_sync_log_complete = AsyncMock()
     mock_sync_log_cls.return_value = sync_logs
 
-    # First product raises, second succeeds with qty=5.
-    stock_service._fetch_ml_full_qty = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[RuntimeError("ML down"), 5]
+    # First product raises, second succeeds with (5, 0) breakdown.
+    stock_service._fetch_ml_full_breakdown = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[RuntimeError("ML down"), (5, 0)]
     )
 
     await stock_service.run_ml_fl_only_sync(sync_log_id=1)

@@ -542,6 +542,15 @@ class StockDepositORM(Base):
     available: Mapped[Decimal] = mapped_column(
         Numeric(10, 2), nullable=False, server_default=text("0")
     )
+    in_transfer: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2),
+        nullable=False,
+        server_default=text("0"),
+        comment=(
+            "ML internal-transfer qty for the 'Full Mercado Livre' row "
+            "(not_available_detail[status=transfer]). Always 0 elsewhere."
+        ),
+    )
     company: Mapped[str | None] = mapped_column(String(200), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
