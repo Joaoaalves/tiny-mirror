@@ -432,6 +432,185 @@ class MLPromotionService:
         self._token_service = token_service
         self._http = http_client
 
+    # -- ML promotions (write) --------------------------------------------
+    async def apply_decision_to_ml(
+        self,
+        *,
+        decision: Any,
+    ) -> dict[str, Any]:
+        """POST a previously-approved decision to /seller-promotions.
+
+        Behaviour by ``promo_type`` x ``decision_kind``:
+
+        - ``DEAL`` / ``DOD`` / ``LIGHTNING`` / ``SELLER_CAMPAIGN`` /
+          ``PRICE_DISCOUNT`` with ``decision_kind='would_activate'``:
+          POST ``{promotion_id, promotion_type, deal_price}`` to enrol
+          the listing in the existing campaign at our target price.
+
+        - ``PRICE_DISCOUNT`` with ``decision_kind='create_price_discount'``:
+          POST ``{promotion_type='PRICE_DISCOUNT', deal_price}`` with
+          no promotion_id to create a new seller-driven discount.
+
+        - ``SELLER_COUPON_CAMPAIGN``: POST
+          ``{promotion_id, promotion_type, discount_percentage}`` —
+          coupons are % off at checkout, not a fixed price.
+
+        - Anything else (SMART, PRICE_MATCHING, VOLUME, etc.) returns
+          ``status='skipped'`` without touching ML. Those types are
+          either ML-managed (SMART) or not yet validated against the
+          live API — we'd rather skip explicitly than send a guessed
+          body shape and risk a hard reject.
+
+        Returns ``{status, status_code, response}`` so the caller can
+        persist the outcome on the decision row. Never raises for
+        operational errors (timeout / 5xx / 4xx) — the caller commits
+        the row either way and surfaces ``status='failed'`` to the UI
+        so the operator can retry.
+        """
+        promo_type = decision.promo_type
+        decision_kind = decision.decision_kind
+        mlb_id = decision.mlb_id
+
+        body = self._build_apply_body(decision)
+        if body is None:
+            logger.info(
+                "promo_apply skipped — no known body shape",
+                decision_id=decision.id,
+                mlb_id=mlb_id,
+                promo_type=promo_type,
+                decision_kind=decision_kind,
+            )
+            return {
+                "status": "skipped",
+                "status_code": None,
+                "response": (
+                    f"executor sem suporte para {promo_type}/{decision_kind}; "
+                    "row foi aprovada localmente mas não enviada ao ML"
+                ),
+            }
+
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        params = {"app_version": "v2"}
+        try:
+            resp = await self._http.post(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+                timeout=20.0,
+            )
+            if resp.status_code == 401:
+                token = await self._token_service.handle_unauthorized()
+                resp = await self._http.post(
+                    url,
+                    params=params,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=body,
+                    timeout=20.0,
+                )
+        except httpx.RequestError as exc:
+            logger.warning(
+                "promo_apply transport error",
+                decision_id=decision.id,
+                mlb_id=mlb_id,
+                error=str(exc),
+            )
+            return {
+                "status": "failed",
+                "status_code": None,
+                "response": f"transport error: {exc!s}"[:2000],
+            }
+
+        # Bound the persisted body so a chatty ML can't blow up the row.
+        snippet = (resp.text or "")[:2000]
+        if 200 <= resp.status_code < 300:
+            logger.info(
+                "promo_apply ok",
+                decision_id=decision.id,
+                mlb_id=mlb_id,
+                status_code=resp.status_code,
+            )
+            return {"status": "ok", "status_code": resp.status_code, "response": snippet}
+
+        logger.warning(
+            "promo_apply non-2xx",
+            decision_id=decision.id,
+            mlb_id=mlb_id,
+            promo_type=promo_type,
+            status_code=resp.status_code,
+            body=snippet[:300],
+        )
+        return {
+            "status": "failed",
+            "status_code": resp.status_code,
+            "response": snippet,
+        }
+
+    @staticmethod
+    def _build_apply_body(decision: Any) -> dict[str, Any] | None:
+        """Map a decision row → the JSON body for POST /seller-promotions.
+
+        Returns ``None`` when the type/kind combo isn't supported by
+        the executor; the caller treats that as ``status='skipped'``.
+
+        The shapes here mirror what ML accepts on
+        ``POST /seller-promotions/items/{MLB}?app_version=v2``. Each
+        body is built from columns already on the row (no extra
+        lookups) — the decision row IS the validated contract.
+        """
+
+        promo_type = (decision.promo_type or "").upper()
+        decision_kind = (decision.decision_kind or "").lower()
+        target = decision.target_price
+        promo_id = decision.promo_id
+
+        # Coupon: % off at checkout, no fixed price.
+        if promo_type == "SELLER_COUPON_CAMPAIGN":
+            if promo_id is None or decision.target_total_pct is None:
+                return None
+            return {
+                "promotion_id": promo_id,
+                "promotion_type": promo_type,
+                "discount_percentage": float(decision.target_total_pct),
+            }
+
+        # Interval / fixed-price campaigns with a known promotion_id.
+        if promo_type in {"DEAL", "DOD", "LIGHTNING", "SELLER_CAMPAIGN"} and (
+            decision_kind == "would_activate"
+        ):
+            if promo_id is None or target is None:
+                return None
+            return {
+                "promotion_id": promo_id,
+                "promotion_type": promo_type,
+                "deal_price": float(target),
+            }
+
+        # PRICE_DISCOUNT can come in two flavours:
+        #  - would_activate: ML already enumerated a PRICE_DISCOUNT
+        #    campaign we can opt into. Same shape as DEAL.
+        #  - create_price_discount: no campaign; create a seller-driven
+        #    discount from scratch. promotion_id is omitted.
+        if promo_type == "PRICE_DISCOUNT":
+            if target is None:
+                return None
+            if decision_kind == "create_price_discount":
+                return {
+                    "promotion_type": "PRICE_DISCOUNT",
+                    "deal_price": float(target),
+                }
+            if decision_kind == "would_activate" and promo_id is not None:
+                return {
+                    "promotion_id": promo_id,
+                    "promotion_type": "PRICE_DISCOUNT",
+                    "deal_price": float(target),
+                }
+
+        # SMART / PRICE_MATCHING / MARKETPLACE_CAMPAIGN / VOLUME /
+        # PRE_NEGOTIATED — ML-managed or not validated yet. Skip.
+        return None
+
     # -- ML promotions ----------------------------------------------------
     async def fetch_eligible_promos(self, mlb_id: str) -> list[dict[str, Any]]:
         token = await self._token_service.get_valid_access_token()

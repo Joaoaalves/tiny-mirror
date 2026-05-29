@@ -1287,10 +1287,15 @@ class MLPromoDecisionORM(Base):
     __table_args__ = (
         Index("ix_ml_promo_decisions_status", "status"),
         Index("ix_ml_promo_decisions_sku", "sku"),
+        Index("ix_ml_promo_decisions_ml_apply_status", "ml_apply_status"),
         UniqueConstraint("mlb_id", "promo_key", name="uq_ml_promo_decisions_mlb_promo"),
         CheckConstraint(
             "status IN ('pending', 'approved', 'rejected', 'ignored', 'expired')",
             name="ck_ml_promo_decisions_status",
+        ),
+        CheckConstraint(
+            "ml_apply_status IS NULL OR ml_apply_status IN " "('pending','ok','failed','skipped')",
+            name="ck_ml_promo_decisions_ml_apply_status",
         ),
         {
             "comment": (
@@ -1350,6 +1355,29 @@ class MLPromoDecisionORM(Base):
             "Why the row was expired: list_price_drift | cap_changed "
             "| floor_changed | stale_age."
         ),
+    )
+    ml_apply_status: Mapped[str | None] = mapped_column(
+        String(20),
+        nullable=True,
+        comment=(
+            "Outcome of the last attempt to push this row to ML: "
+            "pending | ok | failed | skipped. NULL = never tried."
+        ),
+    )
+    ml_apply_status_code: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="HTTP code from ML on the last attempt.",
+    )
+    ml_apply_response: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Trimmed ML response body — first 2KB for debugging.",
+    )
+    ml_applied_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp of the last attempt to push this row to ML.",
     )
 
 

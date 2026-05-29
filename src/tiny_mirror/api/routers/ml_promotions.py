@@ -212,6 +212,10 @@ class DecisionOut(BaseModel):
     notes: str | None
     expired_at: datetime | None = None
     expired_reason: str | None = None
+    ml_apply_status: str | None = None
+    ml_apply_status_code: int | None = None
+    ml_apply_response: str | None = None
+    ml_applied_at: datetime | None = None
 
 
 class DecisionDecideIn(BaseModel):
@@ -1187,11 +1191,13 @@ async def approve_decision(
     decision_id: int,
     body: DecisionDecideIn,
     session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
 ) -> DecisionOut:
     # Re-read the apply flag on every call so the operator can toggle
-    # ML_PROMO_APPLY_ENABLED without a redeploy. Today, with the flag OFF
-    # we only flip ml_promo_decisions.status. Phase 5 will enqueue ML
-    # enrollment when this is True.
+    # ML_PROMO_APPLY_ENABLED without a redeploy. With the flag OFF the
+    # apply branch is skipped entirely and the row stays
+    # ml_apply_status='skipped' so the audit trail records that the
+    # engine deliberately did not contact ML.
     apply_enabled = feature_flags.is_enabled("ml_promo_apply")
     repo = MLPromoDecisionRepository(session)
     override: dict[str, Decimal] = {}
@@ -1216,16 +1222,89 @@ async def approve_decision(
         )
     await session.commit()
     if apply_enabled:
-        # Placeholder: Phase 5 will queue the row for the ML executor here.
-        # Wired now so the gate exists end-to-end and integration tests
-        # can assert the branch is hit when the flag flips.
-        logger.info(
-            "promo_apply gate ON; queue-for-ML stub fired",
-            decision_id=decision_id,
-            sku=row.sku,
-            mlb_id=row.mlb_id,
+        # Send to ML. Errors are non-fatal: the operator already approved,
+        # the DB commit happened, and the failure is recorded on the row
+        # for the UI to surface a 'Reenviar' button. We never raise here.
+        try:
+            apply_result = await service.apply_decision_to_ml(decision=row)
+        except Exception as exc:  # pragma: no cover — defensive belt
+            logger.exception("promo_apply unexpected error", decision_id=decision_id)
+            apply_result = {
+                "status": "failed",
+                "status_code": None,
+                "response": f"unhandled: {exc!s}"[:2000],
+            }
+        updated = await repo.record_apply_result(
+            decision_id,
+            status=apply_result["status"],
+            status_code=apply_result["status_code"],
+            response=apply_result["response"],
         )
+        await session.commit()
+        if updated is not None:
+            row = updated
+    else:
+        # Flag OFF: stamp 'skipped' so a future flag flip doesn't make
+        # this look like a never-attempted approval. Only set on the
+        # first transition; idempotent.
+        if row.ml_apply_status is None:
+            updated = await repo.record_apply_result(
+                decision_id,
+                status="skipped",
+                status_code=None,
+                response="ML_PROMO_APPLY_ENABLED was OFF at approve time",
+            )
+            await session.commit()
+            if updated is not None:
+                row = updated
     return DecisionOut.model_validate(row)
+
+
+@router.post("/decisions/{decision_id}/retry-ml", response_model=DecisionOut)
+async def retry_decision_ml(
+    decision_id: int,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> DecisionOut:
+    """Re-attempt the ML POST for a previously-approved decision.
+
+    Only acts when the operator status is already 'approved' — we
+    never resurrect a rejected/ignored/expired row through this lane.
+    Honours the flag: if ML_PROMO_APPLY_ENABLED is OFF the call is
+    refused with 409 so the operator doesn't think they fired
+    something when they didn't.
+    """
+    if not feature_flags.is_enabled("ml_promo_apply"):
+        raise HTTPException(
+            status_code=409,
+            detail="ML_PROMO_APPLY_ENABLED is OFF; nothing was sent",
+        )
+    repo = MLPromoDecisionRepository(session)
+    row = await repo.get(decision_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"decision {decision_id} not found")
+    if row.status != "approved":
+        raise HTTPException(
+            status_code=409,
+            detail=f"decision is {row.status}, only 'approved' rows can be retried",
+        )
+    try:
+        apply_result = await service.apply_decision_to_ml(decision=row)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("promo_apply retry unexpected error", decision_id=decision_id)
+        apply_result = {
+            "status": "failed",
+            "status_code": None,
+            "response": f"unhandled: {exc!s}"[:2000],
+        }
+    updated = await repo.record_apply_result(
+        decision_id,
+        status=apply_result["status"],
+        status_code=apply_result["status_code"],
+        response=apply_result["response"],
+    )
+    await session.commit()
+    return DecisionOut.model_validate(updated or row)
 
 
 @router.post("/decisions/{decision_id}/reject", response_model=DecisionOut)

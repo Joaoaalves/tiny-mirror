@@ -476,6 +476,31 @@ class MLPromoDecisionRepository:
         await self._session.flush()
         return row
 
+    async def record_apply_result(
+        self,
+        decision_id: int,
+        *,
+        status: str,
+        status_code: int | None,
+        response: str | None,
+    ) -> MLPromoDecisionORM | None:
+        """Persist the outcome of an ML POST attempt for a decision.
+
+        Called after the apply call returns (success or failure). Does
+        NOT touch the operator status column — that's already
+        ``approved`` by the time we get here. A row that has never
+        been attempted keeps ``ml_apply_status=NULL``.
+        """
+        row = await self.get(decision_id)
+        if row is None:
+            return None
+        row.ml_apply_status = status
+        row.ml_apply_status_code = status_code
+        row.ml_apply_response = response[:2000] if response else None
+        row.ml_applied_at = datetime.utcnow()
+        await self._session.flush()
+        return row
+
     async def expire(
         self,
         decision_id: int,
