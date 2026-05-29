@@ -165,6 +165,24 @@ class Settings(BaseSettings):
     # handler and never trusts the client.
     ml_promo_apply_enabled: bool = False
 
+    # Auto-expire thresholds for the pending promo decisions queue.
+    # The daily expire_stale_decisions job (piggybacking on the recompute
+    # cron) flips pending rows to status='expired' when ANY of these
+    # bounds is exceeded — operator still sees the row with its reason,
+    # but it leaves the active approval queue so the backlog stays
+    # actionable.
+    #   - price_drift_pct: relative |Δ list_price| / list_price * 100
+    #     compared to the value snapshotted on the decision row.
+    #   - cap_drift_pct:   absolute Δ cap_pct (percentage points), not
+    #     relative — a 28pp → 30pp bump is 2pp, hitting the default.
+    #   - floor_drift_pct: relative |Δ floor_price| / floor_price * 100.
+    #   - age_days:        time since created_at; covers the case where
+    #     inputs barely moved but the operator simply never acted.
+    promo_stale_price_drift_pct: float = 5.0
+    promo_stale_cap_drift_pct: float = 2.0
+    promo_stale_floor_drift_pct: float = 5.0
+    promo_stale_age_days: int = 14
+
     # Daily job that refreshes ml_catalog_status by calling
     # /items/{MLB}/price_to_win for every active MLB. Reads stay in DB so
     # the dry-run analysis runs in seconds. Scheduled BEFORE the cap

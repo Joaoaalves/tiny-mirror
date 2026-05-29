@@ -1289,7 +1289,7 @@ class MLPromoDecisionORM(Base):
         Index("ix_ml_promo_decisions_sku", "sku"),
         UniqueConstraint("mlb_id", "promo_key", name="uq_ml_promo_decisions_mlb_promo"),
         CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected', 'ignored')",
+            "status IN ('pending', 'approved', 'rejected', 'ignored', 'expired')",
             name="ck_ml_promo_decisions_status",
         ),
         {
@@ -1338,6 +1338,19 @@ class MLPromoDecisionORM(Base):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     decided_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expired_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="When the auto-expire job flipped this row to 'expired'.",
+    )
+    expired_reason: Mapped[str | None] = mapped_column(
+        String(40),
+        nullable=True,
+        comment=(
+            "Why the row was expired: list_price_drift | cap_changed "
+            "| floor_changed | stale_age."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

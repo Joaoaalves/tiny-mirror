@@ -476,6 +476,29 @@ class MLPromoDecisionRepository:
         await self._session.flush()
         return row
 
+    async def expire(
+        self,
+        decision_id: int,
+        *,
+        reason: str,
+    ) -> MLPromoDecisionORM | None:
+        """Flip a pending decision to ``status='expired'`` with a reason.
+
+        Only acts on rows currently in ``pending``; rows already in any
+        terminal state are left alone (returns ``None``). ``decided_at``
+        / ``decided_by`` stay untouched — ``expired_at`` is the audit
+        column for this transition, so we can tell apart 'operator
+        ignored' from 'system auto-expired'.
+        """
+        row = await self.get(decision_id)
+        if row is None or row.status != "pending":
+            return None
+        row.status = "expired"
+        row.expired_at = datetime.utcnow()
+        row.expired_reason = reason
+        await self._session.flush()
+        return row
+
     async def revert_to_pending(
         self,
         decision_id: int,
@@ -492,5 +515,10 @@ class MLPromoDecisionRepository:
         if row is None or row.status == "pending":
             return None
         row.status = "pending"
+        # Clear the auto-expire stamp so a re-expired row can be detected
+        # again next sweep; ``decided_at`` / ``decided_by`` are kept as
+        # the audit trail of the previous operator action.
+        row.expired_at = None
+        row.expired_reason = None
         await self._session.flush()
         return row

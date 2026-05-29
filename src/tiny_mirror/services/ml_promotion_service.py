@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -927,6 +928,151 @@ class MLPromotionService:
         await session.commit()
         logger.info("decisions_generated", **stats)
         return stats
+
+    async def expire_stale_decisions(
+        self,
+        session: AsyncSession,
+        *,
+        price_drift_pct: float | None = None,
+        cap_drift_pct: float | None = None,
+        floor_drift_pct: float | None = None,
+        age_days: int | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Mark pending decisions as ``status='expired'`` when the inputs
+        they were built on no longer match reality.
+
+        A decision row carries a snapshot of ``list_price`` /
+        ``cap_pct`` / ``floor_price`` at generation time. Hours later
+        the daily recompute job may have moved any of those — the
+        target_price the operator is about to approve would be wrong.
+        We auto-expire instead of silently mutating: the operator can
+        re-trigger generation to get fresh rows.
+
+        Rules (any one trips → expire), in priority order so the
+        recorded ``expired_reason`` is the *first* one that failed,
+        even when multiple do:
+
+        1. ``list_price_drift`` — current list_price moved by more than
+           ``price_drift_pct`` % from the snapshot value.
+        2. ``cap_changed``     — current cap moved by more than
+           ``cap_drift_pct`` percentage points from the snapshot value.
+        3. ``floor_changed``   — current floor_price moved by more than
+           ``floor_drift_pct`` % from the snapshot value.
+        4. ``stale_age``       — created_at older than ``age_days``.
+
+        Thresholds default to the Settings values so the daily cron
+        runs with the env-configured policy; explicit args exist for
+        the manual API trigger and tests.
+        """
+        from tiny_mirror.config import settings
+        from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
+            MLPromoDecisionRepository,
+        )
+
+        price_pct = (
+            price_drift_pct if price_drift_pct is not None else settings.promo_stale_price_drift_pct
+        )
+        cap_pct = cap_drift_pct if cap_drift_pct is not None else settings.promo_stale_cap_drift_pct
+        floor_pct = (
+            floor_drift_pct if floor_drift_pct is not None else settings.promo_stale_floor_drift_pct
+        )
+        max_age_days = age_days if age_days is not None else settings.promo_stale_age_days
+        now = now or datetime.now(UTC)
+
+        caps_repo = MLPromoCapRepository(session)
+        snap_repo = MLCostsSnapshotRepository(session)
+        decisions_repo = MLPromoDecisionRepository(session)
+
+        # Pull pending rows. The dashboard has thousands but the cron
+        # runs in one transaction; bound the page so we don't surprise
+        # the DB on a runaway dataset. 5000 is comfortably above the
+        # 2.1k current backlog.
+        pending_rows, total_pending = await decisions_repo.list_(status="pending", limit=5000)
+
+        by_reason: dict[str, int] = {
+            "list_price_drift": 0,
+            "cap_changed": 0,
+            "floor_changed": 0,
+            "stale_age": 0,
+        }
+        expired_total = 0
+
+        for row in pending_rows:
+            reason = self._stale_reason(
+                row,
+                snap=await snap_repo.get(row.mlb_id),
+                cap=await caps_repo.get(row.mlb_id),
+                now=now,
+                price_drift_pct=price_pct,
+                cap_drift_pct=cap_pct,
+                floor_drift_pct=floor_pct,
+                age_days=max_age_days,
+            )
+            if reason is None:
+                continue
+            updated = await decisions_repo.expire(row.id, reason=reason)
+            if updated is not None:
+                expired_total += 1
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+
+        await session.commit()
+        stats = {
+            "total_pending_seen": total_pending,
+            "expired_total": expired_total,
+            "by_reason": by_reason,
+        }
+        logger.info("decisions_expired", **stats)
+        return stats
+
+    @staticmethod
+    def _stale_reason(
+        row: Any,
+        *,
+        snap: Any,
+        cap: Any,
+        now: datetime,
+        price_drift_pct: float,
+        cap_drift_pct: float,
+        floor_drift_pct: float,
+        age_days: int,
+    ) -> str | None:
+        """Return the first staleness reason that applies, or None."""
+        # 1. list_price drift — compare snapshot list_price to current
+        # ml_costs_snapshots list_price. Both nullable, so only fire
+        # when both sides exist; a missing snapshot is "no signal" not
+        # "stale".
+        if row.list_price and snap is not None and snap.list_price:
+            row_lp = float(row.list_price)
+            cur_lp = float(snap.list_price)
+            if row_lp > 0:
+                drift = abs(cur_lp - row_lp) / row_lp * 100.0
+                if drift > price_drift_pct:
+                    return "list_price_drift"
+
+        # 2. cap drift — absolute percentage points.
+        if row.cap_pct is not None and cap is not None:
+            row_cap = float(row.cap_pct)
+            cur_cap = float(cap.max_seller_share_pct)
+            if abs(cur_cap - row_cap) > cap_drift_pct:
+                return "cap_changed"
+
+        # 3. floor drift — relative %.
+        if row.floor_price and cap is not None and cap.margin_floor_price is not None:
+            row_floor = float(row.floor_price)
+            cur_floor = float(cap.margin_floor_price)
+            if row_floor > 0:
+                drift = abs(cur_floor - row_floor) / row_floor * 100.0
+                if drift > floor_drift_pct:
+                    return "floor_changed"
+
+        # 4. plain age. created_at is timezone-aware.
+        if row.created_at is not None:
+            age = (now - row.created_at).total_seconds() / 86400.0
+            if age > age_days:
+                return "stale_age"
+
+        return None
 
 
 def _to_dec(v: Any) -> Decimal | None:

@@ -210,6 +210,8 @@ class DecisionOut(BaseModel):
     decided_at: datetime | None
     decided_by: str | None
     notes: str | None
+    expired_at: datetime | None = None
+    expired_reason: str | None = None
 
 
 class DecisionDecideIn(BaseModel):
@@ -998,6 +1000,31 @@ async def generate_decisions(
     decisions already in the queue (pending / approved / rejected)."""
     return await service.generate_pending_decisions(
         session, only_sku=only_sku, limit_skus=limit_skus
+    )
+
+
+@router.post("/decisions/expire-stale")
+async def expire_stale_decisions(
+    price_drift_pct: float | None = Query(default=None, ge=0.0, le=100.0),
+    cap_drift_pct: float | None = Query(default=None, ge=0.0, le=100.0),
+    floor_drift_pct: float | None = Query(default=None, ge=0.0, le=100.0),
+    age_days: int | None = Query(default=None, ge=0, le=365),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Flip pending decisions to status='expired' when inputs moved.
+
+    Same logic the daily cron uses; exposed here so the operator can
+    re-sweep on demand right after the cap recompute. Each threshold
+    falls back to the Settings default when omitted, so a no-arg call
+    matches what runs at 05:00.
+    """
+    return await service.expire_stale_decisions(
+        session,
+        price_drift_pct=price_drift_pct,
+        cap_drift_pct=cap_drift_pct,
+        floor_drift_pct=floor_drift_pct,
+        age_days=age_days,
     )
 
 

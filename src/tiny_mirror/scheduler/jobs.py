@@ -779,10 +779,17 @@ async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any = None)
         cap_stats = await recompute_all_caps(
             session, service=promo_service, actor="scheduler-daily"
         )
+        # Sweep stale pending decisions immediately after caps refresh
+        # so the rows we just regenerated thresholds for get checked
+        # against the new values in the same transaction window.
+        expire_stats: dict[str, Any] = {}
+        if promo_service is not None:
+            expire_stats = await promo_service.expire_stale_decisions(session)
         logger.info(
             "ML promo recompute job completed",
             **refresh_stats,
             **{k: v for k, v in cap_stats.items() if k != "examples"},
+            **{f"expire_{k}": v for k, v in expire_stats.items() if k != "by_reason"},
         )
 
 
