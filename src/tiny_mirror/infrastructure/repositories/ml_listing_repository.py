@@ -88,3 +88,32 @@ class MLListingRepository:
             )
         )
         return [(str(m), str(s)) for m, s in result.all()]
+
+    async def sku_logistic_status(self, sku: str) -> tuple[int, int]:
+        """Return ``(fulfillment_rows, any_rows)`` for ``sku`` in ml_listings.
+
+        ``fulfillment_rows`` counts listings with logistic_type='fulfillment';
+        ``any_rows`` counts all listings regardless of type. Used by the
+        webhook to decide whether a positive FL-delta should produce a
+        pending transfer:
+
+        - fulfillment_rows > 0 → SKU still on FL, transfer reconciles via ML.
+        - any_rows > 0 and fulfillment_rows == 0 → SKU was on FL but
+          migrated to xd_drop_off / self_service; transfer would never
+          reconcile, so skip it.
+        - any_rows == 0 → SKU absent from ml_listings (likely a kit
+          component). Caller may still record the transfer; reception scan
+          is the appropriate place to decide.
+        """
+        from sqlalchemy import func, select
+
+        result = await self._session.execute(
+            select(
+                func.count().filter(MLListingORM.logistic_type == "fulfillment"),
+                func.count(),
+            ).where(MLListingORM.sku == sku)
+        )
+        row = result.first()
+        if row is None:
+            return (0, 0)
+        return (int(row[0] or 0), int(row[1] or 0))

@@ -100,10 +100,50 @@ class FulfillmentTransferRepository:
     async def mark_received(
         self, transfer_id: int, received_at: datetime
     ) -> FulfillmentTransferORM | None:
+        """Fully receive a transfer: status='received', qty_received=qty."""
         row = await self.get_by_id(transfer_id)
         if row is None:
             return None
         row.status = "received"
         row.received_at = received_at
+        row.quantity_received = row.quantity
+        row.last_event_at = received_at
+        await self._session.flush()
+        return row
+
+    async def apply_partial_reception(
+        self,
+        transfer_id: int,
+        delta_quantity: int,
+        last_event_at: datetime,
+    ) -> FulfillmentTransferORM | None:
+        """Increment ``quantity_received`` by ``delta_quantity`` and stamp
+        ``last_event_at``. Transitions status to 'received' (with
+        received_at = last_event_at) when the cumulative equals the
+        ordered quantity; otherwise stays pending. Caller is responsible
+        for ensuring ``delta_quantity`` does not over-shoot."""
+        row = await self.get_by_id(transfer_id)
+        if row is None:
+            return None
+        row.quantity_received = min(row.quantity, row.quantity_received + delta_quantity)
+        row.last_event_at = last_event_at
+        if row.quantity_received >= row.quantity:
+            row.status = "received"
+            row.received_at = last_event_at
+        await self._session.flush()
+        return row
+
+    async def mark_cancelled(self, transfer_id: int, reason: str) -> FulfillmentTransferORM | None:
+        """Cancel a pending transfer (e.g. SKU is not fulfillment on ML).
+        Cancellation does NOT touch Tiny stock — it only marks our internal
+        ledger so coverage math stops subtracting this row.
+        """
+        row = await self.get_by_id(transfer_id)
+        if row is None:
+            return None
+        row.status = "cancelled"
+        existing = row.notes or ""
+        suffix = f" [cancelled: {reason}]"
+        row.notes = (existing + suffix)[:5000] if existing else suffix.strip()
         await self._session.flush()
         return row

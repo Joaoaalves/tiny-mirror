@@ -986,6 +986,10 @@ class FulfillmentTransferORM(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     received_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quantity_received: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    last_event_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, server_default=text("'pending'")
     )

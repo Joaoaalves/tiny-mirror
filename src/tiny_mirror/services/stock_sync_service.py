@@ -53,6 +53,9 @@ from tiny_mirror.infrastructure.orm.models import MLListingORM, MLListingVariati
 from tiny_mirror.infrastructure.repositories.fulfillment_transfer_repository import (
     FulfillmentTransferRepository,
 )
+from tiny_mirror.infrastructure.repositories.ml_listing_repository import (
+    MLListingRepository,
+)
 from tiny_mirror.infrastructure.repositories.product_repository import (
     PostgreSQLProductRepository,
 )
@@ -443,6 +446,28 @@ class StockSyncService:
                 logger.info(
                     "FL positive delta corroborated but a recent pending "
                     "transfer already exists — skipping duplicate",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    fl_delta=fl_delta,
+                    new_tiny_fl_qty=new_tiny_fl_qty,
+                )
+                return
+
+            # Logistic-type guard: only create a pending transfer when the
+            # SKU has at least one ml_listings row with
+            # logistic_type='fulfillment'. Otherwise we'd be queuing a
+            # transfer that ML will never confirm (xd_drop_off products are
+            # shipped directly by the seller — no INBOUND_RECEPTION event)
+            # and that distorts coverage math until manually cancelled.
+            # SKUs absent from ml_listings entirely (typically kit
+            # components) keep the previous behaviour — we don't know
+            # which kit's MLB drives them, so we still record and let the
+            # operator review.
+            fl_rows, any_rows = await MLListingRepository(session).sku_logistic_status(sku)
+            if any_rows > 0 and fl_rows == 0:
+                logger.info(
+                    "FL positive delta detected but SKU has no fulfillment "
+                    "listing on ML — skipping transfer (would never reconcile)",
                     product_tiny_id=product_tiny_id,
                     sku=sku,
                     fl_delta=fl_delta,

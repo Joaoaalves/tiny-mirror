@@ -62,6 +62,8 @@ INBOUND_EVENT_TYPES = frozenset({"INBOUND_RECEPTION", "TRANSFER_DELIVERY"})
 class ReconciliationResult:
     skus_scanned: int = 0
     transfers_received: int = 0
+    transfers_partially_received: int = 0
+    transfers_cancelled: int = 0
     skus_with_no_inventory: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
@@ -71,7 +73,16 @@ class FulfillmentReceptionService:
         self._ml = ml_client
 
     async def scan_and_reconcile(self) -> ReconciliationResult:
-        """Scan all pending transfers and mark them received when ML confirms arrival."""
+        """Scan all pending transfers and mark them received when ML confirms arrival.
+
+        First runs ``_cancel_non_fulfillment_pending`` to clean up transfers
+        whose SKU is no longer on the FL channel — those will never get an
+        INBOUND_RECEPTION event, so leaving them pending corrupts coverage
+        math forever. Then groups by SKU, fetches inbound events from ML,
+        and credits each transfer in FIFO+chronology order (supporting
+        partial reception so a transfer of 11 that arrives 6+5 in two
+        events is correctly credited as the events land).
+        """
         from sqlalchemy import select
 
         from tiny_mirror.infrastructure.orm.models import (
@@ -80,6 +91,13 @@ class FulfillmentReceptionService:
         )
 
         result = ReconciliationResult()
+
+        # 1) Auto-cancel transfers whose SKU is no longer fulfillment on ML.
+        #    Webhook may have created these legitimately (the product *was*
+        #    FL at lance time) or by accident — either way ML will never
+        #    emit an inbound event, so they must come out of the pending pool.
+        cancelled = await self._cancel_non_fulfillment_pending()
+        result.transfers_cancelled = cancelled
 
         async with AsyncSessionLocal() as session:
             repo = FulfillmentTransferRepository(session)
@@ -181,39 +199,48 @@ class FulfillmentReceptionService:
                 continue
 
             decisions = _fifo_match_with_chronology(transfers_sorted, events)
-            received_decisions = [d for d in decisions if d.received_at is not None]
+            actionable = [d for d in decisions if d.delta_units > 0]
 
-            if not received_decisions:
+            if not actionable:
                 logger.debug(
                     "Events present but none eligible (date filter) or "
-                    "insufficient qty to cover oldest pending transfer",
+                    "no new units to credit existing pendings",
                     sku=sku,
                     inventory_ids=inventory_ids,
                     events_count=len(events),
                 )
                 continue
 
+            full_decisions = [d for d in actionable if d.is_full]
+            partial_decisions = [d for d in actionable if not d.is_full]
+
             logger.info(
                 "Reception events found for SKU",
                 sku=sku,
                 inventory_ids=inventory_ids,
                 event_count=len(events),
-                received_count=len(received_decisions),
+                full_count=len(full_decisions),
+                partial_count=len(partial_decisions),
             )
 
             async with AsyncSessionLocal() as session:
                 repo = FulfillmentTransferRepository(session)
-                for d in received_decisions:
-                    assert d.received_at is not None  # narrow for mypy
-                    await repo.mark_received(d.transfer_id, d.received_at)
+                for d in actionable:
+                    assert d.last_event_at is not None  # mypy narrow
+                    await repo.apply_partial_reception(
+                        d.transfer_id,
+                        delta_quantity=d.delta_units,
+                        last_event_at=d.last_event_at,
+                    )
                 await session.commit()
 
-            result.transfers_received += len(received_decisions)
+            result.transfers_received += len(full_decisions)
+            result.transfers_partially_received += len(partial_decisions)
             logger.info(
-                "Marked fulfillment transfers as received",
+                "Applied receptions",
                 sku=sku,
-                transfer_ids=[d.transfer_id for d in received_decisions],
-                count=len(received_decisions),
+                fully_received_ids=[d.transfer_id for d in full_decisions],
+                partial_ids=[d.transfer_id for d in partial_decisions],
             )
 
         logger.info(
@@ -224,6 +251,61 @@ class FulfillmentReceptionService:
             errors=len(result.errors),
         )
         return result
+
+    async def _cancel_non_fulfillment_pending(self) -> int:
+        """Cancel pending transfers whose SKU is no longer on the FL channel.
+
+        A SKU is treated as non-fulfillment when none of its ``ml_listings``
+        rows has ``logistic_type='fulfillment'`` (anymore). In that case ML
+        will never emit an INBOUND_RECEPTION / TRANSFER_DELIVERY for the
+        SKU, so leaving the transfer in 'pending' permanently distorts
+        coverage math. Cancellation is a metadata-only operation — Tiny
+        stock is untouched.
+
+        SKUs with **zero** ml_listings rows (e.g. kit components) are
+        deliberately *not* cancelled here: we don't know whether they're
+        legitimately fulfilled via a parent kit's MLB; safer to leave them
+        pending for operator review.
+        """
+        from sqlalchemy import text
+
+        async with AsyncSessionLocal() as session:
+            non_fl_rows = await session.execute(
+                text(
+                    """
+                    SELECT ft.id, ft.product_sku
+                    FROM fulfillment_transfers ft
+                    WHERE ft.status = 'pending'
+                      AND EXISTS (
+                          SELECT 1 FROM ml_listings ml WHERE ml.sku = ft.product_sku
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM ml_listings ml
+                          WHERE ml.sku = ft.product_sku
+                            AND ml.logistic_type = 'fulfillment'
+                      )
+                    """
+                )
+            )
+            rows = non_fl_rows.all()
+
+            if not rows:
+                return 0
+
+            repo = FulfillmentTransferRepository(session)
+            cancelled = 0
+            for transfer_id, _sku in rows:
+                await repo.mark_cancelled(
+                    int(transfer_id),
+                    reason="SKU no longer fulfillment in ml_listings",
+                )
+                cancelled += 1
+            await session.commit()
+            logger.info(
+                "Cancelled pending transfers whose SKU is not fulfillment",
+                count=cancelled,
+            )
+            return cancelled
 
     async def _fetch_inbound_events(
         self,
@@ -295,17 +377,41 @@ class FulfillmentReceptionService:
 @dataclass
 class _MatchDecision:
     transfer_id: int
-    received_at: datetime | None  # None means still pending
+    # NEW units to credit on this run (delta vs already-stored
+    # quantity_received). 0 means no new events touched this transfer.
+    delta_units: int
+    # True when the total credited (already-stored + delta) covers
+    # the ordered quantity. Drives the status='received' transition.
+    is_full: bool
+    # Latest event date that contributed to delta_units. Used for both
+    # received_at and last_event_at on the row.
+    last_event_at: datetime | None
 
 
 def _fifo_match_with_chronology(
     transfers: list[FulfillmentTransferORM],
     events: list[dict[str, Any]],
 ) -> list[_MatchDecision]:
-    """Match transfers (oldest first) against events (oldest first), where
-    an event can only fulfill a transfer whose ``transferred_at`` is at or
-    before the event's ``date_created``. Events are consumed greedily; an
-    event with leftover quantity carries over to younger transfers.
+    """Match transfers (oldest first) against events (oldest first) with
+    chronology guard and partial-credit support.
+
+    Rules:
+    - Each transfer has an *already-credited* amount (``quantity_received``)
+      and an outstanding amount (``quantity - quantity_received``). Events
+      fill the outstanding amount FIFO.
+    - An event is eligible to credit a transfer only when its
+      ``date_created`` is at or after the transfer's ``transferred_at``
+      (otherwise newer transfers would steal credit from older arrivals).
+    - Events are consumed greedily; leftover units in an event flow to the
+      next-oldest transfer.
+
+    Returns one decision per input transfer:
+    - ``delta_units = 0`` → nothing new this run (no events left, none
+      eligible, or all events older than this transfer).
+    - ``delta_units > 0, is_full = False`` → partial reception; caller
+      bumps ``quantity_received``.
+    - ``delta_units > 0, is_full = True`` → final units arrived; caller
+      bumps ``quantity_received`` AND sets status='received'.
     """
     transfers_sorted = sorted(transfers, key=lambda t: t.transferred_at)
     events_sorted = sorted(
@@ -316,26 +422,34 @@ def _fifo_match_with_chronology(
 
     decisions: list[_MatchDecision] = []
     for t in transfers_sorted:
-        needed = int(t.quantity)
+        already = int(t.quantity_received or 0)
+        outstanding = max(0, int(t.quantity) - already)
+        delta = 0
         last_event_date: datetime | None = None
         transfer_at = t.transferred_at.astimezone(UTC)
         for i, e in enumerate(events_sorted):
+            if outstanding <= 0:
+                break
             if remaining_per_event[i] <= 0:
                 continue
             evt_date = _extract_received_at(e)
             if evt_date is None or evt_date < transfer_at:
                 continue
-            take = min(needed, remaining_per_event[i])
+            take = min(outstanding, remaining_per_event[i])
             remaining_per_event[i] -= take
-            needed -= take
+            outstanding -= take
+            delta += take
             if take > 0:
                 last_event_date = evt_date
-            if needed <= 0:
-                break
-        if needed <= 0:
-            decisions.append(_MatchDecision(transfer_id=int(t.id), received_at=last_event_date))
-        else:
-            decisions.append(_MatchDecision(transfer_id=int(t.id), received_at=None))
+        is_full = (already + delta) >= int(t.quantity)
+        decisions.append(
+            _MatchDecision(
+                transfer_id=int(t.id),
+                delta_units=delta,
+                is_full=is_full,
+                last_event_at=last_event_date,
+            )
+        )
     return decisions
 
 

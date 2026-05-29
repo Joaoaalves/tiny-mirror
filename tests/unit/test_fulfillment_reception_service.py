@@ -114,10 +114,17 @@ class TestFormatMlDatetime:
 # ---------------------------------------------------------------------------
 # FIFO + chronology matcher (pure function)
 # ---------------------------------------------------------------------------
-def _transfer(transfer_id: int, qty: int, days_ago: int) -> MagicMock:
+def _transfer(
+    transfer_id: int,
+    qty: int,
+    days_ago: int,
+    *,
+    quantity_received: int = 0,
+) -> MagicMock:
     row = MagicMock()
     row.id = transfer_id
     row.quantity = qty
+    row.quantity_received = quantity_received
     row.transferred_at = datetime.now(UTC) - timedelta(days=days_ago)
     return row
 
@@ -128,17 +135,19 @@ class TestFifoMatchWithChronology:
         evt = _event(10, date_iso=(t.transferred_at + timedelta(hours=1)).isoformat())
         decisions = _fifo_match_with_chronology([t], [evt])
         assert decisions[0].transfer_id == 1
-        assert decisions[0].received_at is not None
+        assert decisions[0].delta_units == 10
+        assert decisions[0].is_full is True
+        assert decisions[0].last_event_at is not None
 
     def test_event_before_transfer_does_not_credit(self) -> None:
         """The chronology guard: an event whose date_created is BEFORE the
         transfer's transferred_at can never fulfill it.
         """
         t = _transfer(1, 10, days_ago=2)
-        # Event 5 days ago — before the transfer 2 days ago.
         evt = _event(10, date_iso=(datetime.now(UTC) - timedelta(days=5)).isoformat())
         decisions = _fifo_match_with_chronology([t], [evt])
-        assert decisions[0].received_at is None
+        assert decisions[0].delta_units == 0
+        assert decisions[0].is_full is False
 
     def test_partial_event_qty_carries_over_to_next_transfer(self) -> None:
         """An event partially consumed by the older transfer leaves remainder
@@ -147,12 +156,46 @@ class TestFifoMatchWithChronology:
         t2 = _transfer(2, 4, days_ago=4)
         evt = _event(10, date_iso=(datetime.now(UTC) - timedelta(days=3)).isoformat())
         decisions = _fifo_match_with_chronology([t1, t2], [evt])
-        assert all(d.received_at is not None for d in decisions)
+        assert all(d.is_full for d in decisions)
+        assert decisions[0].delta_units == 6
+        assert decisions[1].delta_units == 4
+
+    def test_partial_reception_keeps_pending(self) -> None:
+        """Transfer of 11 + 2 events of 1 each → partial: delta=2, not full."""
+        t = _transfer(1, 11, days_ago=5)
+        evts = [
+            _event(
+                1,
+                event_type="TRANSFER_DELIVERY",
+                date_iso=(datetime.now(UTC) - timedelta(days=2)).isoformat(),
+            ),
+            _event(
+                1,
+                event_type="TRANSFER_DELIVERY",
+                date_iso=(datetime.now(UTC) - timedelta(days=1)).isoformat(),
+            ),
+        ]
+        decisions = _fifo_match_with_chronology([t], evts)
+        assert decisions[0].delta_units == 2
+        assert decisions[0].is_full is False
+        assert decisions[0].last_event_at is not None
+
+    def test_partial_credit_resumes_from_prior_quantity_received(self) -> None:
+        """A second scan picks up where the first left off — already-credited
+        units don't double-count, only new events add to delta_units."""
+        # Transfer of 11, already 6 credited from a prior scan.
+        t = _transfer(1, 11, days_ago=5, quantity_received=6)
+        # New event delivers the remaining 5.
+        evt = _event(
+            5,
+            event_type="TRANSFER_DELIVERY",
+            date_iso=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+        )
+        decisions = _fifo_match_with_chronology([t], [evt])
+        assert decisions[0].delta_units == 5
+        assert decisions[0].is_full is True
 
     def test_transfer_delivery_events_counted(self) -> None:
-        """Per the matcher's contract, callers pre-filter to inbound types.
-        Make sure a TRANSFER_DELIVERY-shaped event still fulfills the math.
-        """
         t = _transfer(1, 3, days_ago=2)
         evts = [
             _event(
@@ -163,11 +206,11 @@ class TestFifoMatchWithChronology:
             for h in (1, 2, 3)
         ]
         decisions = _fifo_match_with_chronology([t], evts)
-        assert decisions[0].received_at is not None
+        assert decisions[0].is_full is True
 
     def test_three_transfers_FIFO_oldest_first(self) -> None:
-        """3 transfers of 5 each + 1 event of 11 → 2 oldest received, newest pending."""
-        # Pass them out of date order — matcher must sort.
+        """3 transfers of 5 each + 1 event of 11 → 2 oldest received, newest
+        pending. The newest still gets a partial credit of 1."""
         ts = [
             _transfer(99, 5, days_ago=1),  # newest
             _transfer(11, 5, days_ago=5),  # oldest
@@ -175,21 +218,20 @@ class TestFifoMatchWithChronology:
         ]
         evt = _event(11, date_iso=(datetime.now(UTC)).isoformat())
         decisions = _fifo_match_with_chronology(ts, [evt])
-        by_id = {d.transfer_id: d.received_at for d in decisions}
-        assert by_id[11] is not None
-        assert by_id[55] is not None
-        assert by_id[99] is None  # 1 unit left, needs 5
+        by_id = {d.transfer_id: d for d in decisions}
+        assert by_id[11].is_full is True
+        assert by_id[55].is_full is True
+        assert by_id[99].is_full is False
+        assert by_id[99].delta_units == 1  # leftover unit credited
 
-    def test_received_at_is_last_event_consumed(self) -> None:
-        """The persisted received_at must reflect the event that closed the
-        transfer (not the first event consumed)."""
+    def test_last_event_at_is_last_event_consumed(self) -> None:
         t = _transfer(1, 8, days_ago=5)
         evt1 = _event(3, date_iso=(datetime.now(UTC) - timedelta(days=4)).isoformat())
         evt2_date = (datetime.now(UTC) - timedelta(days=2)).isoformat()
         evt2 = _event(5, date_iso=evt2_date)
         decisions = _fifo_match_with_chronology([t], [evt1, evt2])
-        assert decisions[0].received_at is not None
-        assert decisions[0].received_at == _extract_received_at(evt2)
+        assert decisions[0].is_full is True
+        assert decisions[0].last_event_at == _extract_received_at(evt2)
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +243,13 @@ def _make_transfer_orm(
     quantity: int,
     days_ago: int = 1,
     product_tiny_id: int = 971992238,
+    quantity_received: int = 0,
 ) -> MagicMock:
     row = MagicMock()
     row.id = transfer_id
     row.product_sku = sku
     row.quantity = quantity
+    row.quantity_received = quantity_received
     row.product_tiny_id = product_tiny_id
     row.transferred_at = datetime.now(UTC) - timedelta(days=days_ago)
     return row
@@ -232,16 +276,25 @@ def _patch_session(
     listing_rows = listing_rows or []
     variation_rows = variation_rows or []
 
+    # Order of session.execute() in scan_and_reconcile:
+    # 1. _cancel_non_fulfillment_pending raw SQL → returns no rows
+    # 2. main MLListingORM listings query
+    # 3. variations query (only if at least one has_variations=True; we add
+    #    it unconditionally — extra unused side_effects are harmless)
+    cancel_result = MagicMock()
+    cancel_result.all = MagicMock(return_value=[])
     listing_result = MagicMock()
     listing_result.all = MagicMock(return_value=listing_rows)
     variation_result = MagicMock()
     variation_result.all = MagicMock(return_value=variation_rows)
 
-    mock_session.execute = AsyncMock(side_effect=[listing_result, variation_result])
+    mock_session.execute = AsyncMock(side_effect=[cancel_result, listing_result, variation_result])
 
     repo_mock = AsyncMock()
     repo_mock.list_all = AsyncMock(return_value=(pending_rows, len(pending_rows)))
     repo_mock.mark_received = AsyncMock(return_value=MagicMock())
+    repo_mock.apply_partial_reception = AsyncMock(return_value=MagicMock())
+    repo_mock.mark_cancelled = AsyncMock(return_value=MagicMock())
 
     return mock_session, repo_mock
 
@@ -306,7 +359,7 @@ class TestReconciliation:
 
         assert result.skus_scanned == 1
         assert result.transfers_received == 1
-        assert repo_mock.mark_received.call_count == 1
+        assert repo_mock.apply_partial_reception.call_count == 1
 
     @pytest.mark.asyncio
     async def test_transfer_delivery_events_are_counted(self, ml_client: AsyncMock) -> None:

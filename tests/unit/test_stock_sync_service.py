@@ -514,6 +514,7 @@ async def test_webhook_transfer_seeds_snapshot_on_first_observation(
     transfer_repo.has_recent_pending.assert_not_awaited()
 
 
+@patch("tiny_mirror.services.stock_sync_service.MLListingRepository")
 @patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
 @patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
 @patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
@@ -521,6 +522,7 @@ async def test_webhook_transfer_creates_pending_on_positive_delta_with_galpao_dr
     mock_session_local: MagicMock,
     mock_snapshot_repo_cls: MagicMock,
     mock_transfer_repo_cls: MagicMock,
+    mock_ml_listing_repo_cls: MagicMock,
     stock_service: StockSyncService,
 ) -> None:
     """FL +20 corroborated by galpão -20 → insert pending transfer."""
@@ -537,6 +539,11 @@ async def test_webhook_transfer_creates_pending_on_positive_delta_with_galpao_dr
     transfer_repo.has_recent_pending = AsyncMock(return_value=False)
     transfer_repo.create = AsyncMock()
     mock_transfer_repo_cls.return_value = transfer_repo
+
+    # SKU has a fulfillment listing on ML — guard passes, transfer is created.
+    ml_listing_repo = MagicMock()
+    ml_listing_repo.sku_logistic_status = AsyncMock(return_value=(1, 1))
+    mock_ml_listing_repo_cls.return_value = ml_listing_repo
 
     await stock_service._maybe_record_webhook_transfer(
         product_tiny_id=42,
@@ -590,6 +597,95 @@ async def test_webhook_transfer_skips_when_galpao_did_not_drop(
     transfer_repo.create.assert_not_awaited()
     # Snapshot is still updated so the next webhook has fresh baselines.
     snapshot_repo.upsert.assert_awaited_once_with(967523943, tiny_fl_qty=456, stock_galpao_qty=200)
+
+
+@patch("tiny_mirror.services.stock_sync_service.MLListingRepository")
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_skips_when_sku_not_fulfillment_on_ml(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    mock_ml_listing_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """Galpão drop corroborates the FL +20, but the SKU has no fulfillment
+    listing on ML (only xd_drop_off). The transfer would never reconcile
+    via INBOUND_RECEPTION, so the webhook skips creation. Snapshot still
+    updates so we don't get stuck on the same delta forever."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=_snap(fl=3, galpao=100))
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock(return_value=False)
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    # Listing exists but logistic_type != fulfillment.
+    ml_listing_repo = MagicMock()
+    ml_listing_repo.sku_logistic_status = AsyncMock(return_value=(0, 2))
+    mock_ml_listing_repo_cls.return_value = ml_listing_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=42,
+        sku="SKU-XD-DROP-OFF",
+        new_tiny_fl_qty=23,
+        new_stock_galpao_qty=80,
+        product_data={"prices": {"cost_price": "12.32"}},
+    )
+
+    transfer_repo.create.assert_not_awaited()
+    snapshot_repo.upsert.assert_awaited_once()
+
+
+@patch("tiny_mirror.services.stock_sync_service.MLListingRepository")
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_records_when_sku_absent_from_ml_listings(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    mock_ml_listing_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """SKU has zero ml_listings rows (e.g. kit component sold via parent
+    kit's MLB). We don't know whether reconciliation is possible, so we
+    still record and let the reception scan / operator decide later."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=_snap(fl=3, galpao=100))
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock(return_value=False)
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    ml_listing_repo = MagicMock()
+    ml_listing_repo.sku_logistic_status = AsyncMock(return_value=(0, 0))  # absent
+    mock_ml_listing_repo_cls.return_value = ml_listing_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=42,
+        sku="CAMP-FAC-CHUR",
+        new_tiny_fl_qty=23,
+        new_stock_galpao_qty=80,
+        product_data={"prices": {"cost_price": "12.32"}},
+    )
+
+    transfer_repo.create.assert_awaited_once()
 
 
 @patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
