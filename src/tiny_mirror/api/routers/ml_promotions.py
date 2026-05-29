@@ -15,6 +15,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
@@ -31,7 +32,10 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
     MLPromoCapRepository,
     MLPromoDecisionRepository,
 )
+from tiny_mirror.services import feature_flags
 from tiny_mirror.services.ml_promotion_service import MLPromotionService
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -964,6 +968,24 @@ async def acknowledge_alert(
 # ---------------------------------------------------------------------------
 # DECISIONS (operator approval queue)
 # ---------------------------------------------------------------------------
+@router.get("/config")
+async def get_config() -> dict[str, Any]:
+    """Read-only snapshot of every promotion feature flag.
+
+    Surfaced to the UI so it can render a 'simulação vs execução' banner
+    above the Decisões table. **Read-only by contract** — flipping
+    flags requires editing the VPS env (ML_PROMO_APPLY_ENABLED) and a
+    service restart. The approve/reject/ignore handlers re-read flag
+    state on every request and never trust the caller.
+    """
+    return {
+        "flags": feature_flags.public_state(),
+        # Convenience top-level alias so the UI can read one field instead
+        # of digging into flags["ml_promo_apply"].
+        "execute_enabled": feature_flags.is_enabled("ml_promo_apply"),
+    }
+
+
 @router.post("/decisions/generate")
 async def generate_decisions(
     only_sku: str | None = Query(default=None, description="restrict to a single SKU"),
@@ -1079,6 +1101,11 @@ async def approve_decision(
     body: DecisionDecideIn,
     session: AsyncSession = Depends(db_session),
 ) -> DecisionOut:
+    # Re-read the apply flag on every call so the operator can toggle
+    # ML_PROMO_APPLY_ENABLED without a redeploy. Today, with the flag OFF
+    # we only flip ml_promo_decisions.status. Phase 5 will enqueue ML
+    # enrollment when this is True.
+    apply_enabled = feature_flags.is_enabled("ml_promo_apply")
     repo = MLPromoDecisionRepository(session)
     override: dict[str, Decimal] = {}
     notes = body.notes
@@ -1101,6 +1128,16 @@ async def approve_decision(
             detail=f"decision {decision_id} not found or already decided",
         )
     await session.commit()
+    if apply_enabled:
+        # Placeholder: Phase 5 will queue the row for the ML executor here.
+        # Wired now so the gate exists end-to-end and integration tests
+        # can assert the branch is hit when the flag flips.
+        logger.info(
+            "promo_apply gate ON; queue-for-ML stub fired",
+            decision_id=decision_id,
+            sku=row.sku,
+            mlb_id=row.mlb_id,
+        )
     return DecisionOut.model_validate(row)
 
 

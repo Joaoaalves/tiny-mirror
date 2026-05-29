@@ -154,6 +154,17 @@ class Settings(BaseSettings):
     # (04:30) so caps are based on the freshest cost data of the day.
     sync_ml_promo_recompute_cron: str = "0 5 * * *"
 
+    # Feature flag: when False (default), approving a row in
+    # /produtos/promocoes only flips its status in ml_promo_decisions and
+    # never touches ML. When True, the future executor (Phase 5) will POST
+    # to /seller-promotions/items/{MLB} to enroll the listing. Toggled via
+    # env var on the VPS only (ML_PROMO_APPLY_ENABLED); not exposed to any
+    # HTTP endpoint. The UI fetches its read-only value via
+    # GET /api/produtos/promocoes/config to render a 'simulação vs execução'
+    # banner — the server still re-checks the setting inside every approve
+    # handler and never trusts the client.
+    ml_promo_apply_enabled: bool = False
+
     # Daily job that refreshes ml_catalog_status by calling
     # /items/{MLB}/price_to_win for every active MLB. Reads stay in DB so
     # the dry-run analysis runs in seconds. Scheduled BEFORE the cap
