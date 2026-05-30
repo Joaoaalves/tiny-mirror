@@ -1113,14 +1113,26 @@ async def _apply_target_override(
     """Validate a target_price override and return the recomputed pct
     fields plus an optional warning string.
 
-    Limites diferentes:
-    - **cap_pct** (limite do ML pra share do seller) é HARD: viola → 422.
-    - **floor_price** (nosso piso de margem) é SOFT: o operador pode
-      aprovar mesmo abaixo, mas devolvemos uma string de aviso que o
-      caller anexa nas `notes` da linha pra audit ("margem em risco").
+    Limites HARD (todos retornam 422):
 
-    Raises HTTPException(422) só quando o override viola o cap do ML
-    (ou o preço é inválido). O piso só gera warning.
+    - ``cap_pct``: o cap do ML pro share do seller. Viola → erro.
+    - ``floor_price``: o nosso piso de margem. Override que coloca o
+      preço abaixo do piso é recusado *categoricamente*. Antes era
+      SOFT (warning + permite); foi endurecido em 2026-05-29 quando o
+      executor Phase 5 entrou em produção. ML POST não pode acontecer
+      abaixo do piso, então a única forma segura de bloquear é não
+      deixar o operador submeter o valor — o executor sempre lê o
+      ``target_price`` da própria linha.
+    - ``floor_price IS NULL``: quando a linha não tem piso (custos não
+      carregaram no momento da geração) o operador NÃO pode forçar
+      preço para baixo — não temos como verificar a margem. Override
+      para cima continua permitido (mais conservador = mais margem).
+      Pra forçar pra baixo o operador precisa regenerar com custos
+      frescos.
+
+    O retorno mantém a assinatura ``(updates, warning)`` por
+    compatibilidade mas ``warning`` é sempre ``None`` agora — todo
+    risco vira erro.
     """
     row = await repo.get(decision_id)
     if row is None:
@@ -1166,15 +1178,33 @@ async def _apply_target_override(
             ),
         )
 
-    # SOFT: piso de margem é nosso, não do ML. Operador pode forçar
-    # abaixo (ex: pra match preço de concorrente, ou pra giro). Volta
-    # uma warning string pra ser anexada na audit; o status code fica 200.
-    warning: str | None = None
+    # HARD: piso de margem é nosso. Override que coloca o preço abaixo
+    # do piso é recusado. Tolerância de 0.005 (meio centavo) pra
+    # arredondamento — mesma do código antigo, só que agora vira 422
+    # em vez de warning.
     if row.floor_price is not None and override_price + Decimal("0.005") < row.floor_price:
-        warning = (
-            f"[forçado abaixo do piso] target R$ {override_price} < "
-            f"piso R$ {row.floor_price} — margem em risco"
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"target_price R$ {override_price} abaixo do piso R$ {row.floor_price} "
+                f"(margem em risco — recusado)"
+            ),
         )
+
+    # HARD: sem piso conhecido (custos não rodaram), só permitimos
+    # override pra cima do alvo atual. Pra baixo precisaria de uma
+    # base de margem que não temos — re-gere as decisões com custos
+    # frescos primeiro.
+    if row.floor_price is None and row.target_price is not None:
+        current_target = Decimal(row.target_price)
+        if override_price + Decimal("0.005") < current_target:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"target_price R$ {override_price} < alvo gerado R$ {current_target} "
+                    f"e linha sem piso (custos ausentes) — regenere com custos antes"
+                ),
+            )
 
     return (
         {
@@ -1182,7 +1212,7 @@ async def _apply_target_override(
             "target_total_pct": new_total_pct,
             "target_seller_pct": new_seller_pct,
         },
-        warning,
+        None,
     )
 
 

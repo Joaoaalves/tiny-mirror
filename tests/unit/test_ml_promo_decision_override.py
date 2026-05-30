@@ -26,12 +26,14 @@ def _row(
     floor_price: Decimal | None = Decimal("40.00"),
     cap_pct: Decimal | None = Decimal("20.00"),
     meli_percentage: Decimal | None = Decimal("0"),
+    target_price: Decimal | None = Decimal("45.00"),
 ) -> SimpleNamespace:
     return SimpleNamespace(
         list_price=list_price,
         floor_price=floor_price,
         cap_pct=cap_pct,
         meli_percentage=meli_percentage,
+        target_price=target_price,
     )
 
 
@@ -61,16 +63,34 @@ async def test_override_subtracts_meli_copay_from_seller_pct() -> None:
     assert out["target_seller_pct"] == Decimal("7.00")
 
 
-async def test_override_below_floor_returns_warning_not_error() -> None:
-    """SOFT floor: piso violado retorna warning string, não 422."""
+async def test_override_below_floor_returns_422() -> None:
+    """HARD floor: piso violado vira 422 (mudou em 2026-05-29 com o
+    executor Phase 5). Nada que vá pro ML pode ficar abaixo do nosso
+    piso de margem.
+    """
     repo = _repo(_row(floor_price=Decimal("42.00")))
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("41.00"))
+    assert exc.value.status_code == 422
+    assert "piso" in exc.value.detail
+    assert "margem em risco" in exc.value.detail
+
+
+async def test_override_down_without_floor_is_rejected() -> None:
+    """Sem piso (custos ausentes) o operador NÃO pode forçar pra baixo.
+    Pra cima continua permitido."""
+    repo = _repo(_row(floor_price=None, target_price=Decimal("45.00")))
+    # Pra cima do alvo gerado (45) → permitido.
     out, warning = await _apply_target_override(
-        repo, decision_id=1, override_price=Decimal("41.00")
+        repo, decision_id=1, override_price=Decimal("46.00")
     )
-    assert out["target_price"] == Decimal("41.00")
-    assert warning is not None
-    assert "piso" in warning
-    assert "margem em risco" in warning
+    assert out["target_price"] == Decimal("46.00")
+    assert warning is None
+    # Pra baixo do alvo gerado → 422.
+    with pytest.raises(HTTPException) as exc:
+        await _apply_target_override(repo, decision_id=1, override_price=Decimal("40.00"))
+    assert exc.value.status_code == 422
+    assert "sem piso" in exc.value.detail
 
 
 async def test_override_rejects_seller_cap_exceeded() -> None:
