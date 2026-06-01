@@ -92,6 +92,10 @@ async def test_handle_one_applies_balance_when_mismatch(
     mock_session.execute = AsyncMock()
     fake_result = MagicMock()
     fake_result.all = MagicMock(return_value=[])
+    # _recent_correction reads .first(); None = no prior correction
+    # in the 48h ping-pong / 12h cooldown window — the default
+    # scenario for these "first detection" tests.
+    fake_result.first = MagicMock(return_value=None)
     mock_session.execute.return_value = fake_result
 
     repo = MagicMock()
@@ -138,6 +142,7 @@ async def test_handle_one_records_failure_when_tiny_rejects(
     mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
     fake_result = MagicMock()
     fake_result.all = MagicMock(return_value=[])
+    fake_result.first = MagicMock(return_value=None)
     mock_session.execute = AsyncMock(return_value=fake_result)
 
     repo = MagicMock()
@@ -176,6 +181,7 @@ async def test_run_correction_with_no_candidates(
     mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
     fake_result = MagicMock()
     fake_result.all = MagicMock(return_value=[])
+    fake_result.first = MagicMock(return_value=None)
     mock_session.execute = AsyncMock(return_value=fake_result)
 
     sync_logs = MagicMock()

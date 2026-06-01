@@ -99,7 +99,7 @@ class FLStockCorrectionService:
     # ------------------------------------------------------------------
     async def _load_candidates(self) -> list[tuple[int, str, int]]:
         """Returns [(tiny_id, sku, ml_qty)] for every base SKU with FL listing
-        whose Tiny accounting has *settled* (no pending NFs for recent sales).
+        eligible for the cron's drift check.
 
         Filters:
           - p.situation = 'A' (active product in Tiny)
@@ -110,15 +110,15 @@ class FLStockCorrectionService:
             where this product is the kit)
           - excludes test SKUs (SKU-TEST*)
           - **quiet**: no Mercado Livre order activity in the last 6h.
-            Tiny's auto-NF + FL auto-baixa pipeline runs minutes after the
-            ML shipment, so any drift observed while the pipeline is still
-            in motion is likely a timing artifact, not real drift. Applying
-            a balance during that window risks racing the Tiny auto-baixa
-            and double-counting the units. The point of this cron is to
-            catch *real* drift (phantom products, cancelled NFs that left
-            stock dangling, kit decomposition bugs, manual lançamentos with
-            wrong sign, etc.), not to win a race against invoicing. SKUs
-            that aren't quiet this run will be picked up by the next one.
+            Avoids racing Tiny's auto-NF + FL auto-baixa pipeline that runs
+            minutes after the ML shipment. SKUs that aren't quiet this run
+            get picked up by the next one.
+
+        The lag-vs-drift discrimination (ML's Inventory API trailing Tiny's
+        NF by hours) is NOT done here — high-velocity SKUs would never be
+        eligible if we widened this window. It lives downstream in
+        ``_handle_one`` via the ping-pong + cooldown guards, which weigh
+        each detected drift against the recent correction history.
         """
         sql = text(
             """
@@ -144,31 +144,26 @@ class FLStockCorrectionService:
                     AND ml.status = 'active'
               )
               AND NOT EXISTS (
-                  -- "quiet" check #1: ML order activity on this SKU in the
-                  -- last 24h. Tiny pre-fills invoice_id on auto-NF orders,
-                  -- so that flag is useless as a "settled" signal —
-                  -- time-since-activity is the only reliable discriminator
-                  -- between real drift and a timing artifact. Bumped from
-                  -- 6h to 24h after the 2026-06-01 ping-pong audit showed
-                  -- that ML's Inventory API can lag a Tiny NF by 6-12h.
+                  -- "quiet" check: ML order activity in the last 6h means
+                  -- Tiny's auto-baixa pipeline is still in motion — a
+                  -- correction during that window risks racing the
+                  -- invoicing and double-counting. SKUs that aren't quiet
+                  -- this run get picked up by the next one.
+                  --
+                  -- A LONGER window (24h) was tried in 2026-06-01 to catch
+                  -- the ML-Inventory-lag pattern, but it permanently
+                  -- excluded high-velocity SKUs from EVER being corrected
+                  -- — they always have order activity in 24h. The right
+                  -- defence against lag isn't candidate-side exclusion
+                  -- but downstream guards (_is_ping_pong + _is_in_cooldown
+                  -- in _handle_one), which evaluate each detected drift
+                  -- against the recent correction history per SKU.
                   SELECT 1
                   FROM order_items oi
                   JOIN orders o ON o.tiny_id = oi.order_tiny_id
                   WHERE oi.product_sku = p.sku
                     AND o.ecommerce_name LIKE 'Mercado Livre%'
-                    AND o.synced_at >= NOW() - INTERVAL '24 hours'
-              )
-              AND NOT EXISTS (
-                  -- "quiet" check #2: any NF (invoice_items) for this SKU
-                  -- in the last 24h. Tiny decrements FL stock via NF, not
-                  -- via orders directly, so a freshly-synced NF is the
-                  -- strongest signal that Tiny just shrank and ML hasn't
-                  -- caught up yet. invoice_items.created_at = our sync time
-                  -- (within ~1h of when the NF was created in Tiny).
-                  SELECT 1
-                  FROM invoice_items ii
-                  WHERE ii.product_sku = p.sku
-                    AND ii.created_at >= NOW() - INTERVAL '24 hours'
+                    AND o.synced_at >= NOW() - INTERVAL '6 hours'
               );
             """
         )
@@ -203,6 +198,8 @@ class FLStockCorrectionService:
         # API lagging behind a Tiny NF. The right behaviour is to wait;
         # the next cron run picks it up once both sides settle.
         recent = await self._recent_correction(sku)
+        skip_reason: str | None = None
+        skip_guard: str | None = None
         if _is_ping_pong(delta=delta, recent_correction=recent):
             assert recent is not None  # narrowed by _is_ping_pong
             age_hours = (datetime.now(UTC) - recent["created_at"]).total_seconds() / 3600.0
@@ -211,13 +208,26 @@ class FLStockCorrectionService:
                 f"de {age_hours:.1f}h atrás (soma {recent['delta'] + delta:+d}); "
                 f"provável lag ML Inventory vs Tiny NF"
             )
+            skip_guard = "ping-pong"
+        elif _is_in_cooldown(delta=delta, recent_correction=recent):
+            assert recent is not None  # narrowed by _is_in_cooldown
+            age_hours = (datetime.now(UTC) - recent["created_at"]).total_seconds() / 3600.0
+            skip_reason = (
+                f"skipped: cooldown — correção anterior delta={recent['delta']:+d} "
+                f"de {age_hours:.1f}h atrás e |delta atual|={abs(delta)} ≤ "
+                f"{COOLDOWN_MAX_MAGNITUDE}; provável lag oscilatório de alta-velocidade"
+            )
+            skip_guard = "cooldown"
+
+        if skip_reason is not None:
+            assert recent is not None
             logger.info(
-                "FL correction skipped — ping-pong guard",
+                "FL correction skipped",
+                guard=skip_guard,
                 sku=sku,
                 tiny_id=tiny_id,
                 delta=delta,
                 prev_delta=recent["delta"],
-                prev_age_hours=round(age_hours, 1),
             )
             async with AsyncSessionLocal() as session:
                 repo = FLStockCorrectionLogRepository(session)
@@ -450,6 +460,50 @@ class FLStockCorrectionService:
 
 
 # ---------------------------------------------------------------------------
+# Cooldown threshold (hours) and max |delta| considered "small" for the
+# cooldown rule. Small drifts within the cooldown window are treated as
+# lag oscillation; larger drifts pass through so real drift is still
+# corrected (the DEL-VIS-ETIQ-BRNC -102/+79 cases from the audit).
+COOLDOWN_HOURS = 12.0
+COOLDOWN_MAX_MAGNITUDE = 5
+
+
+def _is_in_cooldown(
+    *,
+    delta: int,
+    recent_correction: dict[str, Any] | None,
+    now: datetime | None = None,
+    hours: float = COOLDOWN_HOURS,
+    max_magnitude: int = COOLDOWN_MAX_MAGNITUDE,
+) -> bool:
+    """True when the SKU just had a correction and the current drift is
+    small enough to look like lag noise rather than fresh real drift.
+
+    Pair this with :func:`_is_ping_pong` (called first): ping-pong
+    catches exact cancellation, cooldown catches the "drift kept
+    creeping the same direction" oscillation pattern that ping-pong
+    misses (e.g., -1 then -3 then -1 inside an hour for a high-velocity
+    SKU where ML's Inventory is consistently 1-3 units behind Tiny's
+    NF).
+
+    Returns False when there's no recent correction (no cooldown to
+    enforce) or when ``|delta| > max_magnitude`` (drift big enough to
+    be probable real drift; let it through even within the window).
+
+    The 12h / 5-unit defaults come from the 2026-06-01 audit: the
+    DEL-VIS-ETIQ-BRNC oscillation cluster on 27/05 had |delta| in
+    {1, 3, 1} within ~3h, while the real drifts on the same SKU were
+    -102 and +79 — well above the threshold.
+    """
+    if recent_correction is None:
+        return False
+    if abs(delta) > max_magnitude:
+        return False
+    now = now or datetime.now(UTC)
+    age_hours: float = (now - recent_correction["created_at"]).total_seconds() / 3600.0
+    return age_hours <= hours
+
+
 def _is_ping_pong(*, delta: int, recent_correction: dict[str, Any] | None) -> bool:
     """True when applying ``delta`` would cancel a recent correction
     for the same SKU.

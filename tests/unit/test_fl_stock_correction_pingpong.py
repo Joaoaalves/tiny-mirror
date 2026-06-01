@@ -18,7 +18,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tiny_mirror.services.fl_stock_correction_service import _is_ping_pong
+from tiny_mirror.services.fl_stock_correction_service import (
+    COOLDOWN_HOURS,
+    COOLDOWN_MAX_MAGNITUDE,
+    _is_in_cooldown,
+    _is_ping_pong,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -93,3 +98,64 @@ def test_age_filter_is_caller_responsibility() -> None:
     # This test documents that: an "old" row is still classified as
     # ping-pong here, because if it reached us it WAS recent.
     assert _is_ping_pong(delta=2, recent_correction=_prev(-1, hours_ago=47.0)) is True
+
+
+# ─── _is_in_cooldown ──────────────────────────────────────────────────
+#
+# Cooldown protects high-velocity SKUs from oscillation: when we just
+# corrected a SKU and a SMALL drift is detected again shortly after,
+# the new drift is almost certainly ML's Inventory still catching up
+# with Tiny's NF — not fresh real drift. Skip. Real drift that
+# accumulates beyond the magnitude threshold passes through.
+
+
+def test_cooldown_no_recent_correction_applies() -> None:
+    assert _is_in_cooldown(delta=2, recent_correction=None) is False
+
+
+def test_cooldown_small_delta_inside_window_blocks() -> None:
+    # DEL-VIS-ETIQ-BRNC 27/05 cluster: prev=-102, current=-1, 0.8h
+    # later. |delta|=1 ≤ 5 → block.
+    assert _is_in_cooldown(delta=-1, recent_correction=_prev(-102, hours_ago=0.8)) is True
+    # And the next two in the cluster.
+    assert _is_in_cooldown(delta=-3, recent_correction=_prev(-1, hours_ago=1.0)) is True
+    assert _is_in_cooldown(delta=-1, recent_correction=_prev(-3, hours_ago=1.0)) is True
+
+
+def test_cooldown_large_delta_inside_window_applies() -> None:
+    # The legitimate -102 drift would have had no prev correction; but
+    # even if it had one in window, magnitude > 5 must pass through.
+    # This is the principle that lets us catch real drift on high-vel
+    # SKUs (DEL-VIS-ETIQ-BRNC -102, +79).
+    assert _is_in_cooldown(delta=-102, recent_correction=_prev(-1, hours_ago=2.0)) is False
+    assert _is_in_cooldown(delta=79, recent_correction=_prev(1, hours_ago=2.0)) is False
+
+
+def test_cooldown_window_boundary() -> None:
+    # 12h is the default window. Just inside = blocked, just outside =
+    # applied. Magnitude small in both.
+    assert _is_in_cooldown(delta=1, recent_correction=_prev(-1, hours_ago=11.9)) is True
+    assert _is_in_cooldown(delta=1, recent_correction=_prev(-1, hours_ago=12.5)) is False
+
+
+def test_cooldown_magnitude_boundary() -> None:
+    # |delta| == max_magnitude (5) is "small". |delta| > 5 passes.
+    assert _is_in_cooldown(delta=5, recent_correction=_prev(-1, hours_ago=2.0)) is True
+    assert _is_in_cooldown(delta=-5, recent_correction=_prev(1, hours_ago=2.0)) is True
+    assert _is_in_cooldown(delta=6, recent_correction=_prev(-1, hours_ago=2.0)) is False
+
+
+def test_cooldown_constants_are_audit_calibrated() -> None:
+    # Calibrated against the 2026-06-01 audit. If these defaults
+    # change, the audit assumptions in the docstring should be
+    # revisited.
+    assert COOLDOWN_HOURS == 12.0
+    assert COOLDOWN_MAX_MAGNITUDE == 5
+
+
+def test_cooldown_independent_of_ping_pong_direction() -> None:
+    # Cooldown doesn't care about sign — same-direction repeats are
+    # also lag-suspicious (the -1, -3, -1 cluster all went the same
+    # way). Both directions inside window get blocked when small.
+    assert _is_in_cooldown(delta=2, recent_correction=_prev(3, hours_ago=2.0)) is True
+    assert _is_in_cooldown(delta=-2, recent_correction=_prev(-3, hours_ago=2.0)) is True
