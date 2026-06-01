@@ -144,18 +144,31 @@ class FLStockCorrectionService:
                     AND ml.status = 'active'
               )
               AND NOT EXISTS (
-                  -- "quiet" check: any ML order activity on this SKU in the
-                  -- last 6h is treated as the Tiny invoicing pipeline still
-                  -- being in motion. Tiny pre-fills invoice_id on auto-NF
-                  -- orders, so that flag is useless as a "settled" signal —
+                  -- "quiet" check #1: ML order activity on this SKU in the
+                  -- last 24h. Tiny pre-fills invoice_id on auto-NF orders,
+                  -- so that flag is useless as a "settled" signal —
                   -- time-since-activity is the only reliable discriminator
-                  -- between real drift and a timing artifact.
+                  -- between real drift and a timing artifact. Bumped from
+                  -- 6h to 24h after the 2026-06-01 ping-pong audit showed
+                  -- that ML's Inventory API can lag a Tiny NF by 6-12h.
                   SELECT 1
                   FROM order_items oi
                   JOIN orders o ON o.tiny_id = oi.order_tiny_id
                   WHERE oi.product_sku = p.sku
                     AND o.ecommerce_name LIKE 'Mercado Livre%'
-                    AND o.synced_at >= NOW() - INTERVAL '6 hours'
+                    AND o.synced_at >= NOW() - INTERVAL '24 hours'
+              )
+              AND NOT EXISTS (
+                  -- "quiet" check #2: any NF (invoice_items) for this SKU
+                  -- in the last 24h. Tiny decrements FL stock via NF, not
+                  -- via orders directly, so a freshly-synced NF is the
+                  -- strongest signal that Tiny just shrank and ML hasn't
+                  -- caught up yet. invoice_items.created_at = our sync time
+                  -- (within ~1h of when the NF was created in Tiny).
+                  SELECT 1
+                  FROM invoice_items ii
+                  WHERE ii.product_sku = p.sku
+                    AND ii.created_at >= NOW() - INTERVAL '24 hours'
               );
             """
         )
@@ -168,7 +181,9 @@ class FLStockCorrectionService:
     async def _handle_one(self, tiny_id: int, sku: str, ml_qty: int) -> str:
         """Process one SKU: detect mismatch, capture investigation, apply correction.
 
-        Returns "aligned" if no correction was needed, "corrected" otherwise.
+        Returns "aligned" if no correction was needed, "skipped" when the
+        ping-pong guard rejected the run, "corrected" when the balance
+        was applied (success or failure — see fl_stock_corrections_log).
         """
         # 1. Fetch current Tiny estoque (full snapshot for investigation)
         tiny_estoque = await self._tiny.get_stock(tiny_id)
@@ -179,6 +194,47 @@ class FLStockCorrectionService:
 
         delta = ml_qty - tiny_saldo
         investigation = await self._build_investigation(tiny_id, sku, tiny_estoque)
+
+        # 1b. Ping-pong guard: if we just corrected this SKU in the
+        # opposite direction within 48h and applying this delta would
+        # cancel that out, refuse to flip back. Per the 2026-06-01
+        # audit, 22% of corrections in the last 30 days were the second
+        # leg of a ping-pong — almost always caused by ML's Inventory
+        # API lagging behind a Tiny NF. The right behaviour is to wait;
+        # the next cron run picks it up once both sides settle.
+        recent = await self._recent_correction(sku)
+        if _is_ping_pong(delta=delta, recent_correction=recent):
+            assert recent is not None  # narrowed by _is_ping_pong
+            age_hours = (datetime.now(UTC) - recent["created_at"]).total_seconds() / 3600.0
+            skip_reason = (
+                f"skipped: ping-pong contra correção anterior delta={recent['delta']:+d} "
+                f"de {age_hours:.1f}h atrás (soma {recent['delta'] + delta:+d}); "
+                f"provável lag ML Inventory vs Tiny NF"
+            )
+            logger.info(
+                "FL correction skipped — ping-pong guard",
+                sku=sku,
+                tiny_id=tiny_id,
+                delta=delta,
+                prev_delta=recent["delta"],
+                prev_age_hours=round(age_hours, 1),
+            )
+            async with AsyncSessionLocal() as session:
+                repo = FLStockCorrectionLogRepository(session)
+                await repo.record(
+                    product_tiny_id=tiny_id,
+                    sku=sku,
+                    tiny_saldo_before=tiny_saldo,
+                    ml_qty=ml_qty,
+                    delta=delta,
+                    correction_applied=False,
+                    tiny_id_lancamento=None,
+                    tiny_saldo_after=None,
+                    http_status=None,
+                    error_message=skip_reason,
+                    investigation_payload=investigation,
+                )
+            return "skipped"
 
         # 2. Apply balance
         observacoes = (
@@ -253,6 +309,36 @@ class FLStockCorrectionService:
                 error=error_msg,
             )
         return "corrected"
+
+    # ------------------------------------------------------------------
+    async def _recent_correction(self, sku: str) -> dict[str, Any] | None:
+        """Return the most recent successful correction for this SKU in
+        the last 48h, or None. Used by the ping-pong guard.
+
+        Filters ``correction_applied = true`` so a previous skip doesn't
+        block all future runs. Returns ``delta`` (signed) and
+        ``created_at`` (timezone-aware) — enough for the caller to
+        compute age and check for sign-flip.
+        """
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                text(
+                    """
+                    SELECT delta, created_at
+                    FROM fl_stock_corrections_log
+                    WHERE sku = :sku
+                      AND correction_applied = true
+                      AND created_at >= NOW() - INTERVAL '48 hours'
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """
+                ),
+                {"sku": sku},
+            )
+            row = result.first()
+        if row is None:
+            return None
+        return {"delta": int(row[0]), "created_at": row[1]}
 
     # ------------------------------------------------------------------
     async def _build_investigation(
@@ -364,6 +450,39 @@ class FLStockCorrectionService:
 
 
 # ---------------------------------------------------------------------------
+def _is_ping_pong(*, delta: int, recent_correction: dict[str, Any] | None) -> bool:
+    """True when applying ``delta`` would cancel a recent correction
+    for the same SKU.
+
+    The ping-pong pattern observed in the 2026-06-01 audit: ML's
+    Inventory API lags a Tiny NF by hours, so our cron applies a
+    +N correction; later ML catches up and the cron applies a
+    matching -N, leaving Tiny temporarily wrong. To stop the
+    ping-pong we refuse the second leg.
+
+    Three conditions, all must hold:
+
+    - A previous correction exists for the SKU in the last 48h.
+    - It pointed in the opposite direction (sign flip).
+    - The sum of the two deltas is within ±1 of zero — i.e. this
+      correction would essentially cancel the previous one.
+
+    The ±1 tolerance handles a sale or two that landed between the
+    pair (real drift) without losing the ping-pong signal. If real
+    drift accumulates beyond 1 unit, the deltas won't cancel and the
+    correction proceeds normally.
+    """
+    if recent_correction is None:
+        return False
+    prev_delta = int(recent_correction.get("delta", 0))
+    if prev_delta == 0 or delta == 0:
+        return False
+    # Sign-flip check: previous and current must be opposite signs.
+    if (prev_delta > 0) == (delta > 0):
+        return False
+    return abs(prev_delta + delta) <= 1
+
+
 def _extract_full_saldo(tiny_estoque: dict[str, Any]) -> int:
     """Extract the SALDO (físico) of the Full Mercado Livre deposit.
 
