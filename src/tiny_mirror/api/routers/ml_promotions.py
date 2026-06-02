@@ -279,6 +279,96 @@ def _service_dep(request: Request) -> MLPromotionService:
 
 
 # ---------------------------------------------------------------------------
+# Context snapshot helper (used by approve/reject/ignore/reprice/direct-create)
+# ---------------------------------------------------------------------------
+async def _build_decision_context(
+    session: AsyncSession,
+    mlb_id: str,
+    sku: str,
+    *,
+    price_before: float | None = None,
+    price_after: float | None = None,
+    list_price: float | None = None,
+    floor_price: float | None = None,
+) -> dict[str, Any]:
+    """Monta um snapshot de contexto no momento da ação para fins de automação.
+
+    Captura: status do catálogo, preço atual, price_to_win, momentum de
+    vendas e (quando disponíveis) margem e % de desconto calculados com
+    os dados de custo da snapshot. Todos os campos são opcionais — se a
+    query falhar por dados ausentes, o campo fica None e não bloqueia a
+    ação principal.
+    """
+    from tiny_mirror.infrastructure.orm.models import (
+        MLCatalogStatusORM,
+        MLCostsSnapshotORM,
+    )
+
+    ctx: dict[str, Any] = {
+        "mlb_id": mlb_id,
+        "sku": sku,
+        "price_before": price_before,
+        "price_after": price_after,
+        "list_price": list_price,
+        "floor_price": floor_price,
+        "catalog_status": None,
+        "current_price": None,
+        "price_to_win": None,
+        "momentum": None,
+        "margin_pct": None,
+        "discount_pct": None,
+    }
+
+    try:
+        # Catalog buy-box snapshot
+        cat = await session.get(MLCatalogStatusORM, mlb_id)
+        if cat:
+            ctx["catalog_status"] = cat.status
+            ctx["current_price"] = float(cat.current_price) if cat.current_price else None
+            ctx["price_to_win"] = float(cat.price_to_win) if cat.price_to_win else None
+
+        # Momentum from mv_coverage (materialized view — read-only, fast)
+        mom_row = await session.execute(
+            text("SELECT momentum_15v30 FROM mv_coverage WHERE sku = :sku LIMIT 1"),
+            {"sku": sku},
+        )
+        mom = mom_row.scalar_one_or_none()
+        if mom is not None:
+            ctx["momentum"] = float(mom)
+
+        # Margin calculation from cost snapshot
+        cost = await session.get(MLCostsSnapshotORM, mlb_id)
+        ref_price = price_after or price_before or ctx["current_price"]
+        if cost and ref_price and cost.base_cost and cost.commission_pct:
+            p = float(ref_price)
+            commission = p * float(cost.commission_pct) / 100
+            difal = 0.0  # difal_pct not in snapshot; margin may be slightly overstated
+            freight = 0.0
+            if cost.freight_bands:
+                for band in cost.freight_bands:
+                    b_min = float(band.get("min", 0))
+                    b_max = band.get("max")
+                    if p >= b_min and (b_max is None or p <= float(b_max)):
+                        freight = float(band.get("cost", 0))
+                        break
+            net = p - float(cost.base_cost) - commission - difal - freight
+            ctx["margin_pct"] = round((net / p) * 100, 2) if p else None
+
+        # Discount % vs list price
+        lp = list_price or (float(cost.list_price) if cost and cost.list_price else None)
+        if lp and ref_price:
+            ctx["discount_pct"] = round(((lp - float(ref_price)) / lp) * 100, 2)
+            if not ctx["list_price"]:
+                ctx["list_price"] = lp
+
+    except Exception:
+        # Never let context capture crash the main operation
+        pass
+
+    return ctx
+
+
+# ---------------------------------------------------------------------------
 # CAPS
 # ---------------------------------------------------------------------------
 async def _enrich_cap(
@@ -1238,11 +1328,24 @@ async def approve_decision(
             # Anexa o aviso de piso violado nas notas pra audit. Se o
             # operador já passou um `notes`, preserva no início.
             notes = f"{notes}\n{warning}".strip() if notes else warning
+    # Fetch the pending row first to get sku/mlb_id for context snapshot.
+    pre = await repo.get(decision_id)
+    ctx: dict[str, Any] = {}
+    if pre is not None:
+        ctx = await _build_decision_context(
+            session,
+            mlb_id=pre.mlb_id,
+            sku=pre.sku,
+            price_after=float(body.target_price or pre.target_price or 0) or None,
+            list_price=float(pre.list_price or 0) or None,
+            floor_price=float(pre.floor_price or 0) or None,
+        )
     row = await repo.decide(
         decision_id,
         status="approved",
         by=body.decided_by,
         notes=notes,
+        decision_context=ctx or None,
         **override,
     )
     if row is None:
@@ -1344,7 +1447,24 @@ async def reject_decision(
     session: AsyncSession = Depends(db_session),
 ) -> DecisionOut:
     repo = MLPromoDecisionRepository(session)
-    row = await repo.decide(decision_id, status="rejected", by=body.decided_by, notes=body.notes)
+    pre = await repo.get(decision_id)
+    ctx: dict[str, Any] = {}
+    if pre is not None:
+        ctx = await _build_decision_context(
+            session,
+            mlb_id=pre.mlb_id,
+            sku=pre.sku,
+            price_after=float(pre.target_price or 0) or None,
+            list_price=float(pre.list_price or 0) or None,
+            floor_price=float(pre.floor_price or 0) or None,
+        )
+    row = await repo.decide(
+        decision_id,
+        status="rejected",
+        by=body.decided_by,
+        notes=body.notes,
+        decision_context=ctx or None,
+    )
     if row is None:
         raise HTTPException(
             status_code=404,
@@ -1364,7 +1484,24 @@ async def ignore_decision(
     the row stays out of the pending queue and the cron will not
     re-prompt for it."""
     repo = MLPromoDecisionRepository(session)
-    row = await repo.decide(decision_id, status="ignored", by=body.decided_by, notes=body.notes)
+    pre = await repo.get(decision_id)
+    ctx: dict[str, Any] = {}
+    if pre is not None:
+        ctx = await _build_decision_context(
+            session,
+            mlb_id=pre.mlb_id,
+            sku=pre.sku,
+            price_after=float(pre.target_price or 0) or None,
+            list_price=float(pre.list_price or 0) or None,
+            floor_price=float(pre.floor_price or 0) or None,
+        )
+    row = await repo.decide(
+        decision_id,
+        status="ignored",
+        by=body.decided_by,
+        notes=body.notes,
+        decision_context=ctx or None,
+    )
     if row is None:
         raise HTTPException(
             status_code=404,
@@ -1398,6 +1535,7 @@ async def undo_decision(
 class CreatePriceDiscountIn(BaseModel):
     mlb_id: str
     deal_price: Decimal = Field(gt=0)
+    decided_by: str | None = None
 
 
 @router.post("/create-price-discount")
@@ -1427,12 +1565,37 @@ async def create_price_discount_direct(
     sc = result.get("status_code")
     if sc is not None and sc >= 400:
         raise HTTPException(status_code=sc if sc < 600 else 502, detail=result.get("response"))
+
+    # Log para auditoria e futura automação
+    sku = cap.sku if cap else body.mlb_id
+    ctx = await _build_decision_context(
+        session,
+        mlb_id=body.mlb_id,
+        sku=sku,
+        price_after=float(body.deal_price),
+        floor_price=float(cap.margin_floor_price) if cap and cap.margin_floor_price else None,
+    )
+    action_repo = MLPromoActionRepository(session)
+    await action_repo.log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="direct_create_price_discount",
+        promo_type="PRICE_DISCOUNT",
+        price_after=body.deal_price,
+        reason="criação manual de PRICE_DISCOUNT pelo operador",
+        ml_response=result,
+        dry_run=False,
+        decided_by=body.decided_by,
+        context=ctx,
+    )
+    await session.commit()
     return result
 
 
 class RepriceIn(BaseModel):
     mlb_id: str
     new_price: Decimal = Field(gt=0)
+    decided_by: str | None = None
 
 
 @router.post("/reprice")
@@ -1482,6 +1645,29 @@ async def reprice_listing(
             detail={"step": "enter", "exit_ok": True, "response": enter_result.get("response")},
         )
 
+    # Log para auditoria e futura automação
+    sku = cap.sku if cap else body.mlb_id
+    ctx = await _build_decision_context(
+        session,
+        mlb_id=body.mlb_id,
+        sku=sku,
+        price_after=float(body.new_price),
+        floor_price=float(cap.margin_floor_price) if cap and cap.margin_floor_price else None,
+    )
+    action_repo = MLPromoActionRepository(session)
+    await action_repo.log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="reprice",
+        promo_type="PRICE_DISCOUNT",
+        price_after=body.new_price,
+        reason="subir margem: saiu da promo e reentrou com preço mais alto",
+        ml_response={"exit": exit_result, "enter": enter_result},
+        dry_run=False,
+        decided_by=body.decided_by,
+        context=ctx,
+    )
+    await session.commit()
     return {"exit": exit_result, "enter": enter_result}
 
 

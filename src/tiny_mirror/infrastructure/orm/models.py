@@ -1240,6 +1240,20 @@ class MLPromoActionORM(Base):
     at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    decided_by: Mapped[str | None] = mapped_column(
+        String(200),
+        nullable=True,
+        comment="Email do operador ou 'engine' para ações automáticas",
+    )
+    context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Snapshot de contexto para automação futura: "
+            "{catalog_status, current_price, price_to_win, "
+            "momentum, margin_pct, floor_price, list_price}"
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1378,6 +1392,16 @@ class MLPromoDecisionORM(Base):
         DateTime(timezone=True),
         nullable=True,
         comment="Timestamp of the last attempt to push this row to ML.",
+    )
+    decision_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment=(
+            "Snapshot do contexto no momento da decisão do operador. "
+            "Estruturado para treinar regras de automação: "
+            "{catalog_status, current_price, price_to_win, momentum, "
+            "margin_pct, discount_pct, list_price, floor_price}"
+        ),
     )
 
 

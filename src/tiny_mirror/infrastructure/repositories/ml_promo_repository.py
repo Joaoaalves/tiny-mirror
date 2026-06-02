@@ -223,6 +223,8 @@ class MLPromoActionRepository:
         reason: str | None = None,
         ml_response: Any | None = None,
         dry_run: bool = False,
+        decided_by: str | None = None,
+        context: dict[str, Any] | None = None,
     ) -> MLPromoActionORM:
         row = MLPromoActionORM(
             sku=sku,
@@ -238,6 +240,8 @@ class MLPromoActionRepository:
             reason=reason,
             ml_response=ml_response,
             dry_run=dry_run,
+            decided_by=decided_by,
+            context=context,
         )
         self._session.add(row)
         await self._session.flush()
@@ -443,6 +447,7 @@ class MLPromoDecisionRepository:
         target_price: Decimal | None = None,
         target_total_pct: Decimal | None = None,
         target_seller_pct: Decimal | None = None,
+        decision_context: dict[str, Any] | None = None,
     ) -> MLPromoDecisionORM | None:
         """Move a pending decision to a terminal state.
 
@@ -473,6 +478,8 @@ class MLPromoDecisionRepository:
             row.target_total_pct = target_total_pct
         if target_seller_pct is not None:
             row.target_seller_pct = target_seller_pct
+        if decision_context is not None:
+            row.decision_context = decision_context
         await self._session.flush()
         return row
 
