@@ -148,6 +148,8 @@ class ActionOut(BaseModel):
     ml_response: Any | None
     dry_run: bool
     at: datetime
+    decided_by: str | None = None
+    context: Any | None = None
 
 
 class AlertOut(BaseModel):
@@ -1186,12 +1188,19 @@ async def expire_stale_decisions(
 async def list_decisions(
     status_: Annotated[str | None, Query(alias="status")] = "pending",
     sku: str | None = Query(default=None),
-    limit: int = Query(default=200, ge=1, le=1000),
+    exclude_types: Annotated[list[str] | None, Query()] = None,
+    limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(db_session),
 ) -> list[DecisionOut]:
     repo = MLPromoDecisionRepository(session)
-    rows, _ = await repo.list_(status=status_, sku=sku, limit=limit, offset=offset)
+    rows, _ = await repo.list_(
+        status=status_,
+        sku=sku,
+        exclude_promo_types=exclude_types,
+        limit=limit,
+        offset=offset,
+    )
     return [DecisionOut.model_validate(r) for r in rows]
 
 

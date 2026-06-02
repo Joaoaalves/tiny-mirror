@@ -418,6 +418,7 @@ class MLPromoDecisionRepository:
         *,
         status: str | None = None,
         sku: str | None = None,
+        exclude_promo_types: list[str] | None = None,
         limit: int = 200,
         offset: int = 0,
     ) -> tuple[list[MLPromoDecisionORM], int]:
@@ -429,6 +430,9 @@ class MLPromoDecisionRepository:
         if sku is not None:
             q = q.where(MLPromoDecisionORM.sku == sku)
             count_q = count_q.where(MLPromoDecisionORM.sku == sku)
+        if exclude_promo_types:
+            q = q.where(MLPromoDecisionORM.promo_type.notin_(exclude_promo_types))
+            count_q = count_q.where(MLPromoDecisionORM.promo_type.notin_(exclude_promo_types))
         q = q.order_by(MLPromoDecisionORM.created_at.desc()).limit(limit).offset(offset)
         rows = list((await self._session.execute(q)).scalars().all())
         total = int((await self._session.execute(count_q)).scalar_one())
