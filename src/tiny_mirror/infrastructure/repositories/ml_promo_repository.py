@@ -376,6 +376,7 @@ class MLPromoDecisionRepository:
         floor_price: Decimal | None,
         reason: str,
         status: str = "pending",
+        promo_finish_date: Any | None = None,
     ) -> MLPromoDecisionORM | None:
         """Insert a decision; return the new row, or None if a row with the
         same ``(mlb_id, promo_key)`` already exists.
@@ -405,6 +406,7 @@ class MLPromoDecisionRepository:
                 floor_price=floor_price,
                 reason=reason,
                 status=status,
+                promo_finish_date=promo_finish_date,
             )
             .on_conflict_do_nothing(constraint="uq_ml_promo_decisions_mlb_promo")
             .returning(MLPromoDecisionORM)

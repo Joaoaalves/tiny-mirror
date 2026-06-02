@@ -1225,6 +1225,21 @@ class MLPromotionService:
                     promo_key = (
                         promo_id if promo_id else f"CREATE-{entry.get('constraint') or 'unknown'}"
                     )
+                    # Parse finish_date from ISO string if present.
+                    # ML returns e.g. "2026-06-08T00:00:00-03:00" or
+                    # "2026-06-08T00:00:00" — fromisoformat handles both
+                    # in Python 3.11+; strip trailing timezone offset
+                    # manually for older runtimes.
+                    raw_finish = entry.get("finish_date")
+                    finish_dt: datetime | None = None
+                    if raw_finish:
+                        try:
+                            finish_dt = datetime.fromisoformat(str(raw_finish))
+                            if finish_dt.tzinfo is None:
+                                finish_dt = finish_dt.replace(tzinfo=UTC)
+                        except (ValueError, TypeError):
+                            pass
+
                     inserted = await decisions.insert_if_absent(
                         mlb_id=mlb_id,
                         sku=sku,
@@ -1243,6 +1258,7 @@ class MLPromotionService:
                         floor_price=cap.margin_floor_price,
                         reason=entry.get("reason") or "",
                         status=db_status,
+                        promo_finish_date=finish_dt,
                     )
                     if inserted is not None:
                         if decision_kind == "would_activate":
@@ -1337,6 +1353,7 @@ class MLPromotionService:
             "floor_changed": 0,
             "stale_age": 0,
             "listing_not_active": 0,
+            "campaign_ended": 0,
         }
         expired_total = 0
 
@@ -1346,6 +1363,9 @@ class MLPromotionService:
             lst_status = listing_status.get(row.mlb_id)
             if lst_status != "active":
                 reason: str | None = "listing_not_active"
+            # 0b. Campanha com data de término já passou → decisão obsoleta.
+            elif row.promo_finish_date is not None and row.promo_finish_date < now:
+                reason = "campaign_ended"
             else:
                 reason = self._stale_reason(
                     row,
@@ -1961,6 +1981,7 @@ def enumerate_activations_for_item(
                     "promo_id": p.get("id"),
                     "promo_type": p.get("type"),
                     "promo_name": p.get("name"),
+                    "finish_date": p.get("finish_date"),
                     "status": "already_active",
                     "target_price": price or None,
                     "target_total_pct": total_pct,
@@ -1999,6 +2020,7 @@ def enumerate_activations_for_item(
                 "promo_id": p.get("id"),
                 "promo_type": p.get("type"),
                 "promo_name": p.get("name"),
+                "finish_date": p.get("finish_date"),
                 "status": "would_activate" if accepted else "denied",
                 **scored,
             }

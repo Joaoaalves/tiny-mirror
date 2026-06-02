@@ -1403,6 +1403,15 @@ class MLPromoDecisionORM(Base):
             "margin_pct, discount_pct, list_price, floor_price}"
         ),
     )
+    promo_finish_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=(
+            "Data de término da campanha ML (finish_date do objeto Promo). "
+            "NULL para PRICE_DISCOUNT (sem campanha). "
+            "Usado pelo expire-stale para descartar decisões de campanhas encerradas."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
