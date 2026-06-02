@@ -1395,6 +1395,96 @@ async def undo_decision(
     return DecisionOut.model_validate(row)
 
 
+class CreatePriceDiscountIn(BaseModel):
+    mlb_id: str
+    deal_price: Decimal = Field(gt=0)
+
+
+@router.post("/create-price-discount")
+async def create_price_discount_direct(
+    body: CreatePriceDiscountIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Cria promoção PRICE_DISCOUNT diretamente no ML para um MLB.
+    Valida contra margin_floor_price do cap antes de enviar.
+    """
+    from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
+
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    if cap and cap.margin_floor_price is not None:
+        if body.deal_price + Decimal("0.005") < cap.margin_floor_price:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"deal_price R$ {body.deal_price} abaixo do piso de margem "
+                    f"R$ {cap.margin_floor_price} — recusado"
+                ),
+            )
+    result = await service.create_price_discount(
+        mlb_id=body.mlb_id, deal_price=float(body.deal_price)
+    )
+    sc = result.get("status_code")
+    if sc is not None and sc >= 400:
+        raise HTTPException(status_code=sc if sc < 600 else 502, detail=result.get("response"))
+    return result
+
+
+class RepriceIn(BaseModel):
+    mlb_id: str
+    new_price: Decimal = Field(gt=0)
+
+
+@router.post("/reprice")
+async def reprice_listing(
+    body: RepriceIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Sai da promoção atual e cria uma nova PRICE_DISCOUNT ao new_price.
+
+    Fluxo atômico do ponto de vista do operador:
+    1. DELETE /seller-promotions/items/{mlb_id} — remove promo ativa
+    2. POST  /seller-promotions/items/{mlb_id} — entra com novo preço
+
+    Valida floor antes de qualquer chamada ao ML. Devolve ambos os
+    resultados para o frontend mostrar o diagnóstico se algo falhar.
+    """
+    from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
+
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    if cap and cap.margin_floor_price is not None:
+        if body.new_price + Decimal("0.005") < cap.margin_floor_price:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"new_price R$ {body.new_price} abaixo do piso de margem "
+                    f"R$ {cap.margin_floor_price} — recusado"
+                ),
+            )
+
+    exit_result = await service.exit_promotion(mlb_id=body.mlb_id)
+    exit_sc = exit_result.get("status_code")
+    # Toleramos 404 (não estava em promo) e 200/204 como sucesso.
+    if exit_sc is not None and exit_sc >= 400 and exit_sc != 404:
+        raise HTTPException(
+            status_code=exit_sc if exit_sc < 600 else 502,
+            detail={"step": "exit", "response": exit_result.get("response")},
+        )
+
+    enter_result = await service.create_price_discount(
+        mlb_id=body.mlb_id, deal_price=float(body.new_price)
+    )
+    enter_sc = enter_result.get("status_code")
+    if enter_sc is not None and enter_sc >= 400:
+        raise HTTPException(
+            status_code=enter_sc if enter_sc < 600 else 502,
+            detail={"step": "enter", "exit_ok": True, "response": enter_result.get("response")},
+        )
+
+    return {"exit": exit_result, "enter": enter_result}
+
+
 @router.get("/trends", response_model=dict[str, float | None])
 async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, float | None]:
     """Retorna ``{sku: momentum_15v30}`` para todos os SKUs com vendas.

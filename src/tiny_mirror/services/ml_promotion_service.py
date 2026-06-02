@@ -702,6 +702,64 @@ class MLPromotionService:
         # PRE_NEGOTIATED — ML-managed or not validated yet. Skip.
         return None
 
+    # -- Seller-driven price actions -------------------------------------
+    async def exit_promotion(self, *, mlb_id: str) -> dict[str, Any]:
+        """Remove o anúncio da promoção PRICE_DISCOUNT ativa.
+
+        Chama DELETE /seller-promotions/items/{mlb_id}?app_version=v2.
+        O preço volta ao list_price do anúncio. Não levanta exceção em
+        erros operacionais — devolve {status, status_code, response}
+        para o caller persistir o resultado.
+        """
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        try:
+            resp = await self._http.delete(
+                url,
+                params={"app_version": "v2"},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+            )
+            if resp.status_code == 401:
+                token = await self._token_service.handle_unauthorized()
+                resp = await self._http.delete(
+                    url,
+                    params={"app_version": "v2"},
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30.0,
+                )
+            content = resp.json() if resp.content else {}
+            return {"status_code": resp.status_code, "response": content}
+        except Exception as exc:
+            return {"status_code": None, "response": str(exc)}
+
+    async def create_price_discount(self, *, mlb_id: str, deal_price: float) -> dict[str, Any]:
+        """Cria uma promoção PRICE_DISCOUNT direta para um MLB (sem campaign_id)."""
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        body = {"promotion_type": "PRICE_DISCOUNT", "deal_price": deal_price}
+        try:
+            resp = await self._http.post(
+                url,
+                params={"app_version": "v2"},
+                json=body,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+            )
+            if resp.status_code == 401:
+                token = await self._token_service.handle_unauthorized()
+                resp = await self._http.post(
+                    url,
+                    params={"app_version": "v2"},
+                    json=body,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30.0,
+                )
+            content = resp.json() if resp.content else {}
+            return {"status_code": resp.status_code, "response": content}
+        except Exception as exc:
+            return {"status_code": None, "response": str(exc)}
+
     # -- ML promotions ----------------------------------------------------
     async def fetch_eligible_promos(self, mlb_id: str) -> list[dict[str, Any]]:
         token = await self._token_service.get_valid_access_token()
