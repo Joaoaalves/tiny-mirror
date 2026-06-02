@@ -127,7 +127,10 @@ class CatalogStatusSyncService:
         for i, (mlb_id, sku) in enumerate(listings):
             body, http_status = await self._fetch_one(mlb_id)
             if http_status == 200 and body:
-                stats["in_catalog"] += 1
+                catalog_product_id = body.get("catalog_product_id")
+                is_catalog = catalog_product_id is not None
+                if is_catalog:
+                    stats["in_catalog"] += 1
                 norm_status = _normalise_status(body.get("status"))
                 if norm_status in {"winning", "sharing_first_place", "competing", "losing"}:
                     stats[norm_status] += 1
@@ -137,8 +140,8 @@ class CatalogStatusSyncService:
                 row = {
                     "mlb_id": mlb_id,
                     "sku": sku,
-                    "catalog_listing": True,
-                    "catalog_product_id": body.get("catalog_product_id"),
+                    "catalog_listing": is_catalog,
+                    "catalog_product_id": catalog_product_id,
                     "status": norm_status,
                     "visit_share": body.get("visit_share"),
                     "current_price": _to_dec(body.get("current_price")),
