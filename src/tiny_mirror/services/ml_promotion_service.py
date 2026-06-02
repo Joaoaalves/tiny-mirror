@@ -1308,6 +1308,10 @@ class MLPromotionService:
         max_age_days = age_days if age_days is not None else settings.promo_stale_age_days
         now = now or datetime.now(UTC)
 
+        from sqlalchemy import select
+
+        from tiny_mirror.infrastructure.orm.models import MLListingORM
+
         caps_repo = MLPromoCapRepository(session)
         snap_repo = MLCostsSnapshotRepository(session)
         decisions_repo = MLPromoDecisionRepository(session)
@@ -1318,25 +1322,41 @@ class MLPromotionService:
         # 2.1k current backlog.
         pending_rows, total_pending = await decisions_repo.list_(status="pending", limit=5000)
 
+        # Pre-load listing statuses in one query to avoid N+1.
+        mlb_ids = list({r.mlb_id for r in pending_rows})
+        listing_status_result = await session.execute(
+            select(MLListingORM.mlb_id, MLListingORM.status).where(MLListingORM.mlb_id.in_(mlb_ids))
+        )
+        listing_status: dict[str, str] = {
+            row[0]: (row[1] or "") for row in listing_status_result.all()
+        }
+
         by_reason: dict[str, int] = {
             "list_price_drift": 0,
             "cap_changed": 0,
             "floor_changed": 0,
             "stale_age": 0,
+            "listing_not_active": 0,
         }
         expired_total = 0
 
         for row in pending_rows:
-            reason = self._stale_reason(
-                row,
-                snap=await snap_repo.get(row.mlb_id),
-                cap=await caps_repo.get(row.mlb_id),
-                now=now,
-                price_drift_pct=price_pct,
-                cap_drift_pct=cap_pct,
-                floor_drift_pct=floor_pct,
-                age_days=max_age_days,
-            )
+            # 0. MLB não está ativo (pausado, fechado, ou sem listing) →
+            #    nunca vai ser possível aplicar a promoção.
+            lst_status = listing_status.get(row.mlb_id)
+            if lst_status != "active":
+                reason: str | None = "listing_not_active"
+            else:
+                reason = self._stale_reason(
+                    row,
+                    snap=await snap_repo.get(row.mlb_id),
+                    cap=await caps_repo.get(row.mlb_id),
+                    now=now,
+                    price_drift_pct=price_pct,
+                    cap_drift_pct=cap_pct,
+                    floor_drift_pct=floor_pct,
+                    age_days=max_age_days,
+                )
             if reason is None:
                 continue
             updated = await decisions_repo.expire(row.id, reason=reason)
