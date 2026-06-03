@@ -1099,6 +1099,16 @@ class MLPromoCapORM(Base):
         comment="Override floor price. NULL means use ml_costs_snapshot.sheet_promo_price.",
     )
     auto_apply: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("false"))
+    has_active_promo: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=(
+            "True when ML's seller-promotions API returned a STARTED promo for "
+            "this MLB at the last cap recompute. Authoritative current 'has an "
+            "active promo on ML' signal for the dashboard filter."
+        ),
+    )
     freight_band_opt: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default=text("true")
     )

@@ -78,6 +78,7 @@ class CapOut(BaseModel):
     max_seller_share_pct: Decimal
     margin_floor_price: Decimal | None
     auto_apply: bool
+    has_active_promo: bool = False
     freight_band_opt: bool
     skip_when_winning: bool
     excluded_promo_types: list[str]

@@ -384,8 +384,14 @@ async def recompute_all_caps(
     for sku, snaps in sorted(by_sku.items()):
         for snap in snaps:
             baseline: dict[str, Any] | None = None
+            # None = não buscamos promos nesta run (modo fallback ou snapshot
+            # com erro), então preservamos o has_active_promo anterior no upsert.
+            # True/False só quando o fetch ao vivo aconteceu: baseline != None
+            # ⟺ o ML devolveu uma promo STARTED pra este MLB agora.
+            has_active_promo: bool | None = None
             if service is not None and not snap.fetch_error:
                 baseline = await _fetch_active_baseline_for_mlb(service, snap.mlb_id)
+                has_active_promo = baseline is not None
                 stats["mlbs_fetched_promos"] += 1
             calc = (
                 calc_cap_from_active_promo(snap, baseline)
@@ -409,6 +415,7 @@ async def recompute_all_caps(
                 sku=sku,
                 max_seller_share_pct=calc.cap_pct,
                 margin_floor_price=calc.floor_price,
+                has_active_promo=has_active_promo,
                 notes=calc.reason[:500],
                 updated_by=actor,
             )

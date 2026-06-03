@@ -79,6 +79,7 @@ class MLPromoCapRepository:
         max_seller_share_pct: Decimal,
         margin_floor_price: Decimal | None = None,
         auto_apply: bool | None = None,
+        has_active_promo: bool | None = None,
         freight_band_opt: bool | None = None,
         skip_when_winning: bool | None = None,
         excluded_promo_types: list[str] | None = None,
@@ -103,6 +104,7 @@ class MLPromoCapRepository:
         for k, v in (
             ("margin_floor_price", margin_floor_price),
             ("auto_apply", auto_apply),
+            ("has_active_promo", has_active_promo),
             ("freight_band_opt", freight_band_opt),
             ("skip_when_winning", skip_when_winning),
             ("excluded_promo_types", excluded_promo_types),
