@@ -122,9 +122,27 @@ class FLStockCorrectionService:
         """
         sql = text(
             """
-            SELECT sd.product_tiny_id, p.sku, sd.available::int AS ml_qty
+            SELECT
+                sd.product_tiny_id,
+                p.sku,
+                -- ml_qty efectivo = estoque físico confirmado pelo ML (available +
+                -- in_transfer internos do ML) + unidades que enviamos ao ML mas ele
+                -- ainda não processou (fulfillment_transfers pendentes).
+                -- Isso evita correções falsas quando temos stock "a caminho" para o FL
+                -- que o ML Inventory API ainda não reflete.
+                sd.balance::int
+                + COALESCE(ft_pending.qty_in_transit, 0) AS ml_qty
             FROM stock_deposits sd
             JOIN products p ON p.tiny_id = sd.product_tiny_id
+            LEFT JOIN (
+                SELECT
+                    ft.product_tiny_id,
+                    SUM(ft.quantity - COALESCE(ft.quantity_received, 0))::int AS qty_in_transit
+                FROM fulfillment_transfers ft
+                WHERE ft.status = 'pending'
+                  AND ft.quantity > COALESCE(ft.quantity_received, 0)
+                GROUP BY ft.product_tiny_id
+            ) ft_pending ON ft_pending.product_tiny_id = sd.product_tiny_id
             WHERE sd.deposit_name = :deposit_name
               AND p.situation = 'A'
               AND p.sku IS NOT NULL
