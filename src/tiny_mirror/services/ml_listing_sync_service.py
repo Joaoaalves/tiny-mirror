@@ -70,8 +70,12 @@ class MLListingSyncService:
                 has_variations = bool(item_variations)
 
                 # secure_thumbnail é a URL https; thumbnail é http. Preferimos
-                # a https pra não dar mixed-content no dashboard.
+                # a https pra não dar mixed-content no dashboard. Quando o ML
+                # só devolve a http (acontece no multiget /items), forçamos o
+                # scheme — o host mlstatic.com serve o mesmo path em https.
                 thumbnail = item.get("secure_thumbnail") or item.get("thumbnail") or None
+                if thumbnail and thumbnail.startswith("http://"):
+                    thumbnail = "https://" + thumbnail[len("http://") :]
 
                 listings.append(
                     {
