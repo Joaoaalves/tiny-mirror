@@ -1194,15 +1194,20 @@ async def expire_stale_decisions(
 async def list_decisions(
     status_: Annotated[str | None, Query(alias="status")] = "pending",
     sku: str | None = Query(default=None),
+    constraint_used: str | None = Query(default=None),
     exclude_types: Annotated[list[str] | None, Query()] = None,
     limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(db_session),
 ) -> list[DecisionOut]:
     repo = MLPromoDecisionRepository(session)
+    # "all" (ou vazio) = sem filtro de status — usado pela view "Em andamento",
+    # que cruza por constraint_used (ex.: "started" = campanha já ativa no ML).
+    status_filter = None if status_ in (None, "all", "") else status_
     rows, _ = await repo.list_(
-        status=status_,
+        status=status_filter,
         sku=sku,
+        constraint_used=constraint_used,
         exclude_promo_types=exclude_types,
         limit=limit,
         offset=offset,

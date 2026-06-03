@@ -420,6 +420,7 @@ class MLPromoDecisionRepository:
         *,
         status: str | None = None,
         sku: str | None = None,
+        constraint_used: str | None = None,
         exclude_promo_types: list[str] | None = None,
         limit: int = 200,
         offset: int = 0,
@@ -432,6 +433,9 @@ class MLPromoDecisionRepository:
         if sku is not None:
             q = q.where(MLPromoDecisionORM.sku == sku)
             count_q = count_q.where(MLPromoDecisionORM.sku == sku)
+        if constraint_used is not None:
+            q = q.where(MLPromoDecisionORM.constraint_used == constraint_used)
+            count_q = count_q.where(MLPromoDecisionORM.constraint_used == constraint_used)
         if exclude_promo_types:
             q = q.where(MLPromoDecisionORM.promo_type.notin_(exclude_promo_types))
             count_q = count_q.where(MLPromoDecisionORM.promo_type.notin_(exclude_promo_types))
