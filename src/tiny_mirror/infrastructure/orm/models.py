@@ -954,6 +954,12 @@ class MLListingORM(Base):
     # Full listing price on ML (item.price) — the displayed "preço cheio".
     # Source of truth for the product price; planilha stays for cost/margin.
     price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # MLB ids this listing is LINKED to via ML's item_relations (catalog↔
+    # traditional). Non-empty ⇒ a promo on one applies to both, so the
+    # dashboard acts only on the catalog side. Empty ⇒ independent listings.
+    linked_mlb_ids: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+    )
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

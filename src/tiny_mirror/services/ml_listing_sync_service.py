@@ -77,6 +77,14 @@ class MLListingSyncService:
                 if thumbnail and thumbnail.startswith("http://"):
                     thumbnail = "https://" + thumbnail[len("http://") :]
 
+                # item_relations = vínculo catálogo↔tradicional. Guardamos só
+                # os MLB ids relacionados; vazio = anúncios independentes.
+                linked_mlb_ids = [
+                    rel["id"]
+                    for rel in (item.get("item_relations") or [])
+                    if isinstance(rel, dict) and rel.get("id")
+                ]
+
                 listings.append(
                     {
                         "mlb_id": mlb_id,
@@ -89,6 +97,7 @@ class MLListingSyncService:
                         "thumbnail": thumbnail,
                         "permalink": item.get("permalink") or None,
                         "price": item.get("price"),
+                        "linked_mlb_ids": linked_mlb_ids,
                     }
                 )
 

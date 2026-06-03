@@ -95,6 +95,9 @@ class CapOut(BaseModel):
     # Full listing price on ML (item.price). The displayed "preço cheio" —
     # product price comes from ML, not the planilha.
     ml_list_price: Decimal | None = None
+    # MLB ids linked via ML item_relations (catalog↔traditional). Non-empty
+    # ⇒ a promo on one applies to both; act only on the catalog side.
+    linked_mlb_ids: list[str] = Field(default_factory=list)
     # Joined from ml_costs_snapshot — the pricing inputs the dashboard
     # uses to recompute margin live while editing the cap.
     base_cost: Decimal | None = None
@@ -436,6 +439,7 @@ async def _enrich_cap(
         out.listing_thumbnail = listing.thumbnail
         out.permalink = listing.permalink
         out.ml_list_price = listing.price
+        out.linked_mlb_ids = list(listing.linked_mlb_ids or [])
         out.has_active_listing = listing.status == "active"
     else:
         out.has_active_listing = False
