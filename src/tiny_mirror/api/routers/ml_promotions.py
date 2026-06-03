@@ -1707,35 +1707,57 @@ async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, 
     a view não rastreia diretamente. Pra kits com múltiplos componentes
     (`COM-X`), o momentum sai do componente principal.
 
-    momentum_15v30: ratio (sold_15d/15) / daily_rate. <0.8 caindo,
-    0.8-1.2 estável, ≥1.2 subindo. NULL quando não há baseline (SKU
-    sem vendas no mês). View mv_coverage atualiza a cada 15 min via
-    cron de REFRESH MATERIALIZED VIEW.
+    momentum_15v30: ratio (sold_15d/15) / (sold_30d/30). <0.8 caindo,
+    0.8-1.2 estável, ≥1.2 subindo. NULL quando não houve vendas em 30d.
+
+    Diferente da mv_coverage (que exclui o dia corrente, ``bucket_date <
+    CURRENT_DATE``, p/ não enviesar a velocidade do reabastecimento), aqui
+    contamos sale_buckets **incluindo hoje** — assim uma venda feita hoje
+    já reflete na demanda da aba Promoções (não some até amanhã).
     """
-    # SKUs base — direto da view.
+    # Janela de vendas incluindo o dia corrente (sale_buckets diretos + kit).
+    cov_cte = """
+        WITH cov AS (
+            SELECT sku,
+                sum(quantity_sold) FILTER (
+                    WHERE bucket_date >= CURRENT_DATE - INTERVAL '15 days') AS sold_15d,
+                sum(quantity_sold) FILTER (
+                    WHERE bucket_date >= CURRENT_DATE - INTERVAL '30 days') AS sold_30d
+            FROM sale_buckets
+            WHERE bucket_date >= CURRENT_DATE - INTERVAL '30 days'
+            GROUP BY sku
+        )
+    """
+    # SKUs base — momentum computado da janela acima.
     base_q = await session.execute(
-        text("SELECT sku, momentum_15v30 FROM mv_coverage WHERE momentum_15v30 IS NOT NULL")
+        text(
+            cov_cte
+            + """
+            SELECT sku, round((COALESCE(sold_15d, 0) / 15.0) / (sold_30d / 30.0), 2) AS momentum
+            FROM cov
+            WHERE sold_30d > 0
+            """
+        )
     )
     out: dict[str, float | None] = {sku: float(mom) for sku, mom in base_q.all()}
 
-    # Kits/variantes: pega o momentum do primeiro componente da composição.
-    # Pra kit puro (1 componente) é o próprio base; pra combo (N), a query
-    # ainda devolve um deles — útil como sinal aproximado da demanda.
+    # Kits/variantes: momentum do primeiro componente da composição (mesma
+    # janela incluindo hoje).
     kit_q = await session.execute(
         text(
-            """
-            SELECT DISTINCT ON (p.sku) p.sku, m.momentum_15v30
+            cov_cte
+            + """
+            SELECT DISTINCT ON (p.sku) p.sku,
+                round((COALESCE(c.sold_15d, 0) / 15.0) / (c.sold_30d / 30.0), 2) AS momentum
             FROM product_kit_components kc
             JOIN products p ON p.tiny_id = kc.kit_product_tiny_id
-            JOIN mv_coverage m ON m.sku = kc.component_sku
-            WHERE m.momentum_15v30 IS NOT NULL
+            JOIN cov c ON c.sku = kc.component_sku
+            WHERE c.sold_30d > 0
             ORDER BY p.sku, kc.id
             """
         )
     )
     for kit_sku, mom in kit_q.all():
-        # Não sobrescreve um SKU que já tem momentum próprio (improvável,
-        # mas defensivo — kit puro tem sempre o mesmo valor que o base).
         if kit_sku not in out:
             out[kit_sku] = float(mom)
     return out
