@@ -88,6 +88,7 @@ class MLListingSyncService:
                         "title": (item.get("title") or "")[:500] or None,
                         "thumbnail": thumbnail,
                         "permalink": item.get("permalink") or None,
+                        "price": item.get("price"),
                     }
                 )
 

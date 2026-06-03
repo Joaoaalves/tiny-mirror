@@ -79,6 +79,7 @@ class CapOut(BaseModel):
     margin_floor_price: Decimal | None
     auto_apply: bool
     has_active_promo: bool = False
+    active_promo_price: Decimal | None = None
     freight_band_opt: bool
     skip_when_winning: bool
     excluded_promo_types: list[str]
@@ -91,6 +92,9 @@ class CapOut(BaseModel):
     listing_title: str | None = None
     listing_thumbnail: str | None = None
     permalink: str | None = None
+    # Full listing price on ML (item.price). The displayed "preço cheio" —
+    # product price comes from ML, not the planilha.
+    ml_list_price: Decimal | None = None
     # Joined from ml_costs_snapshot — the pricing inputs the dashboard
     # uses to recompute margin live while editing the cap.
     base_cost: Decimal | None = None
@@ -431,6 +435,7 @@ async def _enrich_cap(
         out.listing_title = listing.title
         out.listing_thumbnail = listing.thumbnail
         out.permalink = listing.permalink
+        out.ml_list_price = listing.price
         out.has_active_listing = listing.status == "active"
     else:
         out.has_active_listing = False

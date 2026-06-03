@@ -951,6 +951,9 @@ class MLListingORM(Base):
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
     thumbnail: Mapped[str | None] = mapped_column(Text, nullable=True)
     permalink: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Full listing price on ML (item.price) — the displayed "preço cheio".
+    # Source of truth for the product price; planilha stays for cost/margin.
+    price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1107,6 +1110,15 @@ class MLPromoCapORM(Base):
             "True when ML's seller-promotions API returned a STARTED promo for "
             "this MLB at the last cap recompute. Authoritative current 'has an "
             "active promo on ML' signal for the dashboard filter."
+        ),
+    )
+    active_promo_price: Mapped[Decimal | None] = mapped_column(
+        Numeric(12, 2),
+        nullable=True,
+        comment=(
+            "Lowest STARTED promo price on the MLB at the last recompute — the "
+            "real current selling price the customer sees. Only meaningful when "
+            "has_active_promo is true; ignore otherwise."
         ),
     )
     freight_band_opt: Mapped[bool] = mapped_column(

@@ -389,9 +389,15 @@ async def recompute_all_caps(
             # True/False só quando o fetch ao vivo aconteceu: baseline != None
             # ⟺ o ML devolveu uma promo STARTED pra este MLB agora.
             has_active_promo: bool | None = None
+            # Menor preço STARTED = preço de venda atual real (o que o cliente
+            # vê). Só gravamos quando há promo ativa; o display ignora quando
+            # has_active_promo é false, então não precisa ser limpo.
+            active_promo_price: Decimal | None = None
             if service is not None and not snap.fetch_error:
                 baseline = await _fetch_active_baseline_for_mlb(service, snap.mlb_id)
                 has_active_promo = baseline is not None
+                if baseline is not None:
+                    active_promo_price = baseline["min_price"]
                 stats["mlbs_fetched_promos"] += 1
             calc = (
                 calc_cap_from_active_promo(snap, baseline)
@@ -416,6 +422,7 @@ async def recompute_all_caps(
                 max_seller_share_pct=calc.cap_pct,
                 margin_floor_price=calc.floor_price,
                 has_active_promo=has_active_promo,
+                active_promo_price=active_promo_price,
                 notes=calc.reason[:500],
                 updated_by=actor,
             )
