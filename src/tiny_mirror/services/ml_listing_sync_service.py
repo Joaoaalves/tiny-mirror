@@ -69,6 +69,10 @@ class MLListingSyncService:
                 item_variations = item.get("variations") or []
                 has_variations = bool(item_variations)
 
+                # secure_thumbnail é a URL https; thumbnail é http. Preferimos
+                # a https pra não dar mixed-content no dashboard.
+                thumbnail = item.get("secure_thumbnail") or item.get("thumbnail") or None
+
                 listings.append(
                     {
                         "mlb_id": mlb_id,
@@ -78,6 +82,8 @@ class MLListingSyncService:
                         "inventory_id": inventory_id if not has_variations else None,
                         "has_variations": has_variations,
                         "title": (item.get("title") or "")[:500] or None,
+                        "thumbnail": thumbnail,
+                        "permalink": item.get("permalink") or None,
                     }
                 )
 

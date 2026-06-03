@@ -88,6 +88,8 @@ class CapOut(BaseModel):
     logistic_type: str | None = None
     listing_status: str | None = None
     listing_title: str | None = None
+    listing_thumbnail: str | None = None
+    permalink: str | None = None
     # Joined from ml_costs_snapshot — the pricing inputs the dashboard
     # uses to recompute margin live while editing the cap.
     base_cost: Decimal | None = None
@@ -426,6 +428,8 @@ async def _enrich_cap(
         out.logistic_type = listing.logistic_type
         out.listing_status = listing.status
         out.listing_title = listing.title
+        out.listing_thumbnail = listing.thumbnail
+        out.permalink = listing.permalink
         out.has_active_listing = listing.status == "active"
     else:
         out.has_active_listing = False

@@ -949,6 +949,8 @@ class MLListingORM(Base):
     inventory_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     has_variations: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    thumbnail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    permalink: Mapped[str | None] = mapped_column(Text, nullable=True)
     synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
