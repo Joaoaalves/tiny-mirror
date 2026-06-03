@@ -1354,10 +1354,12 @@ class MLPromotionService:
             "stale_age": 0,
             "listing_not_active": 0,
             "campaign_ended": 0,
+            "dominated_by_active_promo": 0,
         }
         expired_total = 0
 
         for row in pending_rows:
+            cap = await caps_repo.get(row.mlb_id)
             # 0. MLB não está ativo (pausado, fechado, ou sem listing) →
             #    nunca vai ser possível aplicar a promoção.
             lst_status = listing_status.get(row.mlb_id)
@@ -1366,11 +1368,23 @@ class MLPromotionService:
             # 0b. Campanha com data de término já passou → decisão obsoleta.
             elif row.promo_finish_date is not None and row.promo_finish_date < now:
                 reason = "campaign_ended"
+            # 0c. Já existe promoção ativa no ML a um preço <= ao alvo desta
+            #     sugestão → aprovar não melhora nada (na verdade pioraria).
+            #     active_promo_price é gravado pelo recompute a partir da
+            #     menor promo STARTED no ML.
+            elif (
+                cap is not None
+                and cap.has_active_promo
+                and cap.active_promo_price is not None
+                and row.target_price is not None
+                and row.target_price >= cap.active_promo_price - Decimal("0.01")
+            ):
+                reason = "dominated_by_active_promo"
             else:
                 reason = self._stale_reason(
                     row,
                     snap=await snap_repo.get(row.mlb_id),
-                    cap=await caps_repo.get(row.mlb_id),
+                    cap=cap,
                     now=now,
                     price_drift_pct=price_pct,
                     cap_drift_pct=cap_pct,
@@ -1949,6 +1963,16 @@ def enumerate_activations_for_item(
     if not promos or list_price is None or list_price <= 0:
         return []
     excluded = set(excluded_types)
+    # Menor preço STARTED = preço de venda atual no ML. Um candidato cujo alvo
+    # não fica abaixo disso não melhora o preço pro cliente — não deve virar
+    # decisão pendente (é ruído, ex.: DEAL sugerido a R$475 com promo ativa a
+    # R$369). Suprimimos esses como "denied" (vão pra ignored, não pra fila).
+    _started_prices = [
+        float(p["price"])
+        for p in promos
+        if (p.get("status") or "").lower() == "started" and p.get("price") and float(p["price"]) > 0
+    ]
+    best_started_price = min(_started_prices) if _started_prices else None
     out: list[dict[str, Any]] = []
     for p in promos:
         if p.get("type") in excluded:
@@ -2012,6 +2036,28 @@ def enumerate_activations_for_item(
             # silencioso — não temos como julgar.
             continue
         accepted = scored.get("accepted", False)
+        # Dominado por promo ativa mais barata → rebaixa pra denied. Evita
+        # sugerir/ativar um preço pior do que o anúncio já pratica.
+        target_price = scored.get("target_price")
+        if (
+            accepted
+            and best_started_price is not None
+            and target_price is not None
+            and float(target_price) >= best_started_price - 0.01
+        ):
+            accepted = False
+            scored = {
+                **scored,
+                "accepted": False,
+                "denied_reason": (
+                    f"dominated_by_active: alvo R$ {float(target_price):.2f} "
+                    f">= ativa R$ {best_started_price:.2f}"
+                ),
+                "reason": (
+                    f"Já há promoção ativa mais barata (R$ {best_started_price:.2f}); "
+                    f"esta sugestão (R$ {float(target_price):.2f}) não melhora o preço"
+                ),
+            }
         # score_candidate_promo already writes the human PT reason for
         # both accepted and denied entries; denied_reason carries the
         # English machine code separately. Nothing to reshape here.
