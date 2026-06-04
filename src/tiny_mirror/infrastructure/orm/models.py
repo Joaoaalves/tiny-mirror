@@ -1375,6 +1375,10 @@ class MLPromoDecisionORM(Base):
     list_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     cap_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
     floor_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Faixa de preço permitida pelo ML para promos de INTERVALO (DEAL/DOD/…).
+    # NULL para preço fixo (SMART/fixed_percentage). Apenas informativo na UI.
+    min_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    max_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(
         String(20),

@@ -217,6 +217,8 @@ class DecisionOut(BaseModel):
     list_price: Decimal | None
     cap_pct: Decimal | None
     floor_price: Decimal | None
+    min_price: Decimal | None = None
+    max_price: Decimal | None = None
     reason: str
     status: str
     created_at: datetime
@@ -1765,3 +1767,36 @@ async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, 
         if kit_sku not in out:
             out[kit_sku] = float(mom)
     return out
+
+
+@router.get("/sales-daily")
+async def sales_daily(
+    sku: str = Query(..., description="SKU do produto"),
+    days: int = Query(default=30, ge=1, le=120),
+    session: AsyncSession = Depends(db_session),
+) -> list[dict[str, Any]]:
+    """Série diária de vendas (sale_buckets) dos últimos ``days`` dias para um
+    SKU, incluindo o dia atual e preenchendo dias sem venda com 0. Usado pelo
+    gráfico de vendas na aba Promoções."""
+    rows = await session.execute(
+        text(
+            """
+            SELECT d::date AS day, COALESCE(s.qty, 0)::int AS qty
+            FROM generate_series(
+                CURRENT_DATE - ((:days - 1) * INTERVAL '1 day'),
+                CURRENT_DATE,
+                INTERVAL '1 day'
+            ) d
+            LEFT JOIN (
+                SELECT bucket_date, SUM(quantity_sold) AS qty
+                FROM sale_buckets
+                WHERE sku = :sku
+                  AND bucket_date >= CURRENT_DATE - ((:days - 1) * INTERVAL '1 day')
+                GROUP BY bucket_date
+            ) s ON s.bucket_date = d::date
+            ORDER BY day
+            """
+        ),
+        {"sku": sku, "days": days},
+    )
+    return [{"date": r[0].isoformat(), "qty": int(r[1])} for r in rows.all()]

@@ -1259,6 +1259,8 @@ class MLPromotionService:
                         reason=entry.get("reason") or "",
                         status=db_status,
                         promo_finish_date=finish_dt,
+                        min_price=_to_dec(entry.get("min_price")),
+                        max_price=_to_dec(entry.get("max_price")),
                     )
                     if inserted is not None:
                         if decision_kind == "would_activate":
@@ -1802,6 +1804,8 @@ def score_candidate_promo(
                 "structure_type": "INTERVAL",
                 "is_fixed_price": False,
                 "exposure_boost": exposure_boost,
+                "min_price": round(min_f, 2),
+                "max_price": round(upper, 2),
             }
 
         # Prefer ML's suggested price when it lies inside our band.
@@ -1842,6 +1846,8 @@ def score_candidate_promo(
             "structure_type": "INTERVAL",
             "is_fixed_price": False,
             "exposure_boost": exposure_boost,
+            "min_price": round(min_f, 2),
+            "max_price": round(upper, 2),
         }
 
     # 2b. suggested_discounted_price only (no min/max published).
