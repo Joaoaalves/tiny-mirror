@@ -1800,3 +1800,35 @@ async def sales_daily(
         {"sku": sku, "days": days},
     )
     return [{"date": r[0].isoformat(), "qty": int(r[1])} for r in rows.all()]
+
+
+@router.get("/sales-daily-all")
+async def sales_daily_all(
+    days: int = Query(default=30, ge=1, le=120),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, list[int]]:
+    """Série diária de vendas (sale_buckets) dos últimos ``days`` dias para
+    TODOS os SKUs com vendas, como ``{sku: [qty_dia_mais_antigo … hoje]}``.
+    Um único request alimenta os sparklines de vendas no header dos cards.
+    SKUs sem venda não aparecem (sparkline some)."""
+    from datetime import date, timedelta
+
+    rows = await session.execute(
+        text(
+            """
+            SELECT sku, bucket_date, SUM(quantity_sold)::int AS qty
+            FROM sale_buckets
+            WHERE bucket_date >= CURRENT_DATE - ((:days - 1) * INTERVAL '1 day')
+            GROUP BY sku, bucket_date
+            """
+        ),
+        {"days": days},
+    )
+    start = date.today() - timedelta(days=days - 1)
+    out: dict[str, list[int]] = {}
+    for sku, bdate, qty in rows.all():
+        arr = out.setdefault(sku, [0] * days)
+        idx = (bdate - start).days
+        if 0 <= idx < days:
+            arr[idx] += int(qty)
+    return out
