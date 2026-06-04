@@ -120,6 +120,7 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_catalog_status_sync": CronTrigger.from_crontab(
                 settings.sync_ml_catalog_status_cron, timezone="UTC"
             ),
+            "ml_sales_sync": CronTrigger.from_crontab(settings.sync_ml_sales_cron, timezone="UTC"),
         }
     except ValueError as exc:
         logger.critical(
@@ -188,6 +189,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_catalog_status_sync() -> None:
         await ml_catalog_status_sync_job(http_client, app.state.ml_token_service)
+
+    async def _ml_sales_sync() -> None:
+        await ml_sales_sync_job(http_client, app.state.ml_token_service)
 
     scheduler.add_job(
         _token_rotation,
@@ -295,6 +299,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_promo_recompute,
         trigger=triggers["ml_promo_recompute"],
         id="ml_promo_recompute",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_sales_sync,
+        trigger=triggers["ml_sales_sync"],
+        id="ml_sales_sync",
         replace_existing=True,
     )
 
@@ -811,6 +821,27 @@ async def ml_catalog_status_sync_job(http_client: Any, ml_token_service: Any) ->
     async with AsyncSessionLocal() as session:
         stats = await service.refresh_all(session)
     logger.info("ML catalog status sync job completed", **stats)
+
+
+async def ml_sales_sync_job(http_client: Any, ml_token_service: Any) -> None:
+    """Daily: refresh ``ml_sales_daily`` (vendas por anúncio, só ML) da ML
+    Orders API. Janela curta (settings.sync_ml_sales_window_days) pra pegar
+    pedidos novos e confirmações tardias. No-op sem credenciais ML."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML sales sync skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.ml_sales_sync_service import MLSalesSyncService
+
+    logger.info("ML sales sync job started")
+    service = MLSalesSyncService(
+        token_service=ml_token_service,
+        http_client=http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+    stats = await service.backfill(days=settings.sync_ml_sales_window_days)
+    logger.info("ML sales sync job completed", **stats)
 
 
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:

@@ -189,6 +189,12 @@ class Settings(BaseSettings):
     # recompute so the analyze endpoint always uses fresh catalog data.
     sync_ml_catalog_status_cron: str = "30 4 * * *"
 
+    # Daily job that refreshes ml_sales_daily (vendas por anúncio, só ML) da
+    # ML Orders API. Janela curta (últimos dias) pra pegar pedidos novos e
+    # confirmações tardias; o backfill completo é manual.
+    sync_ml_sales_cron: str = "0 4 * * *"
+    sync_ml_sales_window_days: int = 7
+
     # Controle 4.0 GAS Web App. Single deployment URL with action routing:
     #   ?action=manual_status         → SKU color tags from GERAL B+C
     #   ?action=costs_all             → bulk dump of every MLB cost row
