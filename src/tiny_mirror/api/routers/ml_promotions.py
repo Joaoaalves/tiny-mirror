@@ -1705,68 +1705,34 @@ async def reprice_listing(
 
 @router.get("/trends", response_model=dict[str, float | None])
 async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, float | None]:
-    """Retorna ``{sku: momentum_15v30}`` para todos os SKUs com vendas.
+    """Retorna ``{baseSku: momentum}`` — demanda por SKU base, só Mercado
+    Livre (ml_sales_daily), com janela de 90 dias pra uma tendência mais
+    verdadeira (menos ruidosa que 30d).
 
-    Inclui SKUs base (próprios em mv_coverage) e também kits/combos
-    cujo componente único tem momentum — assim a aba Decisões consegue
-    mostrar tendência mesmo pros SKUs como `10U-FOO` ou `COM-BAR` que
-    a view não rastreia diretamente. Pra kits com múltiplos componentes
-    (`COM-X`), o momentum sai do componente principal.
-
-    momentum_15v30: ratio (sold_15d/15) / (sold_30d/30). <0.8 caindo,
-    0.8-1.2 estável, ≥1.2 subindo. NULL quando não houve vendas em 30d.
-
-    Diferente da mv_coverage (que exclui o dia corrente, ``bucket_date <
-    CURRENT_DATE``, p/ não enviesar a velocidade do reabastecimento), aqui
-    contamos sale_buckets **incluindo hoje** — assim uma venda feita hoje
-    já reflete na demanda da aba Promoções (não some até amanhã).
-    """
-    # Janela de vendas incluindo o dia corrente (sale_buckets diretos + kit).
-    cov_cte = """
-        WITH cov AS (
-            SELECT sku,
-                sum(quantity_sold) FILTER (
-                    WHERE bucket_date >= CURRENT_DATE - INTERVAL '15 days') AS sold_15d,
-                sum(quantity_sold) FILTER (
-                    WHERE bucket_date >= CURRENT_DATE - INTERVAL '30 days') AS sold_30d
-            FROM sale_buckets
-            WHERE bucket_date >= CURRENT_DATE - INTERVAL '30 days'
-            GROUP BY sku
-        )
-    """
-    # SKUs base — momentum computado da janela acima.
-    base_q = await session.execute(
+    momentum = (vendas 30d / 30) / (vendas 90d / 90): a velocidade do último
+    mês vs. a média dos 3 meses. >1.2 acelerando, 0.8-1.2 estável, <0.8
+    desacelerando. Ausente quando não houve venda em 90d. Agrupa todos os
+    anúncios do SKU base (kit ``NU-X`` cai em ``X``; combos ``COM-…`` ficam
+    como estão e aparecem se tiverem venda)."""
+    rows = await session.execute(
         text(
-            cov_cte
-            + """
-            SELECT sku, round((COALESCE(sold_15d, 0) / 15.0) / (sold_30d / 30.0), 2) AS momentum
+            """
+            WITH cov AS (
+                SELECT regexp_replace(sku, '^[0-9]+U-', '') AS base_sku,
+                    SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - INTERVAL '30 days') AS s30,
+                    SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - INTERVAL '90 days') AS s90
+                FROM ml_sales_daily
+                WHERE sale_date >= CURRENT_DATE - INTERVAL '90 days'
+                  AND sku IS NOT NULL AND sku <> ''
+                GROUP BY 1
+            )
+            SELECT base_sku, round((COALESCE(s30, 0) / 30.0) / (s90 / 90.0), 2) AS momentum
             FROM cov
-            WHERE sold_30d > 0
+            WHERE s90 > 0
             """
         )
     )
-    out: dict[str, float | None] = {sku: float(mom) for sku, mom in base_q.all()}
-
-    # Kits/variantes: momentum do primeiro componente da composição (mesma
-    # janela incluindo hoje).
-    kit_q = await session.execute(
-        text(
-            cov_cte
-            + """
-            SELECT DISTINCT ON (p.sku) p.sku,
-                round((COALESCE(c.sold_15d, 0) / 15.0) / (c.sold_30d / 30.0), 2) AS momentum
-            FROM product_kit_components kc
-            JOIN products p ON p.tiny_id = kc.kit_product_tiny_id
-            JOIN cov c ON c.sku = kc.component_sku
-            WHERE c.sold_30d > 0
-            ORDER BY p.sku, kc.id
-            """
-        )
-    )
-    for kit_sku, mom in kit_q.all():
-        if kit_sku not in out:
-            out[kit_sku] = float(mom)
-    return out
+    return {base_sku: float(mom) for base_sku, mom in rows.all()}
 
 
 @router.get("/sales-daily")
@@ -1802,32 +1768,84 @@ async def sales_daily(
     return [{"date": r[0].isoformat(), "qty": int(r[1])} for r in rows.all()]
 
 
+@router.post("/sync/ml-sales")
+async def sync_ml_sales(
+    days: int = Query(default=90, ge=1, le=180),
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Reconstrói ml_sales_daily (vendas por anúncio, só ML) dos últimos
+    ``days`` dias, buscando da ML Orders API. Síncrono (~1-2 min p/ 90d)."""
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.ml_sales_sync_service import MLSalesSyncService
+
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    if ml_token_service is None:
+        raise HTTPException(status_code=503, detail="ML token service not configured")
+    svc = MLSalesSyncService(
+        token_service=ml_token_service,
+        http_client=request.app.state.http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+    return await svc.backfill(days=days)
+
+
 @router.get("/sales-daily-all")
 async def sales_daily_all(
-    days: int = Query(default=30, ge=1, le=120),
+    days: int = Query(default=90, ge=1, le=180),
     session: AsyncSession = Depends(db_session),
 ) -> dict[str, list[int]]:
-    """Série diária de vendas (sale_buckets) dos últimos ``days`` dias para
-    TODOS os SKUs com vendas, como ``{sku: [qty_dia_mais_antigo … hoje]}``.
-    Um único request alimenta os sparklines de vendas no header dos cards.
-    SKUs sem venda não aparecem (sparkline some)."""
+    """Série diária de vendas (Mercado Livre, ml_sales_daily) dos últimos
+    ``days`` dias, agrupada por **SKU base** (soma todos os anúncios do SKU;
+    kit ``NU-X`` cai em ``X``). ``{baseSku: [qty_antigo … hoje]}``. Alimenta o
+    sparkline de vendas no header do card."""
     from datetime import date, timedelta
 
     rows = await session.execute(
         text(
             """
-            SELECT sku, bucket_date, SUM(quantity_sold)::int AS qty
-            FROM sale_buckets
-            WHERE bucket_date >= CURRENT_DATE - ((:days - 1) * INTERVAL '1 day')
-            GROUP BY sku, bucket_date
+            SELECT regexp_replace(sku, '^[0-9]+U-', '') AS base_sku, sale_date, SUM(qty)::int AS qty
+            FROM ml_sales_daily
+            WHERE sale_date >= CURRENT_DATE - ((:days - 1) * INTERVAL '1 day')
+              AND sku IS NOT NULL AND sku <> ''
+            GROUP BY 1, sale_date
             """
         ),
         {"days": days},
     )
     start = date.today() - timedelta(days=days - 1)
     out: dict[str, list[int]] = {}
-    for sku, bdate, qty in rows.all():
-        arr = out.setdefault(sku, [0] * days)
+    for base_sku, bdate, qty in rows.all():
+        arr = out.setdefault(base_sku, [0] * days)
+        idx = (bdate - start).days
+        if 0 <= idx < days:
+            arr[idx] += int(qty)
+    return out
+
+
+@router.get("/sales-daily-mlb")
+async def sales_daily_mlb(
+    days: int = Query(default=90, ge=1, le=180),
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, list[int]]:
+    """Série diária de vendas (Mercado Livre) por **anúncio (MLB)** dos
+    últimos ``days`` dias. ``{mlb_id: [qty_antigo … hoje]}``. Alimenta o
+    gráfico de vendas por anúncio na visão expandida."""
+    from datetime import date, timedelta
+
+    rows = await session.execute(
+        text(
+            """
+            SELECT mlb_id, sale_date, qty
+            FROM ml_sales_daily
+            WHERE sale_date >= CURRENT_DATE - ((:days - 1) * INTERVAL '1 day')
+            """
+        ),
+        {"days": days},
+    )
+    start = date.today() - timedelta(days=days - 1)
+    out: dict[str, list[int]] = {}
+    for mlb, bdate, qty in rows.all():
+        arr = out.setdefault(mlb, [0] * days)
         idx = (bdate - start).days
         if 0 <= idx < days:
             arr[idx] += int(qty)

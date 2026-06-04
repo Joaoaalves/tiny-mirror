@@ -1079,6 +1079,31 @@ class MLListingVariationORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_sales_daily
+# ---------------------------------------------------------------------------
+class MLSalesDailyORM(Base):
+    __tablename__ = "ml_sales_daily"
+    __table_args__ = (
+        Index("ix_ml_sales_daily_sku", "sku"),
+        Index("ix_ml_sales_daily_date", "sale_date"),
+        {
+            "comment": (
+                "Vendas diárias por anúncio (MLB) no Mercado Livre, da ML Orders "
+                "API. Fonte da demanda e dos gráficos (por SKU base e por anúncio)."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    sale_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    qty: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------
 class MLPromoCapORM(Base):
