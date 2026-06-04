@@ -93,7 +93,10 @@ class MLSalesSyncService:
         logger.info("ml_sales backfill started", days=days)
         today = datetime.now(UTC).date()
         start = today - timedelta(days=days - 1)
-        rows: list[dict[str, Any]] = []
+        # Agrega globalmente por (mlb, dia) — a data do pedido pode cair fora da
+        # janela do dia buscado (fuso), então a mesma chave pode aparecer em
+        # dois dias; somamos pra não duplicar no upsert.
+        total_agg: dict[tuple[str, date], dict[str, Any]] = {}
         days_done = 0
         for i in range(days):
             day = start + timedelta(days=i)
@@ -102,9 +105,17 @@ class MLSalesSyncService:
             except Exception as exc:  # pragma: no cover — network noise
                 logger.warning("ml_sales day failed", day=day.isoformat(), error=str(exc))
                 continue
-            for (mlb, odate), v in agg.items():
-                rows.append({"mlb_id": mlb, "sale_date": odate, "sku": v["sku"], "qty": v["qty"]})
+            for key, v in agg.items():
+                cur = total_agg.setdefault(key, {"qty": 0, "sku": None})
+                cur["qty"] += v["qty"]
+                if not cur["sku"]:
+                    cur["sku"] = v["sku"]
             days_done += 1
+        rows: list[dict[str, Any]] = [
+            {"mlb_id": mlb, "sale_date": odate, "sku": v["sku"], "qty": v["qty"]}
+            for (mlb, odate), v in total_agg.items()
+            if odate >= start
+        ]
 
         # Substitui a janela inteira em uma transação (idempotente).
         async with AsyncSessionLocal() as session:
