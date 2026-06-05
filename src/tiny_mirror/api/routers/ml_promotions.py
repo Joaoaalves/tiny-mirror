@@ -1703,36 +1703,88 @@ async def reprice_listing(
     return {"exit": exit_result, "enter": enter_result}
 
 
+# ── Tendência robusta (sem ML) ────────────────────────────────────────────────
+# Dois ruídos atrapalham um momentum simples (taxa 30d / taxa 90d):
+#   1. Volume baixo: 2 vendas em 90d viram "+50% subindo forte" — é só acaso.
+#   2. Pico num único dia: uma venda absurda num dia (lançamento/promo) infla a
+#      base 90d e faz o resto parecer "caindo forte", ou — se o pico for recente
+#      — "subindo forte". É um outlier, não tendência.
+# Tratamento: (a) só calculamos tendência com volume mínimo e vendas em dias
+# suficientes; (b) winsorizamos cada dia num teto robusto (3x a mediana dos dias
+# com venda) antes de comparar — o pico vira um dia normal e a curva fala.
+_TREND_MIN_UNITS = 10  # < isso em 90d: amostra fraca demais p/ tendência
+_TREND_MIN_ACTIVE_DAYS = 5  # vendas em < 5 dias distintos: idem
+
+
+def _robust_momentum(daily: list[int]) -> float:
+    """``daily`` = 90 valores (mais antigo -> mais recente). Retorna um momentum
+    em torno de 1.0 (estável). Pipeline robusto, sem ML:
+
+      1. Gate de volume: < 10 un OU < 5 dias com venda -> 1.0 (amostra fraca).
+      2. Winsoriza cada dia num teto (3x a mediana dos dias com venda) -> uma
+         venda absurda num único dia vira um dia normal e não distorce a base.
+      3. Agrega em 13 semanas (suaviza o agrupamento dia-a-dia, que faz a janela
+         de 30d pegar/perder "clusters" e gerar falso sinal).
+      4. raw = ritmo das 4 semanas recentes / média semanal.
+      5. Encolhe ``raw`` para 1.0 conforme a tendência é INCONSISTENTE: confiança
+         = concordância de sinal dos slopes par-a-par das semanas (ruído ~0.5 de
+         concordância -> confiança 0; tendência limpa -> ~1). Aplicada ao
+         quadrado (variância) -> ruído some, tendência real passa intacta."""
+    total = sum(daily)
+    active = sum(1 for x in daily if x > 0)
+    if total < _TREND_MIN_UNITS or active < _TREND_MIN_ACTIVE_DAYS:
+        return 1.0  # baixo giro -> estável (honesto: não dá pra inferir)
+    nonzero = sorted(x for x in daily if x > 0)
+    cap = max(nonzero[len(nonzero) // 2] * 3, 2)  # teto robusto: neutraliza o pico
+    w = [min(x, cap) for x in daily]
+    weeks = [sum(w[i : i + 7]) for i in range(0, 90, 7)]  # 13 sem, antigo -> recente
+    base = sum(weeks) / len(weeks)
+    if base <= 0:
+        return 1.0
+    raw = (sum(weeks[-4:]) / 4) / base
+    slopes = [weeks[j] - weeks[i] for i in range(len(weeks)) for j in range(i + 1, len(weeks))]
+    nz = [s for s in slopes if s != 0]
+    if nz:
+        agree = max(sum(s > 0 for s in nz), sum(s < 0 for s in nz)) / len(nz)
+        conf = max(0.0, (agree - 0.5) * 2)
+    else:
+        conf = 0.0
+    return round(1.0 + (raw - 1.0) * conf**2, 2)
+
+
 @router.get("/trends", response_model=dict[str, float | None])
 async def list_trends(session: AsyncSession = Depends(db_session)) -> dict[str, float | None]:
     """Retorna ``{baseSku: momentum}`` — demanda por SKU base, só Mercado
-    Livre (ml_sales_daily), com janela de 90 dias pra uma tendência mais
-    verdadeira (menos ruidosa que 30d).
+    Livre (ml_sales_daily), janela de 90 dias.
 
-    momentum = (vendas 30d / 30) / (vendas 90d / 90): a velocidade do último
-    mês vs. a média dos 3 meses. >1.2 acelerando, 0.8-1.2 estável, <0.8
-    desacelerando. Ausente quando não houve venda em 90d. Agrupa todos os
-    anúncios do SKU base (kit ``NU-X`` cai em ``X``; combos ``COM-…`` ficam
-    como estão e aparecem se tiverem venda)."""
+    momentum robusto (ver ``_robust_momentum``): taxa diária dos últimos 30d vs.
+    a média 90d, sobre a série winsorizada (resiste a pico de um dia) e só quando
+    há volume mínimo (>= 10 un em >= 5 dias) — senão 1.0 (estável). Agrupa todos
+    os anúncios do SKU base (kit ``NU-X`` cai em ``X``; combos ``COM-…`` ficam
+    como estão). Ausente quando não houve venda em 90d."""
+    from datetime import date as _date
+    from datetime import timedelta as _td
+
     rows = await session.execute(
         text(
             """
-            WITH cov AS (
-                SELECT regexp_replace(sku, '^[0-9]+U-', '') AS base_sku,
-                    SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - INTERVAL '30 days') AS s30,
-                    SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - INTERVAL '90 days') AS s90
-                FROM ml_sales_daily
-                WHERE sale_date >= CURRENT_DATE - INTERVAL '90 days'
-                  AND sku IS NOT NULL AND sku <> ''
-                GROUP BY 1
-            )
-            SELECT base_sku, round((COALESCE(s30, 0) / 30.0) / (s90 / 90.0), 2) AS momentum
-            FROM cov
-            WHERE s90 > 0
+            SELECT regexp_replace(sku, '^[0-9]+U-', '') AS base_sku,
+                   sale_date, SUM(qty)::int AS qty
+            FROM ml_sales_daily
+            WHERE sale_date >= CURRENT_DATE - INTERVAL '89 days'
+              AND sku IS NOT NULL AND sku <> ''
+            GROUP BY 1, sale_date
             """
         )
     )
-    return {base_sku: float(mom) for base_sku, mom in rows.all()}
+    start = _date.today() - _td(days=89)
+    series: dict[str, list[int]] = {}
+    for base_sku, sale_date, qty in rows.all():
+        arr = series.setdefault(base_sku, [0] * 90)
+        idx = (sale_date - start).days
+        if 0 <= idx < 90:
+            arr[idx] += int(qty)
+    return {base_sku: _robust_momentum(daily) for base_sku, daily in series.items()}
 
 
 @router.get("/sales-daily")
