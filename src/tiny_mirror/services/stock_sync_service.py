@@ -461,17 +461,41 @@ class StockSyncService:
                 return
 
             # Logistic-type guard: only create a pending transfer when the
-            # SKU has at least one ml_listings row with
-            # logistic_type='fulfillment'. Otherwise we'd be queuing a
-            # transfer that ML will never confirm (xd_drop_off products are
-            # shipped directly by the seller — no INBOUND_RECEPTION event)
-            # and that distorts coverage math until manually cancelled.
-            # SKUs absent from ml_listings entirely (typically kit
-            # components) keep the previous behaviour — we don't know
-            # which kit's MLB drives them, so we still record and let the
-            # operator review.
+            # SKU is itself shipped to FL via Mercado Livre. Two cases skip:
+            #
+            #   1. any_rows == 0 (zero ml_listings, i.e. a SKU that is
+            #      ONLY a kit-component, never sold standalone). Tiny
+            #      explodes a kit's T entry into per-component deltas on
+            #      every deposit, so the same physical shipment fires a
+            #      webhook for the kit AND each component. The kit's
+            #      webhook is the canonical record; the component
+            #      webhooks would create phantom transfers double-
+            #      counting the same units. Audit 2026-06-05 found 66
+            #      phantom units on SLF-KITDISPLPDEN-PR alone (3 kit
+            #      shipments x 2 components each = 6 phantom rows).
+            #
+            #   2. any_rows > 0 AND fl_rows == 0 (SKU is on ML but ONLY
+            #      as xd_drop_off — seller ships directly, no
+            #      INBOUND_RECEPTION ever fires). Persisting these
+            #      transfers strands them as pending forever.
+            #
+            # NOTE: a kit-component SKU whose PARENT KIT has a fulfillment
+            # listing is still skipped here today (kit's webhook creates
+            # the canonical row). Bug 4 (TODO 2026-06-05) will revisit the
+            # case where a SKU's parent kits are the only FL channel.
             fl_rows, any_rows = await MLListingRepository(session).sku_logistic_status(sku)
-            if any_rows > 0 and fl_rows == 0:
+            if any_rows == 0:
+                logger.info(
+                    "FL positive delta detected but SKU has no ml_listings "
+                    "at all — skipping (component-only SKU; kit webhook "
+                    "is the canonical transfer record)",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    fl_delta=fl_delta,
+                    new_tiny_fl_qty=new_tiny_fl_qty,
+                )
+                return
+            if fl_rows == 0:
                 logger.info(
                     "FL positive delta detected but SKU has no fulfillment "
                     "listing on ML — skipping transfer (would never reconcile)",

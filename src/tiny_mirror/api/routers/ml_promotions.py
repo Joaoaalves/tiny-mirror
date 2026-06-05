@@ -1711,6 +1711,76 @@ async def exit_promotion_endpoint(
     return result
 
 
+class ModifyPromoIn(BaseModel):
+    mlb_id: str
+    new_price: Decimal = Field(gt=0)
+    promo_id: str | None = None
+    promo_type: str = "PRICE_DISCOUNT"
+    current_price: Decimal | None = None
+    decided_by: str | None = None
+
+
+@router.post("/modify-promotion")
+async def modify_promotion_endpoint(
+    body: ModifyPromoIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Altera o preço de uma promoção JÁ inscrita, sem sair dela (in-place).
+
+    Espelha o "Alterar" nativo do ML: só permite BAIXAR o preço. Para subir, o
+    operador precisa sair (``/exit-promotion``) e reentrar. A regra de só-baixar
+    é reforçada aqui (422 se ``new_price >= current_price``) além do front."""
+    from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
+
+    if body.current_price is not None and body.new_price >= body.current_price - Decimal("0.005"):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Alterar só permite BAIXAR o preço. Para subir, use "
+                "'Deixar de participar' e entre de novo no valor correto."
+            ),
+        )
+
+    result = await service.modify_promotion(
+        mlb_id=body.mlb_id,
+        deal_price=float(body.new_price),
+        promotion_id=body.promo_id,
+        promotion_type=body.promo_type,
+    )
+    sc = result.get("status_code")
+    if sc is not None and sc >= 400:
+        raise HTTPException(
+            status_code=sc if sc < 600 else 502,
+            detail={"step": "modify", "response": result.get("response")},
+        )
+
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    ctx = await _build_decision_context(
+        session,
+        mlb_id=body.mlb_id,
+        sku=sku,
+        price_after=float(body.new_price),
+        floor_price=float(cap.margin_floor_price) if cap and cap.margin_floor_price else None,
+    )
+    action_repo = MLPromoActionRepository(session)
+    await action_repo.log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="modify_promotion",
+        promo_type=body.promo_type,
+        price_after=body.new_price,
+        reason="alterar promoção inscrita: baixou o preço sem sair",
+        ml_response=result,
+        dry_run=False,
+        decided_by=body.decided_by,
+        context=ctx,
+    )
+    await session.commit()
+    return result
+
+
 @router.get("/catalog-competitors")
 async def catalog_competitors(
     mlb_id: str = Query(..., description="MLB do anúncio de catálogo"),

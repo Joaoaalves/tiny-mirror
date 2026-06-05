@@ -736,6 +736,52 @@ class MLPromotionService:
         except Exception as exc:
             return {"status_code": None, "response": str(exc)}
 
+    async def modify_promotion(
+        self,
+        *,
+        mlb_id: str,
+        deal_price: float,
+        promotion_id: str | None = None,
+        promotion_type: str = "PRICE_DISCOUNT",
+    ) -> dict[str, Any]:
+        """Altera o preço de uma promoção JÁ inscrita, sem sair dela.
+
+        Re-envia ``POST /seller-promotions/items/{mlb_id}`` com o mesmo
+        ``promotion_id`` e ``promotion_type``, mudando só o ``deal_price``. O ML
+        trata o POST como idempotente por (anúncio, promoção) — atualiza o preço
+        no lugar, preservando a vaga na campanha. Espelha o "Alterar" nativo do
+        ML, que só permite BAIXAR o preço; subir exige sair e reentrar (a regra
+        de só-baixar é validada no front antes de chamar este método)."""
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        body: dict[str, Any] = {
+            "promotion_type": promotion_type,
+            "deal_price": deal_price,
+        }
+        if promotion_id is not None:
+            body["promotion_id"] = promotion_id
+        try:
+            resp = await self._http.post(
+                url,
+                params={"app_version": "v2"},
+                json=body,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+            )
+            if resp.status_code == 401:
+                token = await self._token_service.handle_unauthorized()
+                resp = await self._http.post(
+                    url,
+                    params={"app_version": "v2"},
+                    json=body,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30.0,
+                )
+            content = resp.json() if resp.content else {}
+            return {"status_code": resp.status_code, "response": content}
+        except Exception as exc:
+            return {"status_code": None, "response": str(exc)}
+
     # -- ML promotions ----------------------------------------------------
     async def fetch_eligible_promos(self, mlb_id: str) -> list[dict[str, Any]]:
         token = await self._token_service.get_valid_access_token()

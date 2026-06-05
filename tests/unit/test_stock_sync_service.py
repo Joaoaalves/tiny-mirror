@@ -702,16 +702,24 @@ async def test_webhook_transfer_skips_when_sku_not_fulfillment_on_ml(
 @patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
 @patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
 @patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
-async def test_webhook_transfer_records_when_sku_absent_from_ml_listings(
+async def test_webhook_transfer_skips_when_sku_absent_from_ml_listings(
     mock_session_local: MagicMock,
     mock_snapshot_repo_cls: MagicMock,
     mock_transfer_repo_cls: MagicMock,
     mock_ml_listing_repo_cls: MagicMock,
     stock_service: StockSyncService,
 ) -> None:
-    """SKU has zero ml_listings rows (e.g. kit component sold via parent
-    kit's MLB). We don't know whether reconciliation is possible, so we
-    still record and let the reception scan / operator decide later."""
+    """Bug 5 fix (2026-06-05): SKU with zero ml_listings rows is a
+    component-only SKU (never sold standalone). Tiny explodes a kit's T
+    entry into per-component deltas, so the same physical shipment fires
+    a webhook for the kit AND each component. The kit's webhook is the
+    canonical record; recording the component's webhook double-counts.
+
+    Before 2026-06-05 this branch RECORDED the transfer ("we don't know,
+    let operator decide later"); audit found 66 phantom units across the
+    SLF-KITDISPLPDEN-PR components alone. The component webhook is now
+    skipped; the kit's webhook remains the source of truth.
+    """
     mock_session = AsyncMock()
     mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
@@ -732,13 +740,15 @@ async def test_webhook_transfer_records_when_sku_absent_from_ml_listings(
 
     await stock_service._maybe_record_webhook_transfer(
         product_tiny_id=42,
-        sku="CAMP-FAC-CHUR",
+        sku="SLF-PESCDENT-PR",
         new_tiny_fl_qty=23,
         new_stock_galpao_qty=80,
         product_data={"prices": {"cost_price": "12.32"}},
     )
 
-    transfer_repo.create.assert_awaited_once()
+    transfer_repo.create.assert_not_awaited()
+    # Snapshot still updates so we don't replay the same delta forever
+    snapshot_repo.upsert.assert_awaited_once()
 
 
 @patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
