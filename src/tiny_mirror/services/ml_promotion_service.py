@@ -788,6 +788,54 @@ class MLPromotionService:
         body = resp.json()
         return body if isinstance(body, list) else []
 
+    async def fetch_catalog_competitors(self, catalog_product_id: str) -> list[dict[str, Any]]:
+        """Lista os anúncios concorrentes de um produto de catálogo, com preços.
+
+        Chama ``GET /products/{catalog_product_id}/items`` — retorna todos os
+        vendedores disputando o catálogo. Usado para sugerir um preço de
+        recuperação de margem baseado na concorrência (o ``price_to_win`` da ML
+        não revela o 2º colocado quando estamos ganhando). Devolve uma lista de
+        ``{item_id, seller_id, price, free_shipping, logistic_type, condition,
+        listing_type_id}``. Lista vazia em erro/sem dados.
+        """
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/products/{catalog_product_id}/items"
+        resp = await self._http.get(
+            url, params={"limit": 50}, headers={"Authorization": f"Bearer {token}"}, timeout=15.0
+        )
+        if resp.status_code == 401:
+            token = await self._token_service.handle_unauthorized()
+            resp = await self._http.get(
+                url,
+                params={"limit": 50},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "ml_catalog_competitors_failed",
+                catalog_product_id=catalog_product_id,
+                status=resp.status_code,
+                body=resp.text[:300],
+            )
+            return []
+        results = (resp.json() or {}).get("results") or []
+        out: list[dict[str, Any]] = []
+        for r in results:
+            shipping = r.get("shipping") or {}
+            out.append(
+                {
+                    "item_id": r.get("item_id"),
+                    "seller_id": r.get("seller_id"),
+                    "price": r.get("price"),
+                    "free_shipping": shipping.get("free_shipping"),
+                    "logistic_type": shipping.get("logistic_type"),
+                    "condition": r.get("condition"),
+                    "listing_type_id": r.get("listing_type_id"),
+                }
+            )
+        return out
+
     # -- Price-to-win (catalog buy-box info from ML) ----------------------
     async def fetch_price_to_win(self, mlb_id: str) -> dict[str, Any] | None:
         """Pull catalog-listing competitive info for an MLB.

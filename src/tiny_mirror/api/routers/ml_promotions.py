@@ -1703,6 +1703,208 @@ async def reprice_listing(
     return {"exit": exit_result, "enter": enter_result}
 
 
+class ExitPromoIn(BaseModel):
+    mlb_id: str
+    decided_by: str | None = None
+
+
+@router.post("/exit-promotion")
+async def exit_promotion_endpoint(
+    body: ExitPromoIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Sai da promoção ativa (DELETE) — o preço volta ao cheio. Usado quando a
+    sugestão de margem é o próprio preço cheio (sozinho no catálogo, ou o
+    concorrente mais barato está acima do nosso cheio)."""
+    from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
+
+    result = await service.exit_promotion(mlb_id=body.mlb_id)
+    sc = result.get("status_code")
+    if sc is not None and sc >= 400 and sc != 404:
+        raise HTTPException(
+            status_code=sc if sc < 600 else 502,
+            detail={"step": "exit", "response": result.get("response")},
+        )
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    action_repo = MLPromoActionRepository(session)
+    await action_repo.log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="exit_promotion",
+        promo_type="PRICE_DISCOUNT",
+        reason="subir margem: saiu da promo (preço volta ao cheio)",
+        ml_response={"exit": result},
+        dry_run=False,
+        decided_by=body.decided_by,
+    )
+    await session.commit()
+    return result
+
+
+@router.get("/catalog-competitors")
+async def catalog_competitors(
+    mlb_id: str = Query(..., description="MLB do anúncio de catálogo"),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Concorrência do catálogo + sugestão de preço pra recuperar margem.
+
+    Quando ganhamos a buy box, a ML não revela o 2º colocado via price_to_win.
+    Aqui buscamos ``GET /products/{cpid}/items`` (todos os vendedores do
+    catálogo) e sugerimos um preço: sozinho -> preço cheio; com concorrentes ->
+    logo abaixo do mais barato (recupera margem mantendo competitividade),
+    limitado pelo piso de margem e pelo preço cheio. Avisa quando está apertado
+    (concorrente <= nosso preço, ou empate no 1º): ganhando, sem folga pra subir.
+    """
+    from tiny_mirror.config import settings
+    from tiny_mirror.infrastructure.orm.models import (
+        MLCatalogStatusORM,
+        MLCostsSnapshotORM,
+        MLListingORM,
+        MLPromoCapORM,
+    )
+    from tiny_mirror.services.pricing_service import margin_at_price
+
+    cat = await session.get(MLCatalogStatusORM, mlb_id)
+    if not cat or not cat.catalog_product_id:
+        return {"mlb_id": mlb_id, "is_catalog": False}
+
+    cap = await session.get(MLPromoCapORM, mlb_id)
+    snap = await session.get(MLCostsSnapshotORM, mlb_id)
+    listing = await session.get(MLListingORM, mlb_id)
+
+    full_price: float | None = None
+    if listing and listing.price is not None:
+        full_price = float(listing.price)
+    elif snap and snap.list_price is not None:
+        full_price = float(snap.list_price)
+    current = float(cat.current_price) if cat.current_price is not None else None
+    floor = float(cap.margin_floor_price) if cap and cap.margin_floor_price is not None else None
+
+    our_id: int | None = None
+    try:
+        our_id = int(settings.ml_user_id) if settings.ml_user_id else None
+    except ValueError:
+        our_id = None
+
+    raw = await service.fetch_catalog_competitors(cat.catalog_product_id)
+    competitors: list[dict[str, Any]] = []
+    comp_prices: list[float] = []
+    for c in raw:
+        price = c.get("price")
+        if price is None:
+            continue
+        is_ours = our_id is not None and c.get("seller_id") == our_id
+        if not is_ours and (c.get("condition") or "new") == "new":
+            comp_prices.append(float(price))
+        competitors.append(
+            {
+                "item_id": c.get("item_id"),
+                "price": float(price),
+                "free_shipping": c.get("free_shipping"),
+                "logistic_type": c.get("logistic_type"),
+                "is_ours": is_ours,
+            }
+        )
+    competitors.sort(key=lambda x: x["price"])
+    comp_prices.sort()
+    cheapest = comp_prices[0] if comp_prices else None
+
+    tied = cat.status == "sharing_first_place" or (cat.competitors_sharing_first_place or 0) > 0
+    winning = cat.status in ("winning", "sharing_first_place")
+
+    # Sugestão de preço. Quatro casos:
+    #   alone    — sozinhos no catálogo: sobe ao preço cheio (margem máx, sem risco).
+    #   undercut — somos os mais baratos: sobe pra logo abaixo do concorrente
+    #              mais barato (recupera o máximo ainda ficando o melhor preço).
+    #   boost    — ganhando ACIMA do concorrente mais barato (vitória por
+    #              reputação/fulfillment): subida CONSERVADORA (metade do caminho
+    #              até o cheio), marcada como estimativa — não dá pra saber o teto.
+    #   tight    — empate no 1º ou sem folga: não sugere subir.
+    suggested: float | None
+    if tied:
+        kind = "tight"
+        suggested = current
+    elif not comp_prices:
+        kind = "alone"
+        suggested = full_price
+    elif current is not None and cheapest is not None and (cheapest - 0.01) > current:
+        kind = "undercut"
+        cand = round(cheapest - 0.01, 2)
+        suggested = min(cand, full_price) if full_price is not None else cand
+    elif winning and full_price is not None and current is not None and full_price > current + 0.01:
+        kind = "boost"
+        suggested = round(current + (full_price - current) * 0.5, 2)
+    else:
+        kind = "tight"
+        suggested = current
+    if full_price is not None and suggested is not None and suggested > full_price:
+        suggested = full_price
+    if floor is not None and suggested is not None and suggested < floor:
+        suggested = floor
+    if suggested is not None:
+        suggested = round(suggested, 2)
+
+    warning = (
+        "tied" if tied else "estimate" if kind == "boost" else "tight" if kind == "tight" else None
+    )
+    can_raise = bool(
+        winning
+        and not tied
+        and suggested is not None
+        and current is not None
+        and suggested > current + 0.01
+    )
+
+    def _margin(price: float | None) -> dict[str, float] | None:
+        if (
+            price is None
+            or not snap
+            or snap.base_cost is None
+            or snap.commission_pct is None
+            or not snap.freight_bands
+        ):
+            return None
+        try:
+            b = margin_at_price(
+                price=price,
+                base_cost=snap.base_cost,
+                commission_pct=snap.commission_pct,
+                freight_bands=snap.freight_bands,
+            )
+            return {"pct": float(b.margin_pct), "value": float(b.margin_value)}
+        except Exception:  # pragma: no cover — dados de custo incompletos
+            return None
+
+    action = (
+        "exit"
+        if full_price is not None and suggested is not None and suggested >= full_price - 0.005
+        else "reprice"
+    )
+
+    return {
+        "mlb_id": mlb_id,
+        "is_catalog": True,
+        "catalog_product_id": cat.catalog_product_id,
+        "status": cat.status,
+        "current_price": current,
+        "full_price": full_price,
+        "floor_price": floor,
+        "competitors": competitors,
+        "n_competitors": len(comp_prices),
+        "cheapest_competitor": cheapest,
+        "suggested_price": suggested,
+        "suggestion_kind": kind,
+        "can_raise": can_raise,
+        "warning": warning,
+        "margin_now": _margin(current),
+        "margin_suggested": _margin(suggested),
+        "action": action,
+    }
+
+
 # ── Tendência robusta (sem ML) ────────────────────────────────────────────────
 # Dois ruídos atrapalham um momentum simples (taxa 30d / taxa 90d):
 #   1. Volume baixo: 2 vendas em 90d viram "+50% subindo forte" — é só acaso.
