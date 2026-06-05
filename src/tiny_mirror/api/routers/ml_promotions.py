@@ -1673,6 +1673,7 @@ async def reprice_listing(
 
 class ExitPromoIn(BaseModel):
     mlb_id: str
+    promo_type: str | None = None
     decided_by: str | None = None
 
 
@@ -1687,7 +1688,7 @@ async def exit_promotion_endpoint(
     concorrente mais barato está acima do nosso cheio)."""
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
-    result = await service.exit_promotion(mlb_id=body.mlb_id)
+    result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=body.promo_type)
     sc = result.get("status_code")
     if sc is not None and sc >= 400 and sc != 404:
         raise HTTPException(
@@ -1726,34 +1727,80 @@ async def modify_promotion_endpoint(
     session: AsyncSession = Depends(db_session),
     service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, Any]:
-    """Altera o preço de uma promoção JÁ inscrita, sem sair dela (in-place).
+    """Altera o preço de uma promoção JÁ inscrita.
 
-    Espelha o "Alterar" nativo do ML: só permite BAIXAR o preço. Para subir, o
-    operador precisa sair (``/exit-promotion``) e reentrar. A regra de só-baixar
-    é reforçada aqui (422 se ``new_price >= current_price``) além do front."""
+    Dois caminhos, escolhidos pelo sentido da mudança (vs ``current_price``):
+
+    - **Baixar/igual** → ``POST`` in-place, preservando ``promotion_id``/tipo (o
+      ML aceita baixar o preço de uma oferta inscrita sem sair dela).
+    - **Subir acima do teto atual** → o ML não deixa subir in-place; então
+      fazemos a **re-inscrição automática**: ``DELETE`` (sai da oferta) seguido
+      de ``POST`` reentrando no novo preço. Para PRICE_DISCOUNT reentra como
+      desconto de vendedor; para campanhas reentra com o ``promotion_id`` (se o
+      novo preço exceder o teto da campanha, o ML devolve erro e repassamos).
+
+    Nota (doc ML): ofertas LIGHTNING já iniciadas não podem ser removidas — a
+    re-inscrição falhará e o erro do ML volta pra UI.
+    """
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
-    if body.current_price is not None and body.new_price >= body.current_price - Decimal("0.005"):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Alterar só permite BAIXAR o preço. Para subir, use "
-                "'Deixar de participar' e entre de novo no valor correto."
-            ),
-        )
-
-    result = await service.modify_promotion(
-        mlb_id=body.mlb_id,
-        deal_price=float(body.new_price),
-        promotion_id=body.promo_id,
-        promotion_type=body.promo_type,
+    promo_type = body.promo_type
+    is_raise = body.current_price is not None and body.new_price > body.current_price + Decimal(
+        "0.005"
     )
-    sc = result.get("status_code")
-    if sc is not None and sc >= 400:
-        raise HTTPException(
-            status_code=sc if sc < 600 else 502,
-            detail={"step": "modify", "response": result.get("response")},
+
+    if not is_raise:
+        # Baixar/igual: altera in-place, sem sair da oferta.
+        result = await service.modify_promotion(
+            mlb_id=body.mlb_id,
+            deal_price=float(body.new_price),
+            promotion_id=body.promo_id,
+            promotion_type=promo_type,
         )
+        sc = result.get("status_code")
+        if sc is not None and sc >= 400:
+            raise HTTPException(
+                status_code=sc if sc < 600 else 502,
+                detail={"step": "modify", "response": result.get("response")},
+            )
+        action = "modify_promotion"
+        reason = "alterar promoção inscrita: baixou o preço in-place"
+        ml_response: dict[str, Any] = result
+    else:
+        # Subir acima do teto: re-inscrição automática (sai e reentra).
+        exit_result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=promo_type)
+        exit_sc = exit_result.get("status_code")
+        if exit_sc is not None and exit_sc >= 400 and exit_sc != 404:
+            raise HTTPException(
+                status_code=exit_sc if exit_sc < 600 else 502,
+                detail={"step": "exit", "response": exit_result.get("response")},
+            )
+        # Reentra: PRICE_DISCOUNT (sem campanha) cria desconto de vendedor;
+        # campanha reentra com o promotion_id.
+        if promo_type == "PRICE_DISCOUNT" or body.promo_id is None:
+            enter_result = await service.create_price_discount(
+                mlb_id=body.mlb_id, deal_price=float(body.new_price)
+            )
+        else:
+            enter_result = await service.modify_promotion(
+                mlb_id=body.mlb_id,
+                deal_price=float(body.new_price),
+                promotion_id=body.promo_id,
+                promotion_type=promo_type,
+            )
+        enter_sc = enter_result.get("status_code")
+        if enter_sc is not None and enter_sc >= 400:
+            raise HTTPException(
+                status_code=enter_sc if enter_sc < 600 else 502,
+                detail={
+                    "step": "reenter",
+                    "exit_ok": True,
+                    "response": enter_result.get("response"),
+                },
+            )
+        action = "resubscribe_promotion"
+        reason = "alterar promoção inscrita: re-inscrição automática (subiu acima do teto)"
+        ml_response = {"exit": exit_result, "enter": enter_result}
 
     cap = await session.get(MLPromoCapORM, body.mlb_id)
     sku = cap.sku if cap else body.mlb_id
@@ -1768,17 +1815,17 @@ async def modify_promotion_endpoint(
     await action_repo.log(
         sku=sku,
         mlb_id=body.mlb_id,
-        action="modify_promotion",
-        promo_type=body.promo_type,
+        action=action,
+        promo_type=promo_type,
         price_after=body.new_price,
-        reason="alterar promoção inscrita: baixou o preço sem sair",
-        ml_response=result,
+        reason=reason,
+        ml_response=ml_response,
         dry_run=False,
         decided_by=body.decided_by,
         context=ctx,
     )
     await session.commit()
-    return result
+    return {"resubscribed": is_raise, **ml_response}
 
 
 @router.get("/catalog-competitors")

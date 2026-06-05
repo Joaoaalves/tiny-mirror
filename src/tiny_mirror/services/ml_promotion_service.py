@@ -679,20 +679,29 @@ class MLPromotionService:
         return None
 
     # -- Seller-driven price actions -------------------------------------
-    async def exit_promotion(self, *, mlb_id: str) -> dict[str, Any]:
-        """Remove o anúncio da promoção PRICE_DISCOUNT ativa.
+    async def exit_promotion(
+        self, *, mlb_id: str, promotion_type: str | None = None
+    ) -> dict[str, Any]:
+        """Remove o anúncio de uma promoção ativa.
 
-        Chama DELETE /seller-promotions/items/{mlb_id}?app_version=v2.
-        O preço volta ao list_price do anúncio. Não levanta exceção em
-        erros operacionais — devolve {status, status_code, response}
-        para o caller persistir o resultado.
+        Chama DELETE /seller-promotions/items/{mlb_id}?promotion_type=X&app_version=v2.
+        O preço volta ao list_price do anúncio. A doc do ML exige o
+        ``promotion_type`` no DELETE (sem ele, o ML pode não saber qual oferta
+        remover) — passamos quando conhecido. Não levanta exceção em erros
+        operacionais — devolve {status_code, response} para o caller persistir.
+
+        Nota (doc ML): ofertas LIGHTNING já *iniciadas* (started) NÃO podem ser
+        removidas, apenas pausadas — o ML devolverá erro nesse caso.
         """
         token = await self._token_service.get_valid_access_token()
         url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        params = {"app_version": "v2"}
+        if promotion_type:
+            params["promotion_type"] = promotion_type
         try:
             resp = await self._http.delete(
                 url,
-                params={"app_version": "v2"},
+                params=params,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=30.0,
             )
@@ -700,7 +709,7 @@ class MLPromotionService:
                 token = await self._token_service.handle_unauthorized()
                 resp = await self._http.delete(
                     url,
-                    params={"app_version": "v2"},
+                    params=params,
                     headers={"Authorization": f"Bearer {token}"},
                     timeout=30.0,
                 )

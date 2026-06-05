@@ -28,6 +28,7 @@ def _http(json_body: Any = None, status: int = 200) -> Any:
     resp.content = (json.dumps(json_body) if json_body is not None else "").encode()
     resp.json = MagicMock(return_value=json_body or {})
     mock.post = AsyncMock(return_value=resp)
+    mock.delete = AsyncMock(return_value=resp)
     return mock
 
 
@@ -77,3 +78,24 @@ async def test_modify_surfaces_error_status() -> None:
     out = await svc.modify_promotion(mlb_id="MLB1", deal_price=10.0)
     assert out["status_code"] == 400
     assert out["response"] == {"message": "invalid"}
+
+
+@pytest.mark.asyncio
+async def test_exit_passes_promotion_type_in_delete() -> None:
+    # Doc do ML exige promotion_type no DELETE — sem ele o ML pode não saber
+    # qual oferta remover. Reentrada automática (raise) depende disso.
+    http = _http({})
+    svc = _service(http)
+    await svc.exit_promotion(mlb_id="MLB1", promotion_type="DEAL")
+    _, kwargs = http.delete.call_args
+    assert kwargs["params"] == {"app_version": "v2", "promotion_type": "DEAL"}
+
+
+@pytest.mark.asyncio
+async def test_exit_without_type_omits_param() -> None:
+    http = _http({})
+    svc = _service(http)
+    await svc.exit_promotion(mlb_id="MLB1")
+    _, kwargs = http.delete.call_args
+    assert kwargs["params"] == {"app_version": "v2"}
+    assert "promotion_type" not in kwargs["params"]
