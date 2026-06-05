@@ -84,13 +84,27 @@ d30_fl AS (
       AND bucket_date <  CURRENT_DATE
       AND ecommerce_name = 'Mercado Livre FULL'
     GROUP BY sku
+),
+-- Collapse multiple FL listings of the SAME kit into one row. A kit
+-- with two MLBs (e.g. listed twice on the marketplace) would otherwise
+-- yield 2 rows and break the unique index. STRING_AGG keeps every
+-- mlb_id / inventory_id visible to the UI as a comma-separated list.
+fl_listings AS (
+    SELECT
+        sku,
+        STRING_AGG(DISTINCT mlb_id, ',' ORDER BY mlb_id) AS mlb_ids,
+        STRING_AGG(DISTINCT inventory_id, ',' ORDER BY inventory_id)
+            FILTER (WHERE inventory_id IS NOT NULL) AS inventory_ids
+    FROM ml_listings
+    WHERE logistic_type = 'fulfillment' AND status = 'active'
+    GROUP BY sku
 )
 SELECT
     p.tiny_id,
     p.sku,
     p.description,
-    ml.mlb_id,
-    ml.inventory_id,
+    flk.mlb_ids,
+    flk.inventory_ids,
     COALESCE(s.stock_galpao,         0) AS stock_galpao,
     COALESCE(s.stock_full_ml,        0) AS stock_full_ml,
     COALESCE(s.stock_fl_in_transfer, 0) AS stock_fl_in_transfer,
@@ -102,10 +116,7 @@ SELECT
     COALESCE(d30.sold_30d,           0) AS sold_30d,
     COALESCE(d30_fl.sold_30d_fl,     0) AS sold_30d_fl
 FROM products p
-JOIN ml_listings ml
-    ON ml.sku = p.sku
-   AND ml.logistic_type = 'fulfillment'
-   AND ml.status = 'active'
+JOIN fl_listings flk    ON flk.sku = p.sku
 LEFT JOIN stock_dep s   ON s.product_tiny_id = p.tiny_id
 LEFT JOIN pending pend  ON pend.sku = p.sku
 LEFT JOIN d30           ON d30.sku  = p.sku
