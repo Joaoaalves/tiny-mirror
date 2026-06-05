@@ -220,6 +220,9 @@ class DecisionOut(BaseModel):
     floor_price: Decimal | None
     min_price: Decimal | None = None
     max_price: Decimal | None = None
+    stock_min: int | None = None
+    stock_max: int | None = None
+    stock_chosen: int | None = None
     reason: str
     status: str
     created_at: datetime
@@ -244,6 +247,9 @@ class DecisionDecideIn(BaseModel):
     # target_seller_pct são recalculados a partir do novo target_price
     # + list_price + meli_percentage.
     target_price: Decimal | None = None
+    # Unidades a reservar na oferta (LIGHTNING/DOD) — escolhida pelo operador
+    # dentro de [stock_min, stock_max]. Gravada em stock_chosen e enviada no POST.
+    units: int | None = None
 
 
 class BulkDecideIn(BaseModel):
@@ -1352,6 +1358,7 @@ async def approve_decision(
         status="approved",
         by=body.decided_by,
         notes=notes,
+        stock_chosen=body.units,
         decision_context=ctx or None,
         **override,
     )

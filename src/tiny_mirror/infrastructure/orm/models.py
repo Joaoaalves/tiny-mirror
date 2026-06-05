@@ -1407,6 +1407,11 @@ class MLPromoDecisionORM(Base):
     # NULL para preço fixo (SMART/fixed_percentage). Apenas informativo na UI.
     min_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
     max_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Estoque a reservar na oferta (LIGHTNING/DOD): faixa publicada pelo ML
+    # (offer.stock {min,max}) + a quantidade escolhida pelo operador na aprovação.
+    stock_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stock_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stock_chosen: Mapped[int | None] = mapped_column(Integer, nullable=True)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(
         String(20),

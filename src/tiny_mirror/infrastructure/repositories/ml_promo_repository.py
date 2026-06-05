@@ -383,6 +383,8 @@ class MLPromoDecisionRepository:
         promo_finish_date: Any | None = None,
         min_price: Decimal | None = None,
         max_price: Decimal | None = None,
+        stock_min: int | None = None,
+        stock_max: int | None = None,
     ) -> MLPromoDecisionORM | None:
         """Insert a decision; return the new row, or None if a row with the
         same ``(mlb_id, promo_key)`` already exists.
@@ -415,6 +417,8 @@ class MLPromoDecisionRepository:
                 promo_finish_date=promo_finish_date,
                 min_price=min_price,
                 max_price=max_price,
+                stock_min=stock_min,
+                stock_max=stock_max,
             )
             .on_conflict_do_nothing(constraint="uq_ml_promo_decisions_mlb_promo")
             .returning(MLPromoDecisionORM)
@@ -465,6 +469,7 @@ class MLPromoDecisionRepository:
         target_price: Decimal | None = None,
         target_total_pct: Decimal | None = None,
         target_seller_pct: Decimal | None = None,
+        stock_chosen: int | None = None,
         decision_context: dict[str, Any] | None = None,
     ) -> MLPromoDecisionORM | None:
         """Move a pending decision to a terminal state.
@@ -496,6 +501,8 @@ class MLPromoDecisionRepository:
             row.target_total_pct = target_total_pct
         if target_seller_pct is not None:
             row.target_seller_pct = target_seller_pct
+        if stock_chosen is not None:
+            row.stock_chosen = stock_chosen
         if decision_context is not None:
             row.decision_context = decision_context
         await self._session.flush()

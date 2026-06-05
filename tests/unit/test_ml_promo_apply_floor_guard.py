@@ -45,26 +45,23 @@ def test_target_at_floor_is_safe() -> None:
     assert MLPromotionService._floor_violation_reason(row) is None
 
 
-def test_target_below_floor_returns_reason() -> None:
+# 2026-06-05: o guard de piso do executor foi DESLIGADO (retorna sempre None).
+# Na aprovação manual o operador decide (dupla confirmação no front p/ margem
+# negativa); o CAP/piso só voltará na automação de aprovação. Os testes abaixo
+# fixam o no-op pra documentar a mudança.
+def test_target_below_floor_no_longer_blocks() -> None:
     row = FakeRow(target_price=Decimal("55.00"))
-    reason = MLPromotionService._floor_violation_reason(row)
-    assert reason is not None
-    assert "55" in reason
-    assert "60" in reason
+    assert MLPromotionService._floor_violation_reason(row) is None
 
 
-def test_target_one_cent_below_floor_blocks() -> None:
-    # 59.99 < 60.00 (more than the 0.005 tolerance). Must block.
+def test_target_one_cent_below_floor_no_longer_blocks() -> None:
     row = FakeRow(target_price=Decimal("59.99"))
-    assert MLPromotionService._floor_violation_reason(row) is not None
+    assert MLPromotionService._floor_violation_reason(row) is None
 
 
-def test_null_floor_always_blocks_for_priced_promos() -> None:
-    # Costs absent → no floor known → cannot verify margin → refuse.
+def test_null_floor_no_longer_blocks_for_priced_promos() -> None:
     row = FakeRow(floor_price=None)
-    reason = MLPromotionService._floor_violation_reason(row)
-    assert reason is not None
-    assert "sem piso" in reason
+    assert MLPromotionService._floor_violation_reason(row) is None
 
 
 def test_coupon_effective_above_floor_is_safe() -> None:
@@ -77,29 +74,23 @@ def test_coupon_effective_above_floor_is_safe() -> None:
     assert MLPromotionService._floor_violation_reason(row) is None
 
 
-def test_coupon_effective_below_floor_blocks() -> None:
-    # 50% off R$ 100 = R$ 50 effective; floor 60 → block.
+def test_coupon_effective_below_floor_no_longer_blocks() -> None:
     row = FakeRow(
         promo_type="SELLER_COUPON_CAMPAIGN",
         target_price=None,
         target_total_pct=Decimal("50.00"),
     )
-    reason = MLPromotionService._floor_violation_reason(row)
-    assert reason is not None
-    assert "cupom" in reason
-    assert "50" in reason  # the percentage
-    assert "60" in reason  # the floor
+    assert MLPromotionService._floor_violation_reason(row) is None
 
 
-def test_coupon_with_null_floor_blocks() -> None:
-    # Even coupons can't ship without a known floor.
+def test_coupon_with_null_floor_no_longer_blocks() -> None:
     row = FakeRow(
         promo_type="SELLER_COUPON_CAMPAIGN",
         target_price=None,
         target_total_pct=Decimal("30.00"),
         floor_price=None,
     )
-    assert MLPromotionService._floor_violation_reason(row) is not None
+    assert MLPromotionService._floor_violation_reason(row) is None
 
 
 def test_row_with_no_target_skips_floor_check() -> None:

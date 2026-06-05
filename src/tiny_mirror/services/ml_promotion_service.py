@@ -599,43 +599,12 @@ class MLPromotionService:
            (costs weren't loaded when the row was generated). Refuse:
            regenerate after the cost sync runs.
         2. ``effective < floor`` — refuse, would lose money.
+
+        2026-06-05: na aprovação MANUAL o piso (CAP) deixa de bloquear — o
+        operador decide (com dupla confirmação no front p/ margem negativa). Este
+        guard fica DESLIGADO até a automação de aprovação entrar, quando o cap
+        volta a ser exigido só nesse fluxo. Por isso retorna sempre None.
         """
-        from decimal import Decimal
-
-        if decision.floor_price is None:
-            return (
-                "linha sem piso de margem (custos ausentes ao gerar); "
-                "regenere as decisões com custos frescos antes de aprovar"
-            )
-
-        floor = Decimal(str(decision.floor_price))
-        promo_type = (decision.promo_type or "").upper()
-
-        # Coupon: effective = list * (1 - %). Need both fields populated;
-        # body_builder would already return None without them, so this
-        # guard only fires when there IS a body to send.
-        if promo_type == "SELLER_COUPON_CAMPAIGN":
-            if decision.list_price is None or decision.target_total_pct is None:
-                return None  # body_builder will return None → 'skipped'
-            list_price = Decimal(str(decision.list_price))
-            pct = Decimal(str(decision.target_total_pct))
-            effective = (list_price * (Decimal("100") - pct) / Decimal("100")).quantize(
-                Decimal("0.01")
-            )
-            if effective + Decimal("0.005") < floor:
-                return (
-                    f"cupom {pct}% sobre R$ {list_price} resulta em "
-                    f"R$ {effective}, abaixo do piso R$ {floor}"
-                )
-            return None
-
-        # Fixed-price / interval campaigns — target_price IS the
-        # effective price.
-        if decision.target_price is None:
-            return None  # body_builder returns None → 'skipped'
-        target = Decimal(str(decision.target_price))
-        if target + Decimal("0.005") < floor:
-            return f"target R$ {target} abaixo do piso R$ {floor}"
         return None
 
     @staticmethod
@@ -672,11 +641,18 @@ class MLPromotionService:
         ):
             if promo_id is None or target is None:
                 return None
-            return {
+            body = {
                 "promotion_id": promo_id,
                 "promotion_type": promo_type,
                 "deal_price": float(target),
             }
+            # LIGHTNING/DOD exigem reservar estoque pra oferta. Enviamos a
+            # quantidade escolhida pelo operador (stock_chosen). NOTA: o nome do
+            # campo ("stock") precisa ser confirmado na 1ª ativação real — se o
+            # ML recusar, o erro volta na UI e ajustamos.
+            if promo_type in {"LIGHTNING", "DOD"} and getattr(decision, "stock_chosen", None):
+                body["stock"] = int(decision.stock_chosen)
+            return body
 
         # PRICE_DISCOUNT can come in two flavours:
         #  - would_activate: ML already enumerated a PRICE_DISCOUNT
@@ -1309,6 +1285,8 @@ class MLPromotionService:
                         promo_finish_date=finish_dt,
                         min_price=_to_dec(entry.get("min_price")),
                         max_price=_to_dec(entry.get("max_price")),
+                        stock_min=entry.get("stock_min"),
+                        stock_max=entry.get("stock_max"),
                     )
                     if inserted is not None:
                         if decision_kind == "would_activate":
@@ -1793,6 +1771,35 @@ def score_candidate_promo(
             cap_label="total",
             structure_type="FIXED_PCT",
         )
+
+    # 1b. LIGHTNING (Oferta Relâmpago): o ML DETERMINA o teto (``offer.price``)
+    # com base nas nossas vendas — não dá pra subir acima dele. O operador só
+    # pode BAIXAR o preço, até o ``min_discounted_price``. O ``suggested`` vem
+    # ACIMA do teto real e por isso é ignorado aqui. Reserva de estoque
+    # obrigatória vem em ``offer.stock {min,max}``.
+    if promo_type == "LIGHTNING" and p.get("price") is not None:
+        ceiling = float(p["price"])
+        min_raw = p.get("min_discounted_price")
+        floor_min = float(min_raw) if min_raw is not None else ceiling
+        target = round(ceiling, 2)
+        total_pct = round((list_price - target) / list_price * 100, 2)
+        stock = p.get("stock") or {}
+        return {
+            "accepted": True,
+            "target_price": target,
+            "target_total_pct": total_pct,
+            "target_seller_pct": round(total_pct - meli_pct, 2),
+            "meli_percentage": meli_pct,
+            "constraint": "lightning_ceiling",
+            "reason": "Teto definido pelo ML (com base nas suas vendas) — só dá pra baixar o preço",
+            "structure_type": "INTERVAL",
+            "is_fixed_price": False,
+            "exposure_boost": exposure_boost,
+            "min_price": round(floor_min, 2),
+            "max_price": round(ceiling, 2),
+            "stock_min": stock.get("min"),
+            "stock_max": stock.get("max"),
+        }
 
     # 2. min_discounted_price (INTERVAL types: DEAL/DOD/LIGHTNING/etc).
     # The seller picks any price in [min, max] (max optional). We choose
