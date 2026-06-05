@@ -120,12 +120,14 @@ def _transfer(
     days_ago: int,
     *,
     quantity_received: int = 0,
+    last_event_at: datetime | None = None,
 ) -> MagicMock:
     row = MagicMock()
     row.id = transfer_id
     row.quantity = qty
     row.quantity_received = quantity_received
     row.transferred_at = datetime.now(UTC) - timedelta(days=days_ago)
+    row.last_event_at = last_event_at
     return row
 
 
@@ -233,6 +235,95 @@ class TestFifoMatchWithChronology:
         assert decisions[0].is_full is True
         assert decisions[0].last_event_at == _extract_received_at(evt2)
 
+    # Bug 3 fix (2026-06-05): events at or before t.last_event_at must NOT
+    # be re-credited. Without this guard, every subsequent run inflates
+    # quantity_received by the same 3 units (proven on BUB-ASPR-NAS-ESTJ
+    # transfer #279: 3 real events → received=10/13 over 3-4 runs).
+    def test_last_event_at_idempotency_skips_already_seen_events(self) -> None:
+        last_run = datetime.now(UTC) - timedelta(hours=6)
+        # Transfer credited up to last_run on a prior scan.
+        t = _transfer(
+            1,
+            10,
+            days_ago=5,
+            quantity_received=3,
+            last_event_at=last_run,
+        )
+        # Re-supplying the SAME event that was already credited on the
+        # prior run (date BEFORE last_run): must NOT be credited again.
+        already_seen = _event(
+            3,
+            date_iso=(last_run - timedelta(hours=1)).isoformat(),
+        )
+        decisions = _fifo_match_with_chronology([t], [already_seen])
+        assert decisions[0].delta_units == 0
+        assert decisions[0].is_full is False
+
+    def test_last_event_at_admits_strictly_newer_events(self) -> None:
+        last_run = datetime.now(UTC) - timedelta(hours=6)
+        t = _transfer(
+            1,
+            10,
+            days_ago=5,
+            quantity_received=3,
+            last_event_at=last_run,
+        )
+        # A genuinely new event strictly AFTER last_run: must be credited.
+        new_event = _event(
+            2,
+            date_iso=(last_run + timedelta(hours=2)).isoformat(),
+        )
+        decisions = _fifo_match_with_chronology([t], [new_event])
+        assert decisions[0].delta_units == 2
+        assert decisions[0].is_full is False
+
+    def test_last_event_at_at_boundary_is_not_credited(self) -> None:
+        """Event with date_created EXACTLY at last_event_at is treated as the
+        already-credited one — skipped. Avoids replay at second precision."""
+        last_run = datetime.now(UTC) - timedelta(hours=6)
+        t = _transfer(
+            1,
+            10,
+            days_ago=5,
+            quantity_received=3,
+            last_event_at=last_run,
+        )
+        same_instant = _event(2, date_iso=last_run.isoformat())
+        decisions = _fifo_match_with_chronology([t], [same_instant])
+        assert decisions[0].delta_units == 0
+
+
+# ---------------------------------------------------------------------------
+# INBOUND_EVENT_TYPES gate (Bug 2 fix, 2026-06-05): TRANSFER_DELIVERY is
+# ML's INTERNAL warehouse-to-warehouse flow per the official docs, NOT
+# our seller shipment arriving. Including it credited internal moves
+# against pending transfers (~700 phantom units in a 14-day sample of 30
+# received rows).
+# ---------------------------------------------------------------------------
+class TestInboundEventTypesContract:
+    def test_inbound_reception_is_eligible(self) -> None:
+        from tiny_mirror.services.fulfillment_reception_service import (
+            INBOUND_EVENT_TYPES,
+        )
+
+        assert "INBOUND_RECEPTION" in INBOUND_EVENT_TYPES
+
+    def test_transfer_delivery_no_longer_eligible(self) -> None:
+        from tiny_mirror.services.fulfillment_reception_service import (
+            INBOUND_EVENT_TYPES,
+        )
+
+        assert "TRANSFER_DELIVERY" not in INBOUND_EVENT_TYPES
+
+    def test_set_size_is_one(self) -> None:
+        """If a new inbound-source event type is added, this assertion
+        prompts updating the docstring + this contract test."""
+        from tiny_mirror.services.fulfillment_reception_service import (
+            INBOUND_EVENT_TYPES,
+        )
+
+        assert len(INBOUND_EVENT_TYPES) == 1
+
 
 # ---------------------------------------------------------------------------
 # Service tests — scan_and_reconcile with mocks
@@ -244,6 +335,7 @@ def _make_transfer_orm(
     days_ago: int = 1,
     product_tiny_id: int = 971992238,
     quantity_received: int = 0,
+    last_event_at: datetime | None = None,
 ) -> MagicMock:
     row = MagicMock()
     row.id = transfer_id
@@ -252,6 +344,7 @@ def _make_transfer_orm(
     row.quantity_received = quantity_received
     row.product_tiny_id = product_tiny_id
     row.transferred_at = datetime.now(UTC) - timedelta(days=days_ago)
+    row.last_event_at = last_event_at
     return row
 
 
@@ -362,9 +455,13 @@ class TestReconciliation:
         assert repo_mock.apply_partial_reception.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_transfer_delivery_events_are_counted(self, ml_client: AsyncMock) -> None:
-        """TRANSFER_DELIVERY (unit-by-unit flow) must reconcile pending transfers
-        the same as INBOUND_RECEPTION — the regression fix."""
+    async def test_transfer_delivery_events_are_NOT_counted(self, ml_client: AsyncMock) -> None:
+        """TRANSFER_DELIVERY is ML's INTERNAL warehouse move (per official
+        Fulfillment Operations docs). It must NOT credit a seller's
+        pending transfer. This test pins the 2026-06-05 fix that removed
+        TRANSFER_DELIVERY from INBOUND_EVENT_TYPES (the original ~700-unit
+        phantom-reception bug).
+        """
         service = FulfillmentReceptionService(ml_client=ml_client)
         transfers = [_make_transfer_orm(1, "SKU-A", 3, days_ago=2)]
         mock_session, repo_mock = _patch_session(
@@ -397,7 +494,9 @@ class TestReconciliation:
         ):
             result = await service.scan_and_reconcile()
 
-        assert result.transfers_received == 1
+        # TRANSFER_DELIVERY no longer in INBOUND_EVENT_TYPES → events filtered
+        # at _fetch_chunk_inbound, transfer stays pending.
+        assert result.transfers_received == 0
 
     @pytest.mark.asyncio
     async def test_non_inbound_event_types_filtered_out(self, ml_client: AsyncMock) -> None:

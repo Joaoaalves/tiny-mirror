@@ -562,6 +562,59 @@ async def test_webhook_transfer_creates_pending_on_positive_delta_with_galpao_dr
     assert kwargs["source"] == "tiny_webhook"
 
 
+# Bug 1 fix (2026-06-05): on a hot SKU, ML sales can fire on FL between the
+# operator's T entry and the next stock webhook. FL then decrements via N
+# entries while galpão stays put, so fl_delta under-counts the real
+# transfer. Pin quantity = max(fl_delta, galpao_drop) so the galpão side
+# (which only changes via T) sets the lower bound on the transfer size.
+# Real case: BUB-ASPR-NAS-ESTJ 2026-06-01: T +100 fired in Tiny, 11 sales
+# landed before the webhook arrived → fl_delta=89, galpao_drop=100.
+@patch("tiny_mirror.services.stock_sync_service.MLListingRepository")
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_quantity_uses_galpao_drop_when_sales_in_window(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    mock_ml_listing_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """fl_delta=89, galpao_drop=100 → quantity persisted = 100."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=_snap(fl=0, galpao=119))
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock(return_value=False)
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    ml_listing_repo = MagicMock()
+    ml_listing_repo.sku_logistic_status = AsyncMock(return_value=(1, 1))
+    mock_ml_listing_repo_cls.return_value = ml_listing_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=955038884,
+        sku="BUB-ASPR-NAS-ESTJ",
+        new_tiny_fl_qty=89,  # only +89 because of 11 sales in the window
+        new_stock_galpao_qty=19,  # full -100 from the T entry
+        product_data={"prices": {"cost_price": "13.37"}},
+    )
+
+    transfer_repo.create.assert_awaited_once()
+    kwargs = transfer_repo.create.call_args.kwargs
+    assert (
+        kwargs["quantity"] == 100
+    ), f"expected max(fl_delta=89, galpao_drop=100)=100, got {kwargs['quantity']}"
+    assert "max(fl_delta=89, galpao_drop=100)" in kwargs["notes"]
+
+
 @patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
 @patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
 @patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")

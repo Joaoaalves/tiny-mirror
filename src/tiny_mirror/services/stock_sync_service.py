@@ -482,17 +482,28 @@ class StockSyncService:
                 )
                 return
 
+            # Quantity = max(fl_delta, galpao_drop). The two diverge when ML
+            # sales fire on FL between the operator's T entry and the next
+            # webhook (FL decrements via N entries but galpão doesn't); fl_delta
+            # then under-counts the real transfer. galpao_drop tracks gross
+            # units leaving the warehouse — the more reliable lower bound on
+            # what was shipped. Reverse case (galpao drops less than fl grows)
+            # is rare but still picks the larger value: if galpão received a
+            # purchase order arrival in the same window, fl_delta is closer to
+            # the actual transfer size. Either way the max captures it.
+            transfer_quantity = max(int(fl_delta), int(galpao_drop))
             cost = _extract_cost_price(product_data)
             await transfers.create(
                 product_tiny_id=product_tiny_id,
                 product_sku=sku,
-                quantity=fl_delta,
+                quantity=transfer_quantity,
                 cost_per_unit=cost,
                 transferred_at=now,
                 notes=(
                     "Detected via Tiny stock webhook: Full ML deposit grew "
                     f"from {previous.tiny_fl_qty} to {new_tiny_fl_qty} "
-                    f"(galpão {previous.stock_galpao_qty} → {new_stock_galpao_qty})."
+                    f"(galpão {previous.stock_galpao_qty} → {new_stock_galpao_qty}). "
+                    f"Quantity = max(fl_delta={fl_delta}, galpao_drop={int(galpao_drop)})."
                 ),
                 source="tiny_webhook",
             )

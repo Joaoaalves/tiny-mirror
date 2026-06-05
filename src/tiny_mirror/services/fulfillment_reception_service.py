@@ -50,12 +50,24 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 
-# Event types ML emits that represent units physically arriving at the FL CD.
-# Both carry ``detail.available_quantity > 0`` when the event ADDS stock.
-# INBOUND_RECEPTION = batch barcode receptions (older flow).
-# TRANSFER_DELIVERY = unit-by-unit seller-managed transfer flow (newer flow,
-# used for example by POL-PSTABA-OFCSFT-CRST in 2026-05).
-INBOUND_EVENT_TYPES = frozenset({"INBOUND_RECEPTION", "TRANSFER_DELIVERY"})
+# Event types ML emits that represent units PHYSICALLY ARRIVING from the
+# seller (i.e. units that should decrement our pending fulfillment_transfers).
+#
+# Per ML's official Fulfillment Operations docs (verified 2026-06-05):
+#  - ``INBOUND_RECEPTION``: "Novo estoque: o processo inbound disponibiliza
+#    unidades para venda no fluxo de acesso." This is the seller-side inbound
+#    flow we want to track.
+#  - ``TRANSFER_DELIVERY``: "Esta é a ação INTERNA do estoque do Mercado Livre,
+#    NÃO do vendedor. Unidades entram em transferência (warehouse-to-warehouse
+#    internal moves)." Including it credits internal ML moves as if they were
+#    our shipment arriving — that bled ~700 phantom units into our log in 30d.
+#
+# An earlier comment claimed TRANSFER_DELIVERY was a "newer seller-managed
+# transfer flow" (per a POL-PSTABA observation in 2026-05). The 2026-06-05
+# audit against ML's official docs disproved that — those POL-PSTABA events
+# were ML's internal warehouse moves and shouldn't have credited the seller
+# transfer either.
+INBOUND_EVENT_TYPES = frozenset({"INBOUND_RECEPTION"})
 
 
 @dataclass
@@ -427,14 +439,26 @@ def _fifo_match_with_chronology(
         delta = 0
         last_event_date: datetime | None = None
         transfer_at = t.transferred_at.astimezone(UTC)
+        # Idempotency floor: events at or before the last credited timestamp
+        # were already counted in a prior run — skip them. Without this guard
+        # every subsequent execution re-credits the same events, inflating
+        # quantity_received until it caps at quantity. (2026-06-05 audit
+        # showed this drove ~108 phantom units on the 6 pending transfers
+        # alone, plus undetermined inflation on the 156 historical
+        # 'received' rows.)
+        last_seen = t.last_event_at.astimezone(UTC) if t.last_event_at else None
         for i, e in enumerate(events_sorted):
             if outstanding <= 0:
                 break
             if remaining_per_event[i] <= 0:
                 continue
             evt_date = _extract_received_at(e)
-            if evt_date is None or evt_date < transfer_at:
+            if evt_date is None:
                 continue
+            if evt_date < transfer_at:
+                continue  # chronology guard: older events can't be ours
+            if last_seen is not None and evt_date <= last_seen:
+                continue  # idempotency: already credited in a prior run
             take = min(outstanding, remaining_per_event[i])
             remaining_per_event[i] -= take
             outstanding -= take
