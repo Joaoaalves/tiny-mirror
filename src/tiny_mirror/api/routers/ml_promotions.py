@@ -89,6 +89,7 @@ class CapOut(BaseModel):
     # Joined from ml_listings (the MLB's listing row) — type + status + title.
     logistic_type: str | None = None
     listing_status: str | None = None
+    available_quantity: int | None = None
     listing_title: str | None = None
     listing_thumbnail: str | None = None
     permalink: str | None = None
@@ -437,6 +438,7 @@ async def _enrich_cap(
     if listing is not None:
         out.logistic_type = listing.logistic_type
         out.listing_status = listing.status
+        out.available_quantity = listing.available_quantity
         out.listing_title = listing.title
         out.listing_thumbnail = listing.thumbnail
         out.permalink = listing.permalink
@@ -1287,46 +1289,19 @@ async def _apply_target_override(
     new_total_pct = ((list_price - override_price) / list_price * 100).quantize(Decimal("0.01"))
     new_seller_pct = (new_total_pct - meli_pct).quantize(Decimal("0.01"))
 
-    # HARD: cap_pct é o teto da parte do seller (sem co-pay do ML). Pra
-    # promoções como SMART/DEAL, ML usa esse cap pra definir se o seller
-    # está jogando dentro da regra do canal. Override que viola é
-    # bloqueado.
+    # CAP + piso de margem são SOFT na aprovação MANUAL (2026-06-05): o operador
+    # decide. O cap do canal só será exigido na aprovação AUTOMÁTICA (quando a
+    # automação de promoções entrar). Margem negativa não bloqueia aqui — o front
+    # exige dupla confirmação. Tudo vira aviso, registrado nas notas pra auditoria.
+    soft: list[str] = []
     if row.cap_pct is not None and new_seller_pct > row.cap_pct + Decimal("0.01"):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"seller {new_seller_pct}% > cap ML {row.cap_pct}% "
-                f"(target_price R$ {override_price} ultrapassa o cap do canal)"
-            ),
+        soft.append(
+            f"seller {new_seller_pct}% > cap ML {row.cap_pct}% (cap ignorado na aprovação manual)"
         )
-
-    # HARD: piso de margem é nosso. Override que coloca o preço abaixo
-    # do piso é recusado. Tolerância de 0.005 (meio centavo) pra
-    # arredondamento — mesma do código antigo, só que agora vira 422
-    # em vez de warning.
     if row.floor_price is not None and override_price + Decimal("0.005") < row.floor_price:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"target_price R$ {override_price} abaixo do piso R$ {row.floor_price} "
-                f"(margem em risco — recusado)"
-            ),
+        soft.append(
+            f"preço R$ {override_price} abaixo do piso R$ {row.floor_price} (margem em risco)"
         )
-
-    # HARD: sem piso conhecido (custos não rodaram), só permitimos
-    # override pra cima do alvo atual. Pra baixo precisaria de uma
-    # base de margem que não temos — re-gere as decisões com custos
-    # frescos primeiro.
-    if row.floor_price is None and row.target_price is not None:
-        current_target = Decimal(row.target_price)
-        if override_price + Decimal("0.005") < current_target:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"target_price R$ {override_price} < alvo gerado R$ {current_target} "
-                    f"e linha sem piso (custos ausentes) — regenere com custos antes"
-                ),
-            )
 
     return (
         {
@@ -1334,7 +1309,7 @@ async def _apply_target_override(
             "target_total_pct": new_total_pct,
             "target_seller_pct": new_seller_pct,
         },
-        None,
+        "; ".join(soft) or None,
     )
 
 
@@ -1577,20 +1552,14 @@ async def create_price_discount_direct(
     service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, Any]:
     """Cria promoção PRICE_DISCOUNT diretamente no ML para um MLB.
-    Valida contra margin_floor_price do cap antes de enviar.
+
+    Aprovação MANUAL: o piso de margem (CAP) NÃO bloqueia (2026-06-05) — o
+    operador decide, e o front exige dupla confirmação quando a margem fica
+    negativa. O CAP só será exigido na aprovação automática.
     """
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
     cap = await session.get(MLPromoCapORM, body.mlb_id)
-    if cap and cap.margin_floor_price is not None:
-        if body.deal_price + Decimal("0.005") < cap.margin_floor_price:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"deal_price R$ {body.deal_price} abaixo do piso de margem "
-                    f"R$ {cap.margin_floor_price} — recusado"
-                ),
-            )
     result = await service.create_price_discount(
         mlb_id=body.mlb_id, deal_price=float(body.deal_price)
     )
@@ -1642,21 +1611,13 @@ async def reprice_listing(
     1. DELETE /seller-promotions/items/{mlb_id} — remove promo ativa
     2. POST  /seller-promotions/items/{mlb_id} — entra com novo preço
 
-    Valida floor antes de qualquer chamada ao ML. Devolve ambos os
-    resultados para o frontend mostrar o diagnóstico se algo falhar.
+    Aprovação MANUAL: o piso (CAP) NÃO bloqueia (2026-06-05) — decisão do
+    operador, com dupla confirmação no front p/ margem negativa. Devolve ambos
+    os resultados para o frontend mostrar o diagnóstico se algo falhar.
     """
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
     cap = await session.get(MLPromoCapORM, body.mlb_id)
-    if cap and cap.margin_floor_price is not None:
-        if body.new_price + Decimal("0.005") < cap.margin_floor_price:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"new_price R$ {body.new_price} abaixo do piso de margem "
-                    f"R$ {cap.margin_floor_price} — recusado"
-                ),
-            )
 
     exit_result = await service.exit_promotion(mlb_id=body.mlb_id)
     exit_sc = exit_result.get("status_code")

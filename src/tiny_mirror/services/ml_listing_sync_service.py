@@ -91,6 +91,7 @@ class MLListingSyncService:
                         "sku": sku,
                         "logistic_type": logistic_type,
                         "status": item.get("status"),
+                        "available_quantity": item.get("available_quantity"),
                         "inventory_id": inventory_id if not has_variations else None,
                         "has_variations": has_variations,
                         "title": (item.get("title") or "")[:500] or None,

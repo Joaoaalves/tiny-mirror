@@ -104,8 +104,9 @@ class Settings(BaseSettings):
     sync_stock_history_cron: str = "0 1 * * *"
     # Purchase orders: weekly on Sunday at 06:00 UTC
     sync_purchase_orders_cron: str = "0 6 * * 0"
-    # ML listings (full snapshot of seller's active listings): daily at 00:30 UTC
-    sync_ml_listings_cron: str = "30 0 * * *"
+    # ML listings (full snapshot of seller's listings): a cada 6h (status/estoque
+    # ficam stale durante o dia quando um anúncio pausa por falta de estoque).
+    sync_ml_listings_cron: str = "30 */6 * * *"
     # ML-only Full stock refresh. Runs every 15 min to keep the 'Full
     # Mercado Livre' deposit row in stock_deposits fresh against ML's
     # Inventory API. Bypasses Tiny entirely so it stays well under the

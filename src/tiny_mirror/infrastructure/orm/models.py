@@ -946,6 +946,9 @@ class MLListingORM(Base):
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
     logistic_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Estoque disponível (item.available_quantity). O ML pausa o anúncio quando
+    # zera, mas isso pode demorar; o estoque dá o sinal direto de vendável.
+    available_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
     inventory_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     has_variations: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     title: Mapped[str | None] = mapped_column(Text, nullable=True)
