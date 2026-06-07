@@ -53,21 +53,52 @@ logger = structlog.get_logger(__name__)
 # Event types ML emits that represent units PHYSICALLY ARRIVING from the
 # seller (i.e. units that should decrement our pending fulfillment_transfers).
 #
-# Per ML's official Fulfillment Operations docs (verified 2026-06-05):
+# Doc story (per ML's official Fulfillment Operations spec):
 #  - ``INBOUND_RECEPTION``: "Novo estoque: o processo inbound disponibiliza
-#    unidades para venda no fluxo de acesso." This is the seller-side inbound
-#    flow we want to track.
-#  - ``TRANSFER_DELIVERY``: "Esta é a ação INTERNA do estoque do Mercado Livre,
-#    NÃO do vendedor. Unidades entram em transferência (warehouse-to-warehouse
-#    internal moves)." Including it credits internal ML moves as if they were
-#    our shipment arriving — that bled ~700 phantom units into our log in 30d.
+#    unidades para venda" → seller inbound. Should count.
+#  - ``TRANSFER_DELIVERY``: "Ação INTERNA do estoque do Mercado Livre" →
+#    warehouse-to-warehouse moves. Should NOT count.
 #
-# An earlier comment claimed TRANSFER_DELIVERY was a "newer seller-managed
-# transfer flow" (per a POL-PSTABA observation in 2026-05). The 2026-06-05
-# audit against ML's official docs disproved that — those POL-PSTABA events
-# were ML's internal warehouse moves and shouldn't have credited the seller
-# transfer either.
-INBOUND_EVENT_TYPES = frozenset({"INBOUND_RECEPTION"})
+# 2026-06-05 took the doc literally and restricted to INBOUND_RECEPTION
+# only. 2026-06-07 audit (RON-COLL-PRE + 49 other inventories, n=2019
+# TRANSFER_DELIVERY events) proved the doc is wrong in practice:
+#  - 0 INBOUND_RECEPTION events for RON-COLL-PRE in 60d despite ~25 known
+#    seller T entries arriving.
+#  - 2019/2019 TRANSFER_DELIVERY events carry
+#    ``external_references[].type == "inbound_id"`` linking them to a
+#    seller inbound order. They ARE the unit-by-unit reception.
+#  - True ML-internal moves use TRANSFER_RESERVATION (negative qty, empty
+#    external_references) + a paired TRANSFER_DELIVERY (which we never
+#    observe — those would also be empty external_references if they did).
+#
+# Discriminator: include both types as candidates, then filter at the
+# event level via ``_is_seller_inbound_event``. Internal-move
+# TRANSFER_DELIVERY (no inbound_id) is filtered out; seller-inbound
+# TRANSFER_DELIVERY (with inbound_id) credits the FIFO normally.
+INBOUND_EVENT_TYPES = frozenset({"INBOUND_RECEPTION", "TRANSFER_DELIVERY"})
+
+
+def _is_seller_inbound_event(op: dict[str, Any]) -> bool:
+    """True when ``op`` represents the seller's shipment arriving at ML.
+
+    INBOUND_RECEPTION is always a seller reception per the docs (rare in
+    practice; some categories/SKUs never emit it). TRANSFER_DELIVERY must
+    additionally carry an ``inbound_id`` link in its external_references
+    — that's the empirical marker that distinguishes ML's documented
+    seller inbound flow (which they implemented as TRANSFER_DELIVERY in
+    practice) from ML's internal warehouse-to-warehouse moves.
+
+    Negative-quantity events (TRANSFER_RESERVATION et al.) are filtered
+    out downstream by the ``qty > 0`` check in ``_fetch_chunk_inbound``;
+    this discriminator is purely about event TYPE intent.
+    """
+    op_type = op.get("type")
+    if op_type == "INBOUND_RECEPTION":
+        return True
+    if op_type == "TRANSFER_DELIVERY":
+        refs = op.get("external_references") or []
+        return any(isinstance(r, dict) and r.get("type") == "inbound_id" for r in refs)
+    return False
 
 
 @dataclass
@@ -367,7 +398,13 @@ class FulfillmentReceptionService:
             )
             results: list[dict[str, Any]] = data.get("results") or []
             for op in results:
+                # Two-step filter: (1) type must be one we consider for
+                # inbound credit, (2) the event must actually represent a
+                # seller inbound (not a ML-internal warehouse move).
+                # TRANSFER_DELIVERY without an inbound_id is dropped here.
                 if op.get("type") not in INBOUND_EVENT_TYPES:
+                    continue
+                if not _is_seller_inbound_event(op):
                     continue
                 if _extract_received_qty(op) > 0:
                     out.append(op)

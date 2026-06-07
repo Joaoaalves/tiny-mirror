@@ -39,13 +39,25 @@ def _event(
     *,
     event_type: str = "INBOUND_RECEPTION",
     date_iso: str = "2026-05-10T14:30:00Z",
+    inbound_id: str | None = "68000000",
 ) -> dict:
+    """Build a representative ML operation payload for tests.
+
+    ``inbound_id``: default value mimics the real-world TRANSFER_DELIVERY
+    shape from the 2026-06-07 audit (every TRANSFER_DELIVERY in production
+    carries inbound_id). Pass ``None`` to simulate an event without the
+    external_references link — the discriminator must reject it.
+    """
+    refs: list[dict] = []
+    if inbound_id is not None:
+        refs.append({"type": "inbound_id", "value": inbound_id})
     return {
         "id": 1000000000000000000 + qty,
         "type": event_type,
         "date_created": date_iso,
         "detail": {"available_quantity": qty, "not_available_detail": []},
         "result": {"total": qty, "available_quantity": qty},
+        "external_references": refs,
     }
 
 
@@ -294,11 +306,16 @@ class TestFifoMatchWithChronology:
 
 
 # ---------------------------------------------------------------------------
-# INBOUND_EVENT_TYPES gate (Bug 2 fix, 2026-06-05): TRANSFER_DELIVERY is
-# ML's INTERNAL warehouse-to-warehouse flow per the official docs, NOT
-# our seller shipment arriving. Including it credited internal moves
-# against pending transfers (~700 phantom units in a 14-day sample of 30
-# received rows).
+# Seller-inbound discriminator (2026-06-07 audit on RON-COLL-PRE + 49 other
+# inventories, n=2019 TRANSFER_DELIVERY events): the 2026-06-05 restriction
+# to INBOUND_RECEPTION only credited 0 receptions despite ML clearly
+# receiving stock — the empirical channel ML uses for unit-by-unit seller
+# inbound reception is TRANSFER_DELIVERY with external_references.type ==
+# "inbound_id". Pure internal warehouse moves (the doc's TRANSFER_DELIVERY)
+# use TRANSFER_RESERVATION (negative qty, empty refs) instead.
+#
+# These tests pin the discriminator so a doc-driven over-correction
+# (like 2026-06-05's) can't silently break it.
 # ---------------------------------------------------------------------------
 class TestInboundEventTypesContract:
     def test_inbound_reception_is_eligible(self) -> None:
@@ -308,21 +325,102 @@ class TestInboundEventTypesContract:
 
         assert "INBOUND_RECEPTION" in INBOUND_EVENT_TYPES
 
-    def test_transfer_delivery_no_longer_eligible(self) -> None:
+    def test_transfer_delivery_is_eligible_for_discrimination(self) -> None:
+        """TRANSFER_DELIVERY must reach the discriminator (see
+        _is_seller_inbound_event); the qualifier is the inbound_id ref,
+        not the type itself."""
         from tiny_mirror.services.fulfillment_reception_service import (
             INBOUND_EVENT_TYPES,
         )
 
-        assert "TRANSFER_DELIVERY" not in INBOUND_EVENT_TYPES
+        assert "TRANSFER_DELIVERY" in INBOUND_EVENT_TYPES
 
-    def test_set_size_is_one(self) -> None:
-        """If a new inbound-source event type is added, this assertion
-        prompts updating the docstring + this contract test."""
+
+class TestIsSellerInboundEvent:
+    """Pins the empirical discriminator from the 2026-06-07 audit."""
+
+    def test_inbound_reception_always_counts(self) -> None:
         from tiny_mirror.services.fulfillment_reception_service import (
-            INBOUND_EVENT_TYPES,
+            _is_seller_inbound_event,
         )
 
-        assert len(INBOUND_EVENT_TYPES) == 1
+        assert _is_seller_inbound_event({"type": "INBOUND_RECEPTION", "external_references": []})
+
+    def test_transfer_delivery_with_inbound_id_counts(self) -> None:
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        op = {
+            "type": "TRANSFER_DELIVERY",
+            "external_references": [{"type": "inbound_id", "value": "68422036"}],
+        }
+        assert _is_seller_inbound_event(op)
+
+    def test_transfer_delivery_without_inbound_id_rejected(self) -> None:
+        """No inbound_id → ML-internal move (hypothetical for our seller,
+        never observed in 2019/2019 sample, but guard exists)."""
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        op = {"type": "TRANSFER_DELIVERY", "external_references": []}
+        assert not _is_seller_inbound_event(op)
+
+    def test_transfer_delivery_with_unrelated_ref_rejected(self) -> None:
+        """Only ``type=inbound_id`` counts. Other ref types don't make
+        the event a seller inbound."""
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        op = {
+            "type": "TRANSFER_DELIVERY",
+            "external_references": [{"type": "shipment_id", "value": "999"}],
+        }
+        assert not _is_seller_inbound_event(op)
+
+    def test_transfer_reservation_rejected(self) -> None:
+        """TRANSFER_RESERVATION is ML's internal-move signal. Even though
+        external_references is empty, it's still rejected because the type
+        itself isn't in our eligible set."""
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        op = {"type": "TRANSFER_RESERVATION", "external_references": []}
+        assert not _is_seller_inbound_event(op)
+
+    def test_sale_confirmation_rejected(self) -> None:
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        assert not _is_seller_inbound_event(
+            {"type": "SALE_CONFIRMATION", "external_references": []}
+        )
+
+    def test_missing_external_references_rejected(self) -> None:
+        """Defensive: TRANSFER_DELIVERY payload missing the key entirely
+        is treated as 'no inbound_id' → rejected."""
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        assert not _is_seller_inbound_event({"type": "TRANSFER_DELIVERY"})
+
+    def test_malformed_ref_entry_does_not_crash(self) -> None:
+        """A non-dict element in external_references (defensive) must not
+        crash the discriminator — it just doesn't match."""
+        from tiny_mirror.services.fulfillment_reception_service import (
+            _is_seller_inbound_event,
+        )
+
+        op = {
+            "type": "TRANSFER_DELIVERY",
+            "external_references": ["not a dict", None, {"type": "inbound_id", "value": "1"}],
+        }
+        assert _is_seller_inbound_event(op)
 
 
 # ---------------------------------------------------------------------------
@@ -455,12 +553,10 @@ class TestReconciliation:
         assert repo_mock.apply_partial_reception.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_transfer_delivery_events_are_NOT_counted(self, ml_client: AsyncMock) -> None:
-        """TRANSFER_DELIVERY is ML's INTERNAL warehouse move (per official
-        Fulfillment Operations docs). It must NOT credit a seller's
-        pending transfer. This test pins the 2026-06-05 fix that removed
-        TRANSFER_DELIVERY from INBOUND_EVENT_TYPES (the original ~700-unit
-        phantom-reception bug).
+    async def test_transfer_delivery_with_inbound_id_credits(self, ml_client: AsyncMock) -> None:
+        """TRANSFER_DELIVERY with external_references.type=inbound_id IS
+        seller inbound reception (empirical: 2019/2019 such events in the
+        2026-06-07 audit). Each unit credits the pending transfer FIFO.
         """
         service = FulfillmentReceptionService(ml_client=ml_client)
         transfers = [_make_transfer_orm(1, "SKU-A", 3, days_ago=2)]
@@ -476,6 +572,7 @@ class TestReconciliation:
                         1,
                         event_type="TRANSFER_DELIVERY",
                         date_iso=(datetime.now(UTC) - timedelta(hours=h)).isoformat(),
+                        inbound_id=f"6800000{h}",  # default would suffice; explicit for clarity
                     )
                     for h in (1, 2, 3)
                 ],
@@ -494,8 +591,51 @@ class TestReconciliation:
         ):
             result = await service.scan_and_reconcile()
 
-        # TRANSFER_DELIVERY no longer in INBOUND_EVENT_TYPES → events filtered
-        # at _fetch_chunk_inbound, transfer stays pending.
+        # 3 events of 1 unit, transfer of 3 → fully received.
+        assert result.transfers_received == 1
+
+    @pytest.mark.asyncio
+    async def test_transfer_delivery_without_inbound_id_does_not_credit(
+        self, ml_client: AsyncMock
+    ) -> None:
+        """TRANSFER_DELIVERY WITHOUT inbound_id ref is a hypothetical
+        ML-internal warehouse move (never observed in our 2019-event
+        production sample but guarded). Must not credit the pending
+        transfer.
+        """
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        transfers = [_make_transfer_orm(1, "SKU-A", 3, days_ago=2)]
+        mock_session, repo_mock = _patch_session(
+            transfers,
+            listing_rows=[_listing_row("SKU-A", "MLB1", "INV-A", False)],
+        )
+        ml_client.list_fulfillment_operations = AsyncMock(
+            return_value={
+                "paging": {"total": 3},
+                "results": [
+                    _event(
+                        1,
+                        event_type="TRANSFER_DELIVERY",
+                        date_iso=(datetime.now(UTC) - timedelta(hours=h)).isoformat(),
+                        inbound_id=None,  # no ref → discriminator rejects
+                    )
+                    for h in (1, 2, 3)
+                ],
+            }
+        )
+
+        with (
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.AsyncSessionLocal",
+                return_value=mock_session,
+            ),
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.FulfillmentTransferRepository",
+                return_value=repo_mock,
+            ),
+        ):
+            result = await service.scan_and_reconcile()
+
         assert result.transfers_received == 0
 
     @pytest.mark.asyncio
