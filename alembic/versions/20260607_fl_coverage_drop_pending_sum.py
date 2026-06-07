@@ -70,20 +70,42 @@ def downgrade() -> None:
 # the classified CTE; the only diff is the two CASE branches at the end
 # that no longer add pending_full_qty. Kept verbatim so the downgrade and
 # the diff are obvious to reviewers.
-_CREATE_MV_COVERAGE = """
+_CREATE_MV_COVERAGE = r"""
 CREATE MATERIALIZED VIEW mv_coverage AS
 WITH non_kit AS (
-    SELECT p.tiny_id, p.sku, p.description, p.supplier_name, p.supplier_code,
-           EXISTS (
-               SELECT 1 FROM ml_listings ml
-               WHERE ml.sku = p.sku
-                 AND ml.logistic_type = 'fulfillment'
-                 AND ml.status = 'active'
-           ) AS has_fl_listing
+    SELECT p.tiny_id, p.sku, p.description,
+        COALESCE(pfx_sup.supplier_name, NULLIF(sup.supplier_name, '')) AS supplier_name,
+        sup.supplier_code,
+        COALESCE(fl.has_fl, false) AS has_fl_listing
     FROM products p
-    WHERE p.type != 'K' AND p.situation = 'A'
+    LEFT JOIN LATERAL (
+        SELECT (s.value ->> 'nome')                         AS supplier_name,
+               (s.value ->> 'codigoProdutoNoFornecedor')    AS supplier_code
+        FROM jsonb_array_elements(COALESCE(p.suppliers, '[]'::jsonb)) s
+        LIMIT 1
+    ) sup ON true
+    LEFT JOIN LATERAL (
+        SELECT sps.supplier_name
+        FROM sku_prefix_supplier sps
+        WHERE p.sku LIKE sps.prefix || '%'
+        ORDER BY length(sps.prefix) DESC
+        LIMIT 1
+    ) pfx_sup ON true
+    LEFT JOIN LATERAL (
+        SELECT true AS has_fl
+        FROM ml_listings mll
+        WHERE mll.sku = p.sku AND mll.logistic_type = 'fulfillment'
+        LIMIT 1
+    ) fl ON true
+    WHERE p.situation = 'A'
+      AND p.type NOT IN ('K','V')
+      AND p.sku NOT LIKE 'KIT-%'
+      AND p.sku NOT LIKE 'COM-%'
+      AND p.sku NOT LIKE 'XU-%'
+      AND p.sku !~ '^[0-9]'
 ), stock_dep AS (
     SELECT product_tiny_id,
+        GREATEST(SUM(available), 0)::int AS stock_total,
         GREATEST(SUM(available) FILTER (
             WHERE deposit_name ILIKE '%Galpão%'
         ), 0)::int AS stock_galpao,
@@ -95,10 +117,7 @@ WITH non_kit AS (
         ), 0)::int AS stock_fl_in_transfer,
         GREATEST(SUM(available) FILTER (
             WHERE deposit_name ILIKE '%A Caminho%'
-        ), 0)::int AS stock_chegando,
-        GREATEST(SUM(available) FILTER (
-            WHERE deposit_name NOT ILIKE '%Avaria%'
-        ), 0)::int AS stock_total
+        ), 0)::int AS stock_chegando
     FROM stock_deposits
     WHERE NOT ignore
     GROUP BY product_tiny_id
