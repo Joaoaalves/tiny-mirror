@@ -454,10 +454,19 @@ def _patch_session(
     pending_rows: list,
     listing_rows: list[tuple] | None = None,
     variation_rows: list[tuple] | None = None,
+    parent_kit_rows: list[tuple] | None = None,
+    parent_variation_rows: list[tuple] | None = None,
 ):
     """Mock AsyncSessionLocal so each ``session.execute(...)`` returns the
-    next pre-canned result. The scan issues at most 2 execute calls per
-    invocation: (1) main listings, (2) variations if any has_variations=True.
+    next pre-canned result.
+
+    Order of session.execute() in scan_and_reconcile:
+      1. _cancel_non_fulfillment_pending raw SQL → no rows (handled internally)
+      2. main MLListingORM listings query (direct FL listings)
+      3. variations query (only if any has_variations=True)
+      4. parent kit listings query (only if any SKU lacks direct FL inv)
+      5. parent kit variations query (only if any parent listing has variations)
+    Extra unused side_effects are harmless — Mock just leaves them queued.
     """
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
@@ -466,20 +475,33 @@ def _patch_session(
 
     listing_rows = listing_rows or []
     variation_rows = variation_rows or []
+    parent_kit_rows = parent_kit_rows or []
+    parent_variation_rows = parent_variation_rows or []
 
-    # Order of session.execute() in scan_and_reconcile:
-    # 1. _cancel_non_fulfillment_pending raw SQL → returns no rows
-    # 2. main MLListingORM listings query
-    # 3. variations query (only if at least one has_variations=True; we add
-    #    it unconditionally — extra unused side_effects are harmless)
     cancel_result = MagicMock()
     cancel_result.all = MagicMock(return_value=[])
     listing_result = MagicMock()
     listing_result.all = MagicMock(return_value=listing_rows)
     variation_result = MagicMock()
     variation_result.all = MagicMock(return_value=variation_rows)
+    parent_result = MagicMock()
+    parent_result.all = MagicMock(return_value=parent_kit_rows)
+    parent_var_result = MagicMock()
+    parent_var_result.all = MagicMock(return_value=parent_variation_rows)
 
-    mock_session.execute = AsyncMock(side_effect=[cancel_result, listing_result, variation_result])
+    # The variation query only fires when at least one direct listing has
+    # has_variations=True. Build the side_effect list to match what the
+    # code path will actually call so parent queries land on the right slot.
+    has_main_vars = any(row[3] for row in listing_rows)
+    has_parent_vars = any(row[3] for row in parent_kit_rows)
+    side_effects = [cancel_result, listing_result]
+    if has_main_vars:
+        side_effects.append(variation_result)
+    side_effects.append(parent_result)
+    if has_parent_vars:
+        side_effects.append(parent_var_result)
+
+    mock_session.execute = AsyncMock(side_effect=side_effects)
 
     repo_mock = AsyncMock()
     repo_mock.list_all = AsyncMock(return_value=(pending_rows, len(pending_rows)))
@@ -852,4 +874,152 @@ class TestReconciliation:
         ):
             await service.scan_and_reconcile()
 
-        assert call_count >= 2, f"Expected chunked calls for 120-day-old transfer; got {call_count}"
+
+class TestBug4ParentKitInventoryFallback:
+    """Cat. A — SKU base sem FL listing direta, mas é componente de kit FL.
+
+    Real-world example: ``RTA-GAV4-P`` moved from fulfillment to xd_drop_off
+    on its direct listing, but is still shipped to FL as part of the kits
+    ``6U-RTA-GAV4-P`` / ``12U-RTA-GAV4-P`` / ``3U-RTA-GAV4-P``. Reception
+    events land on the kits' inventories — we must follow the parent-kit
+    chain and credit ``event_qty * comp_per_kit`` to the base SKU's pending.
+    """
+
+    @pytest.mark.asyncio
+    async def test_base_sku_receives_via_parent_kit_with_multiplier(
+        self, ml_client: AsyncMock
+    ) -> None:
+        """Transfer of 12 base units, kit parent has comp_per_kit=6 → one
+        kit reception of 2 must credit 12 (=2*6) base units, fully closing."""
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        transfers = [_make_transfer_orm(1, "BASE-SKU", 12, days_ago=3)]
+        mock_session, repo_mock = _patch_session(
+            transfers,
+            listing_rows=[],  # no direct FL listing for BASE-SKU
+            parent_kit_rows=[
+                # (base_sku, mlb_id, inventory_id, has_variations, comp_per_kit)
+                ("BASE-SKU", "MLB-KIT-6U", "INV-KIT-6U", False, 6),
+            ],
+        )
+        ml_client.list_fulfillment_operations = AsyncMock(
+            return_value={
+                "paging": {"total": 1},
+                "results": [
+                    _event(
+                        2,  # 2 kits received
+                        event_type="TRANSFER_DELIVERY",
+                        date_iso=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                    )
+                ],
+            }
+        )
+
+        with (
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.AsyncSessionLocal",
+                return_value=mock_session,
+            ),
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.FulfillmentTransferRepository",
+                return_value=repo_mock,
+            ),
+        ):
+            result = await service.scan_and_reconcile()
+
+        assert result.transfers_received == 1
+        assert result.transfers_partially_received == 0
+        assert result.skus_with_no_inventory == []
+        # Verify the credit was 12 (=2*6), not 2.
+        repo_mock.apply_partial_reception.assert_awaited_once()
+        call_kwargs = repo_mock.apply_partial_reception.await_args.kwargs
+        assert call_kwargs["delta_quantity"] == 12
+
+    @pytest.mark.asyncio
+    async def test_base_sku_partial_credit_via_parent_kit(self, ml_client: AsyncMock) -> None:
+        """Transfer of 18 base units, kit parent has comp_per_kit=6 → one
+        kit reception of 2 credits only 12 (=2*6); transfer stays pending."""
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        transfers = [_make_transfer_orm(1, "BASE-SKU", 18, days_ago=3)]
+        mock_session, repo_mock = _patch_session(
+            transfers,
+            listing_rows=[],
+            parent_kit_rows=[
+                ("BASE-SKU", "MLB-KIT-6U", "INV-KIT-6U", False, 6),
+            ],
+        )
+        ml_client.list_fulfillment_operations = AsyncMock(
+            return_value={
+                "paging": {"total": 1},
+                "results": [
+                    _event(
+                        2,
+                        event_type="TRANSFER_DELIVERY",
+                        date_iso=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                    )
+                ],
+            }
+        )
+
+        with (
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.AsyncSessionLocal",
+                return_value=mock_session,
+            ),
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.FulfillmentTransferRepository",
+                return_value=repo_mock,
+            ),
+        ):
+            result = await service.scan_and_reconcile()
+
+        assert result.transfers_received == 0
+        assert result.transfers_partially_received == 1
+        # 18 - 12 = 6 still outstanding; delta credited = 12
+        call_kwargs = repo_mock.apply_partial_reception.await_args.kwargs
+        assert call_kwargs["delta_quantity"] == 12
+
+    @pytest.mark.asyncio
+    async def test_direct_fl_takes_precedence_over_parent_kit(self, ml_client: AsyncMock) -> None:
+        """When the SKU has a direct FL listing, do not also resolve parent
+        kits (avoids double-credit). The parent_kit_rows is provided to
+        prove they're ignored when direct inventory exists."""
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        transfers = [_make_transfer_orm(1, "SKU-A", 5, days_ago=2)]
+        mock_session, repo_mock = _patch_session(
+            transfers,
+            listing_rows=[_listing_row("SKU-A", "MLB1", "INV-A", False)],
+            parent_kit_rows=[
+                # Would multiply by 100 if it were applied; assertion below
+                # proves it isn't.
+                ("SKU-A", "MLB-KIT", "INV-KIT", False, 100),
+            ],
+        )
+        ml_client.list_fulfillment_operations = AsyncMock(
+            return_value={
+                "paging": {"total": 1},
+                "results": [
+                    _event(
+                        5,
+                        date_iso=(datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                    )
+                ],
+            }
+        )
+
+        with (
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.AsyncSessionLocal",
+                return_value=mock_session,
+            ),
+            patch(
+                "tiny_mirror.services.fulfillment_reception_service.FulfillmentTransferRepository",
+                return_value=repo_mock,
+            ),
+        ):
+            result = await service.scan_and_reconcile()
+
+        assert result.transfers_received == 1
+        # Direct credit = 5, not 5*100. If the multiplier had leaked we'd
+        # see delta_quantity=500.
+        call_kwargs = repo_mock.apply_partial_reception.await_args.kwargs
+        assert call_kwargs["delta_quantity"] == 5

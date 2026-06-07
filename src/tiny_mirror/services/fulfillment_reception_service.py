@@ -155,11 +155,18 @@ class FulfillmentReceptionService:
         for row in pending_rows:
             by_sku.setdefault(row.product_sku, []).append(row)
 
-        # Build a SKU -> [inventory_id] map covering BOTH main listings and
-        # their variations. A SKU split across multiple MLBs and/or
-        # variations maps to multiple inventories.
+        # Build a SKU -> list of (inventory_id, multiplier) map.
+        #
+        # multiplier=1 → SKU is sold as itself on FL (direct listing).
+        # multiplier=N → SKU has no direct FL listing but is a component
+        #                of a kit whose FL listing exposes this base SKU
+        #                through its parent inventory. One unit recorded
+        #                by ML on the parent's inventory means N component
+        #                units physically arrived. Used for Bug-4 SKUs like
+        #                RTA-GAV4-P that were swapped to xd_drop_off but
+        #                are still shipped to FL as part of 6U/12U/3U kits.
         sku_list = list(by_sku.keys())
-        inventory_map: dict[str, list[str]] = {}
+        inventory_map: dict[str, list[tuple[str, int]]] = {}
         async with AsyncSessionLocal() as session:
             main_rows = (
                 await session.execute(
@@ -180,7 +187,7 @@ class FulfillmentReceptionService:
                 if has_variations:
                     variation_mlb_ids.append(mlb_id)
                 elif inventory_id:
-                    inventory_map.setdefault(sku, []).append(inventory_id)
+                    inventory_map.setdefault(sku, []).append((inventory_id, 1))
 
             if variation_mlb_ids:
                 var_rows = (
@@ -198,16 +205,79 @@ class FulfillmentReceptionService:
                 ).all()
                 for sku, inventory_id in var_rows:
                     if inventory_id:
-                        inventory_map.setdefault(sku, []).append(inventory_id)
+                        inventory_map.setdefault(sku, []).append((inventory_id, 1))
 
-        # Deduplicate inventory_ids per SKU (two listings can share an inventory).
+            # Bug-4 fallback: SKUs with no direct FL inventory but kit-FL
+            # parents. Pull parent kit listings + their inventories along
+            # with the per-kit component quantity. Multiplier = comp_per_kit.
+            skus_without_direct = [s for s in sku_list if s not in inventory_map]
+            if skus_without_direct:
+                from sqlalchemy import text
+
+                parent_rows = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT
+                                ft.product_sku AS base_sku,
+                                ml.mlb_id,
+                                ml.inventory_id,
+                                ml.has_variations,
+                                kc.quantity AS comp_per_kit
+                            FROM (SELECT DISTINCT product_sku, product_tiny_id
+                                  FROM fulfillment_transfers
+                                  WHERE product_sku = ANY(:sku_list)) ft
+                            JOIN product_kit_components kc
+                              ON kc.component_product_tiny_id = ft.product_tiny_id
+                            JOIN products p_kit
+                              ON p_kit.tiny_id = kc.kit_product_tiny_id
+                            JOIN ml_listings ml
+                              ON ml.sku = p_kit.sku
+                            WHERE ml.logistic_type = 'fulfillment'
+                              AND ml.status IN ('active', 'paused')
+                            """
+                        ),
+                        {"sku_list": skus_without_direct},
+                    )
+                ).all()
+
+                parent_variation_mlbs: list[tuple[str, str, int]] = []
+                for base_sku, mlb_id, inv_id, has_var, comp_per_kit in parent_rows:
+                    mult = max(1, int(comp_per_kit or 1))
+                    if has_var:
+                        parent_variation_mlbs.append((base_sku, mlb_id, mult))
+                    elif inv_id:
+                        inventory_map.setdefault(base_sku, []).append((inv_id, mult))
+
+                if parent_variation_mlbs:
+                    mlb_ids = list({m for _, m, _ in parent_variation_mlbs})
+                    parent_var_rows = (
+                        await session.execute(
+                            select(
+                                MLListingVariationORM.mlb_id,
+                                MLListingVariationORM.inventory_id,
+                            ).where(
+                                MLListingVariationORM.mlb_id.in_(mlb_ids),
+                                MLListingVariationORM.inventory_id.isnot(None),
+                            )
+                        )
+                    ).all()
+                    by_mlb_inv: dict[str, list[str]] = {}
+                    for mlb_id, inv_id in parent_var_rows:
+                        if inv_id:
+                            by_mlb_inv.setdefault(mlb_id, []).append(inv_id)
+                    for base_sku, mlb_id, mult in parent_variation_mlbs:
+                        for inv_id in by_mlb_inv.get(mlb_id, []):
+                            inventory_map.setdefault(base_sku, []).append((inv_id, mult))
+
+        # Deduplicate (inventory_id, multiplier) per SKU.
         for sku in list(inventory_map.keys()):
             inventory_map[sku] = sorted(set(inventory_map[sku]))
 
         for sku, transfers in by_sku.items():
             result.skus_scanned += 1
-            inventory_ids = inventory_map.get(sku) or []
-            if not inventory_ids:
+            inventory_sources = inventory_map.get(sku) or []
+            if not inventory_sources:
                 logger.warning(
                     "No fulfillment inventory_id found for SKU, skipping",
                     sku=sku,
@@ -220,14 +290,14 @@ class FulfillmentReceptionService:
 
             try:
                 events = await self._fetch_inbound_events(
-                    inventory_ids=inventory_ids,
+                    inventory_sources=inventory_sources,
                     oldest_transfer_date=oldest_date,
                 )
             except Exception as exc:
                 logger.error(
                     "Failed to fetch fulfillment operations for SKU",
                     sku=sku,
-                    inventory_ids=inventory_ids,
+                    inventory_sources=inventory_sources,
                     error=str(exc),
                 )
                 result.errors.append(f"{sku}: {exc}")
@@ -237,7 +307,7 @@ class FulfillmentReceptionService:
                 logger.debug(
                     "No INBOUND_RECEPTION/TRANSFER_DELIVERY events found for SKU",
                     sku=sku,
-                    inventory_ids=inventory_ids,
+                    inventory_sources=inventory_sources,
                 )
                 continue
 
@@ -249,7 +319,7 @@ class FulfillmentReceptionService:
                     "Events present but none eligible (date filter) or "
                     "no new units to credit existing pendings",
                     sku=sku,
-                    inventory_ids=inventory_ids,
+                    inventory_sources=inventory_sources,
                     events_count=len(events),
                 )
                 continue
@@ -260,7 +330,7 @@ class FulfillmentReceptionService:
             logger.info(
                 "Reception events found for SKU",
                 sku=sku,
-                inventory_ids=inventory_ids,
+                inventory_sources=inventory_sources,
                 event_count=len(events),
                 full_count=len(full_decisions),
                 partial_count=len(partial_decisions),
@@ -298,17 +368,19 @@ class FulfillmentReceptionService:
     async def _cancel_non_fulfillment_pending(self) -> int:
         """Cancel pending transfers whose SKU is no longer on the FL channel.
 
-        A SKU is treated as non-fulfillment when none of its ``ml_listings``
-        rows has ``logistic_type='fulfillment'`` (anymore). In that case ML
-        will never emit an INBOUND_RECEPTION / TRANSFER_DELIVERY for the
-        SKU, so leaving the transfer in 'pending' permanently distorts
-        coverage math. Cancellation is a metadata-only operation — Tiny
-        stock is untouched.
+        A SKU is treated as non-fulfillment when none of the following holds:
+          (a) It has at least one ``ml_listings`` row with
+              ``logistic_type='fulfillment'`` AND ``status IN ('active','paused')``
+              — paused counts because sub_status=out_of_stock means the
+              listing is still FL, just temporarily without stock.
+          (b) It is a kit component of at least one product whose own
+              ``ml_listings`` is fulfillment+active/paused — even though
+              the base SKU has no direct FL listing, the units physically
+              shipped reach FL via the parent kit's MLB inventory.
 
-        SKUs with **zero** ml_listings rows (e.g. kit components) are
-        deliberately *not* cancelled here: we don't know whether they're
-        legitimately fulfilled via a parent kit's MLB; safer to leave them
-        pending for operator review.
+        SKUs with **zero** ml_listings rows AND no FL-listed parent kit are
+        deliberately *not* cancelled here either: still safer to leave
+        them pending for operator review.
         """
         from sqlalchemy import text
 
@@ -326,6 +398,18 @@ class FulfillmentReceptionService:
                           SELECT 1 FROM ml_listings ml
                           WHERE ml.sku = ft.product_sku
                             AND ml.logistic_type = 'fulfillment'
+                            AND ml.status IN ('active', 'paused')
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM product_kit_components kc
+                          JOIN products p_kit
+                            ON p_kit.tiny_id = kc.kit_product_tiny_id
+                          JOIN ml_listings ml2
+                            ON ml2.sku = p_kit.sku
+                          WHERE kc.component_product_tiny_id = ft.product_tiny_id
+                            AND ml2.logistic_type = 'fulfillment'
+                            AND ml2.status IN ('active', 'paused')
                       )
                     """
                 )
@@ -352,28 +436,42 @@ class FulfillmentReceptionService:
 
     async def _fetch_inbound_events(
         self,
-        inventory_ids: list[str],
+        inventory_sources: list[tuple[str, int]],
         oldest_transfer_date: datetime,
     ) -> list[dict[str, Any]]:
         """Return all inbound-positive events (INBOUND_RECEPTION +
-        TRANSFER_DELIVERY) across every inventory, from oldest_transfer_date
-        to now. Chunks at <= 59 days because ML caps the date range at 60d.
+        TRANSFER_DELIVERY) across every inventory source, from
+        oldest_transfer_date to now. Chunks at <= 59 days because ML caps
+        the date range at 60d.
+
+        Each ``(inventory_id, multiplier)`` source applies its multiplier
+        to ``detail.available_quantity`` so the FIFO matcher credits the
+        right number of base-SKU units when a kit-parent inventory is
+        used as the source.
         """
         now_utc = datetime.now(UTC)
         oldest_utc = oldest_transfer_date.astimezone(UTC)
 
         collected: list[dict[str, Any]] = []
-        for inventory_id in inventory_ids:
+        for inventory_id, multiplier in inventory_sources:
             chunk_start = oldest_utc
             while chunk_start < now_utc:
                 chunk_end = min(chunk_start + timedelta(days=59), now_utc)
-                collected.extend(
-                    await self._fetch_chunk_inbound(
-                        inventory_id=inventory_id,
-                        date_from=_format_ml_datetime(chunk_start),
-                        date_to=_format_ml_datetime(chunk_end),
-                    )
+                chunk_events = await self._fetch_chunk_inbound(
+                    inventory_id=inventory_id,
+                    date_from=_format_ml_datetime(chunk_start),
+                    date_to=_format_ml_datetime(chunk_end),
                 )
+                if multiplier != 1:
+                    for e in chunk_events:
+                        scaled = dict(e)
+                        detail = dict(scaled.get("detail") or {})
+                        raw_qty = _extract_received_qty(e)
+                        detail["available_quantity"] = raw_qty * multiplier
+                        scaled["detail"] = detail
+                        collected.append(scaled)
+                else:
+                    collected.extend(chunk_events)
                 chunk_start = chunk_end + timedelta(milliseconds=1)
         return collected
 
