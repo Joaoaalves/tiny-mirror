@@ -100,6 +100,35 @@ def _dec(v: Any) -> Decimal:
     return v if isinstance(v, Decimal) else Decimal(str(v))
 
 
+def apply_flex_calibration(
+    logistic_type: str | None,
+    commission_pct: Any,
+    freight_bands: list[dict[str, Any]] | None,
+    calib: Any,
+) -> tuple[Any, list[dict[str, Any]] | None]:
+    """Return effective ``(commission_pct, freight_bands)`` for margin math.
+
+    For **Flex** (non-fulfillment) listings that have a per-MLB calibration row
+    (``ml_flex_fee_calibration``), commission becomes the real effective rate and
+    freight becomes a synthetic 2-band table split at R$79 (the free-shipping
+    cliff: ML covers ~100% under R$79 and ~10% above). Fulfillment listings, an
+    unknown ``logistic_type``, or a missing/empty calibration return the
+    snapshot values UNCHANGED — fulfillment fees are already correct and must
+    never be overridden. This is the single source of truth for the override;
+    both the caps enrichment and the floor recompute use it.
+    """
+    if logistic_type is None or logistic_type == "fulfillment" or calib is None:
+        return commission_pct, freight_bands
+    real_comm = getattr(calib, "real_comm_pct", None)
+    if real_comm is None:
+        return commission_pct, freight_bands
+    bands: list[dict[str, Any]] = [
+        {"min": 0, "max": 78.99, "cost": float(getattr(calib, "freight_per_unit_lt79", 0) or 0)},
+        {"min": 79, "max": None, "cost": float(getattr(calib, "freight_per_unit_ge79", 0) or 0)},
+    ]
+    return real_comm, bands
+
+
 def margin_at_price(
     *,
     price: Decimal | float | int,

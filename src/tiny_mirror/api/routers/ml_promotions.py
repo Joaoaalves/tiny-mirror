@@ -414,6 +414,7 @@ async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tupl
         MLFlexFeeCalibrationORM,
         MLListingORM,
     )
+    from tiny_mirror.services.pricing_service import apply_flex_calibration
 
     base_comm = snap.commission_pct if snap is not None else None
     base_bands = snap.freight_bands if snap is not None else None
@@ -427,14 +428,7 @@ async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tupl
         return base_comm, base_bands
 
     calib = await session.get(MLFlexFeeCalibrationORM, mlb_id)
-    if calib is None or calib.real_comm_pct is None:
-        return base_comm, base_bands
-
-    bands = [
-        {"min": 0, "max": 78.99, "cost": float(calib.freight_per_unit_lt79 or 0)},
-        {"min": 79, "max": None, "cost": float(calib.freight_per_unit_ge79 or 0)},
-    ]
-    return calib.real_comm_pct, bands
+    return apply_flex_calibration(logistic_type, base_comm, base_bands, calib)
 
 
 async def _enrich_cap(
