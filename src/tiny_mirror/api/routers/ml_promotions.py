@@ -396,6 +396,47 @@ async def _build_decision_context(
 # ---------------------------------------------------------------------------
 # CAPS
 # ---------------------------------------------------------------------------
+async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tuple[Any, Any]:
+    """Return ``(commission_pct, freight_bands)`` for margin math, applying the
+    per-MLB **Flex** fee calibration when one exists.
+
+    Fulfillment listings (and any MLB with unknown logistic_type or no
+    calibration row) return the snapshot values UNCHANGED — fulfillment fees are
+    already correct and must never be overridden. For Flex listings with a
+    calibration row, commission_pct becomes the real effective rate and
+    freight_bands becomes a synthetic 2-band table split at R$79 (the
+    free-shipping cliff), so both margin engines and the frontend pick up the
+    real seller freight without any further changes.
+    """
+    from sqlalchemy import select
+
+    from tiny_mirror.infrastructure.orm.models import (
+        MLFlexFeeCalibrationORM,
+        MLListingORM,
+    )
+
+    base_comm = snap.commission_pct if snap is not None else None
+    base_bands = snap.freight_bands if snap is not None else None
+
+    logistic_type = (
+        await session.execute(
+            select(MLListingORM.logistic_type).where(MLListingORM.mlb_id == mlb_id)
+        )
+    ).scalar_one_or_none()
+    if logistic_type is None or logistic_type == "fulfillment":
+        return base_comm, base_bands
+
+    calib = await session.get(MLFlexFeeCalibrationORM, mlb_id)
+    if calib is None or calib.real_comm_pct is None:
+        return base_comm, base_bands
+
+    bands = [
+        {"min": 0, "max": 78.99, "cost": float(calib.freight_per_unit_lt79 or 0)},
+        {"min": 79, "max": None, "cost": float(calib.freight_per_unit_ge79 or 0)},
+    ]
+    return calib.real_comm_pct, bands
+
+
 async def _enrich_cap(
     session: AsyncSession,
     cap: Any,
@@ -418,23 +459,26 @@ async def _enrich_cap(
     if snap is not None:
         out.list_price = snap.list_price
         out.base_cost = snap.base_cost
-        out.commission_pct = snap.commission_pct
-        out.freight_bands = snap.freight_bands
+        # Flex listings: override the (wrong) spreadsheet commission + generic
+        # freight bands with the per-MLB calibration. Fulfillment is unchanged.
+        eff_commission_pct, eff_freight_bands = await _effective_fees(session, cap.mlb_id, snap)
+        out.commission_pct = eff_commission_pct
+        out.freight_bands = eff_freight_bands
         out.sheet_promo_price = snap.sheet_promo_price
 
         floor_price = cap.margin_floor_price or snap.sheet_promo_price
         if (
             floor_price is not None
             and snap.base_cost is not None
-            and snap.commission_pct is not None
-            and snap.freight_bands
+            and eff_commission_pct is not None
+            and eff_freight_bands
         ):
             try:
                 breakdown = margin_at_price(
                     price=floor_price,
                     base_cost=snap.base_cost,
-                    commission_pct=snap.commission_pct,
-                    freight_bands=snap.freight_bands,
+                    commission_pct=eff_commission_pct,
+                    freight_bands=eff_freight_bands,
                 )
                 out.margin_at_floor_value = breakdown.margin_value
                 out.margin_at_floor_pct = breakdown.margin_pct

@@ -1578,3 +1578,38 @@ class PhantomProductsLogORM(Base):
     detected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+# ---------------------------------------------------------------------------
+# ml_flex_fee_calibration
+# ---------------------------------------------------------------------------
+class MLFlexFeeCalibrationORM(Base):
+    """Per-MLB calibrated ML fees for **Flex / non-fulfillment** listings only.
+
+    Fulfillment listings are NEVER calibrated here — their snapshot
+    commission_pct + freight_bands are already correct and must stay untouched.
+
+    Derived from settled ML orders (Orders API ``sale_fee`` per unit +
+    ``shipments/{id}/costs`` ``senders.cost`` per shipment / qty). The spreadsheet
+    commission and the generic freight bands are wrong for Flex listings; this
+    table holds what ML actually charged, per listing:
+
+    - ``real_comm_pct``: median effective commission (sale_fee / price), in %.
+    - ``freight_per_unit_lt79`` / ``freight_per_unit_ge79``: mean seller freight
+      per unit, split by the R$79 free-shipping band (ML covers ~100% under R$79
+      and ~10% above, so freight jumps at the R$79 cliff).
+    """
+
+    __tablename__ = "ml_flex_fee_calibration"
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    n_sales: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    real_comm_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
+    freight_per_unit_lt79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    freight_per_unit_ge79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    n_freight_lt79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    n_freight_ge79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
