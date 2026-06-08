@@ -196,6 +196,13 @@ class Settings(BaseSettings):
     sync_ml_sales_cron: str = "0 4 * * *"
     sync_ml_sales_window_days: int = 7
 
+    # Flex fee calibration (real commission + freight per Flex MLB from settled
+    # orders). Weekly — Sundays 04:20 UTC. Heavy (re-pulls orders + shipment
+    # costs), so off-peak and infrequent.
+    sync_flex_calibration_cron: str = "20 4 * * 0"
+    sync_flex_calibration_days: int = 90
+    sync_flex_calibration_max_shipments: int = 3000
+
     # Controle 4.0 GAS Web App. Single deployment URL with action routing:
     #   ?action=manual_status         → SKU color tags from GERAL B+C
     #   ?action=costs_all             → bulk dump of every MLB cost row

@@ -119,9 +119,13 @@ def apply_flex_calibration(
     """
     if logistic_type is None or logistic_type == "fulfillment" or calib is None:
         return commission_pct, freight_bands
+    # Flex with a calibration row: ALWAYS replace the (wrong) generic freight
+    # bands with the calibrated 2-band Flex table — fallback rows for listings
+    # without sales still carry the global Flex mean, so they don't silently
+    # revert to the fulfillment-style bands. Commission is overridden only when
+    # we actually measured it (real_comm_pct); otherwise keep the snapshot %.
     real_comm = getattr(calib, "real_comm_pct", None)
-    if real_comm is None:
-        return commission_pct, freight_bands
+    eff_comm = real_comm if real_comm is not None else commission_pct
     # ``payback`` (ML freight subsidy) rides along on each band for the UI; the
     # margin math only reads ``cost`` so the extra key is harmless.
     bands: list[dict[str, Any]] = [
@@ -138,7 +142,7 @@ def apply_flex_calibration(
             "payback": float(getattr(calib, "payback_per_unit_ge79", 0) or 0),
         },
     ]
-    return real_comm, bands
+    return eff_comm, bands
 
 
 def margin_at_price(

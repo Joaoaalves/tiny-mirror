@@ -103,6 +103,28 @@ def test_apply_flex_calibration_pure_helper() -> None:
     assert bands == BANDS_CALIBRATED
 
 
+def test_apply_flex_calibration_fallback_row_overrides_only_freight() -> None:
+    """A no-sales fallback row (real_comm_pct=None) still replaces the freight
+    bands with the global Flex 2-band table, but keeps the snapshot commission."""
+    from tiny_mirror.services.pricing_service import apply_flex_calibration
+
+    fallback = SimpleNamespace(
+        real_comm_pct=None,
+        freight_per_unit_lt79=Decimal("5.54"),
+        freight_per_unit_ge79=Decimal("37.82"),
+        payback_per_unit_lt79=Decimal("0.00"),
+        payback_per_unit_ge79=Decimal("0.00"),
+    )
+    comm, bands = apply_flex_calibration(
+        "xd_drop_off", Decimal("11.5"), SNAP.freight_bands, fallback
+    )
+    assert comm == Decimal("11.5")  # commission kept — no measured rate
+    assert bands == [
+        {"min": 0, "max": 78.99, "cost": 5.54, "payback": 0.0},
+        {"min": 79, "max": None, "cost": 37.82, "payback": 0.0},
+    ]
+
+
 def test_calc_cap_for_snapshot_honors_fee_override() -> None:
     """The Flex floor must use the calibrated fees: higher fees → higher floor."""
     from tiny_mirror.services.cap_recompute_service import calc_cap_for_snapshot

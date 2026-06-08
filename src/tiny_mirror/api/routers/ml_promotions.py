@@ -2242,6 +2242,40 @@ async def sync_ml_sales(
     return await svc.backfill(days=days)
 
 
+@router.post("/calibrate-flex")
+async def calibrate_flex(
+    days: int = Query(default=90, ge=1, le=180),
+    max_shipments: int = Query(default=3000, ge=100, le=12000),
+    request: Request = None,  # type: ignore[assignment]
+) -> dict[str, Any]:
+    """Dispara a recalibração das taxas Flex (comissão + frete por anúncio dos
+    pedidos reais) em background. Pesado (~10-15 min, puxa pedidos + fretes), por
+    isso roda detached e devolve na hora. O job semanal faz o mesmo."""
+    import asyncio
+
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    if ml_token_service is None:
+        raise HTTPException(status_code=503, detail="ML token service not configured")
+    svc = FlexFeeCalibrationService(
+        token_service=ml_token_service,
+        http_client=request.app.state.http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+
+    async def _run() -> None:
+        try:
+            await svc.recalibrate(days=days, max_shipments=max_shipments)
+        except Exception as exc:  # pragma: no cover — background safety
+            logger.error("calibrate-flex background run failed", error=str(exc))
+
+    # Keep a reference on app.state so the task isn't garbage-collected mid-run.
+    request.app.state.flex_calib_task = asyncio.create_task(_run())
+    return {"status": "started", "days": days, "max_shipments": max_shipments}
+
+
 @router.get("/sales-daily-all")
 async def sales_daily_all(
     days: int = Query(default=90, ge=1, le=180),

@@ -121,6 +121,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
                 settings.sync_ml_catalog_status_cron, timezone="UTC"
             ),
             "ml_sales_sync": CronTrigger.from_crontab(settings.sync_ml_sales_cron, timezone="UTC"),
+            "flex_calibration": CronTrigger.from_crontab(
+                settings.sync_flex_calibration_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -192,6 +195,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_sales_sync() -> None:
         await ml_sales_sync_job(http_client, app.state.ml_token_service)
+
+    async def _flex_calibration() -> None:
+        await flex_calibration_job(http_client, app.state.ml_token_service)
 
     scheduler.add_job(
         _token_rotation,
@@ -305,6 +311,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_sales_sync,
         trigger=triggers["ml_sales_sync"],
         id="ml_sales_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _flex_calibration,
+        trigger=triggers["flex_calibration"],
+        id="flex_calibration",
         replace_existing=True,
     )
 
@@ -842,6 +854,30 @@ async def ml_sales_sync_job(http_client: Any, ml_token_service: Any) -> None:
     )
     stats = await service.backfill(days=settings.sync_ml_sales_window_days)
     logger.info("ML sales sync job completed", **stats)
+
+
+async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:
+    """Weekly: refresh ``ml_flex_fee_calibration`` (real commission + freight per
+    Flex MLB) from settled orders + shipment costs. Fulfillment is untouched.
+    No-op without ML credentials."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("flex calibration skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    logger.info("flex calibration job started")
+    service = FlexFeeCalibrationService(
+        token_service=ml_token_service,
+        http_client=http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+    stats = await service.recalibrate(
+        days=settings.sync_flex_calibration_days,
+        max_shipments=settings.sync_flex_calibration_max_shipments,
+    )
+    logger.info("flex calibration job completed", **stats)
 
 
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:
