@@ -42,13 +42,23 @@ def main(csv_path: str) -> None:
         p, sf, q = f(r["unit_price"]), f(r["sale_fee"]), (f(r["qty"]) or 1)
         if p is None or sf is None or p <= 0:
             continue
-        d = by.setdefault(r["mlb"], {"sku": r.get("sku"), "rates": [], "fr_lt": [], "fr_ge": []})
+        d = by.setdefault(
+            r["mlb"],
+            {"sku": r.get("sku"), "rates": [], "fr_lt": [], "fr_ge": [], "pb_lt": [], "pb_ge": []},
+        )
         d["rates"].append(sf / p * 100)
         fr = f(r["seller_freight"])
         if fr is not None:
             per_unit = fr / q
-            (d["fr_ge"] if p >= 79 else d["fr_lt"]).append(per_unit)
-            (glob_ge if p >= 79 else glob_lt).append(per_unit)
+            pb = (f(r.get("ml_freight_save")) or 0.0) / q  # ML subsidy per unit
+            if p >= 79:
+                d["fr_ge"].append(per_unit)
+                d["pb_ge"].append(pb)
+                glob_ge.append(per_unit)
+            else:
+                d["fr_lt"].append(per_unit)
+                d["pb_lt"].append(pb)
+                glob_lt.append(per_unit)
 
     fb_lt = round(st.mean(glob_lt), 2) if glob_lt else 0.0
     fb_ge = round(st.mean(glob_ge), 2) if glob_ge else 0.0
@@ -62,19 +72,21 @@ def main(csv_path: str) -> None:
         comm = round(st.median(d["rates"]), 2) if d["rates"] else None
         fr_lt = round(st.mean(d["fr_lt"]), 2) if d["fr_lt"] else fb_lt
         fr_ge = round(st.mean(d["fr_ge"]), 2) if d["fr_ge"] else fb_ge
+        pb_lt = round(st.mean(d["pb_lt"]), 2) if d["pb_lt"] else 0.0
+        pb_ge = round(st.mean(d["pb_ge"]), 2) if d["pb_ge"] else 0.0
         sku = (d["sku"] or "").replace("'", "''")
         values.append(
             f"('{mlb}', '{sku}', {len(d['rates'])}, {sql_num(comm)}, "
-            f"{sql_num(fr_lt)}, {sql_num(fr_ge)}, {len(d['fr_lt'])}, {len(d['fr_ge'])}, now())"
+            f"{sql_num(fr_lt)}, {sql_num(fr_ge)}, {sql_num(pb_lt)}, {sql_num(pb_ge)}, "
+            f"{len(d['fr_lt'])}, {len(d['fr_ge'])}, now())"
         )
 
     sql = (
         "BEGIN;\nDELETE FROM ml_flex_fee_calibration;\n"
         "INSERT INTO ml_flex_fee_calibration "
         "(mlb_id, sku, n_sales, real_comm_pct, freight_per_unit_lt79, "
-        "freight_per_unit_ge79, n_freight_lt79, n_freight_ge79, updated_at) VALUES\n"
-        + ",\n".join(values)
-        + ";\nCOMMIT;\n"
+        "freight_per_unit_ge79, payback_per_unit_lt79, payback_per_unit_ge79, "
+        "n_freight_lt79, n_freight_ge79, updated_at) VALUES\n" + ",\n".join(values) + ";\nCOMMIT;\n"
     )
     proc = subprocess.run(
         ["sudo", "-u", "postgres", "psql", "-d", "tiny_mirror_db", "-v", "ON_ERROR_STOP=1"],

@@ -1608,6 +1608,10 @@ class MLFlexFeeCalibrationORM(Base):
     real_comm_pct: Mapped[Decimal | None] = mapped_column(Numeric(5, 2), nullable=True)
     freight_per_unit_lt79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     freight_per_unit_ge79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    # Mean ML freight subsidy ("payback") per unit, by band — how much ML knocks
+    # off the seller's shipping bill (senders.save). Informational for the UI.
+    payback_per_unit_lt79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
+    payback_per_unit_ge79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     n_freight_lt79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     n_freight_ge79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     updated_at: Mapped[datetime] = mapped_column(

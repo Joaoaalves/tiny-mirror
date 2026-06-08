@@ -122,9 +122,21 @@ def apply_flex_calibration(
     real_comm = getattr(calib, "real_comm_pct", None)
     if real_comm is None:
         return commission_pct, freight_bands
+    # ``payback`` (ML freight subsidy) rides along on each band for the UI; the
+    # margin math only reads ``cost`` so the extra key is harmless.
     bands: list[dict[str, Any]] = [
-        {"min": 0, "max": 78.99, "cost": float(getattr(calib, "freight_per_unit_lt79", 0) or 0)},
-        {"min": 79, "max": None, "cost": float(getattr(calib, "freight_per_unit_ge79", 0) or 0)},
+        {
+            "min": 0,
+            "max": 78.99,
+            "cost": float(getattr(calib, "freight_per_unit_lt79", 0) or 0),
+            "payback": float(getattr(calib, "payback_per_unit_lt79", 0) or 0),
+        },
+        {
+            "min": 79,
+            "max": None,
+            "cost": float(getattr(calib, "freight_per_unit_ge79", 0) or 0),
+            "payback": float(getattr(calib, "payback_per_unit_ge79", 0) or 0),
+        },
     ]
     return real_comm, bands
 

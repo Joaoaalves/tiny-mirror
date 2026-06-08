@@ -47,7 +47,14 @@ CALIB = SimpleNamespace(
     real_comm_pct=Decimal("16.50"),
     freight_per_unit_lt79=Decimal("6.75"),
     freight_per_unit_ge79=Decimal("18.35"),
+    payback_per_unit_lt79=Decimal("2.00"),
+    payback_per_unit_ge79=Decimal("18.35"),
 )
+
+BANDS_CALIBRATED = [
+    {"min": 0, "max": 78.99, "cost": 6.75, "payback": 2.0},
+    {"min": 79, "max": None, "cost": 18.35, "payback": 18.35},
+]
 
 
 @pytest.mark.asyncio
@@ -61,10 +68,7 @@ async def test_fulfillment_is_never_overridden() -> None:
 async def test_flex_with_calibration_overrides_to_2band_split() -> None:
     comm, bands = await _effective_fees(_Session("xd_drop_off", CALIB), "MLB1", SNAP)
     assert comm == Decimal("16.50")
-    assert bands == [
-        {"min": 0, "max": 78.99, "cost": 6.75},
-        {"min": 79, "max": None, "cost": 18.35},
-    ]
+    assert bands == BANDS_CALIBRATED
 
 
 @pytest.mark.asyncio
@@ -96,10 +100,7 @@ def test_apply_flex_calibration_pure_helper() -> None:
     # flex + calib → real rate + 2-band split
     comm, bands = apply_flex_calibration("xd_drop_off", Decimal("11.5"), SNAP.freight_bands, CALIB)
     assert comm == Decimal("16.50")
-    assert bands == [
-        {"min": 0, "max": 78.99, "cost": 6.75},
-        {"min": 79, "max": None, "cost": 18.35},
-    ]
+    assert bands == BANDS_CALIBRATED
 
 
 def test_calc_cap_for_snapshot_honors_fee_override() -> None:
