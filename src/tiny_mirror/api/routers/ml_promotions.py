@@ -33,7 +33,10 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
     MLPromoDecisionRepository,
 )
 from tiny_mirror.services import feature_flags
-from tiny_mirror.services.ml_promotion_service import MLPromotionService
+from tiny_mirror.services.ml_promotion_service import (
+    CO_PARTICIPATION_TYPES,
+    MLPromotionService,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -1674,6 +1677,7 @@ async def reprice_listing(
 class ExitPromoIn(BaseModel):
     mlb_id: str
     promo_type: str | None = None
+    promo_id: str | None = None
     decided_by: str | None = None
 
 
@@ -1685,10 +1689,19 @@ async def exit_promotion_endpoint(
 ) -> dict[str, Any]:
     """Sai da promoção ativa (DELETE) — o preço volta ao cheio. Usado quando a
     sugestão de margem é o próprio preço cheio (sozinho no catálogo, ou o
-    concorrente mais barato está acima do nosso cheio)."""
+    concorrente mais barato está acima do nosso cheio).
+
+    Campanhas de co-participação (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN)
+    precisam de ``promotion_id`` + ``offer_id`` no DELETE — para esses tipos
+    roteamos por ``exit_offer``, que resolve esses ids ao vivo."""
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
-    result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=body.promo_type)
+    if body.promo_type and body.promo_type.upper() in CO_PARTICIPATION_TYPES:
+        result = await service.exit_offer(
+            mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
+        )
+    else:
+        result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=body.promo_type)
     sc = result.get("status_code")
     if sc is not None and sc >= 400 and sc != 404:
         raise HTTPException(
@@ -1702,9 +1715,72 @@ async def exit_promotion_endpoint(
         sku=sku,
         mlb_id=body.mlb_id,
         action="exit_promotion",
-        promo_type="PRICE_DISCOUNT",
-        reason="subir margem: saiu da promo (preço volta ao cheio)",
+        promo_type=body.promo_type or "PRICE_DISCOUNT",
+        reason="saiu da promoção (preço volta ao cheio)",
         ml_response={"exit": result},
+        dry_run=False,
+        decided_by=body.decided_by,
+    )
+    await session.commit()
+    return result
+
+
+class EnrollOfferIn(BaseModel):
+    mlb_id: str
+    promo_type: str = "SMART"
+    promo_id: str | None = None
+    decided_by: str | None = None
+
+
+@router.post("/activate-smart")
+async def activate_smart_endpoint(
+    body: EnrollOfferIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Ativa (aceita) uma campanha de co-participação para um anúncio — SMART,
+    PRICE_MATCHING ou MARKETPLACE_CAMPAIGN. O Mercado Livre define o preço; o
+    vendedor só aceita. Resolve o ``offer_id`` ao vivo e faz o POST de inscrição.
+
+    Escreve DIRETO no ML (irreversível a não ser saindo da campanha). A UI só
+    chama isto após confirmação explícita do operador."""
+    from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
+
+    pt = (body.promo_type or "SMART").upper()
+    if pt not in CO_PARTICIPATION_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "step": "validate",
+                "response": (
+                    f"{pt} não é campanha de co-participação; use os endpoints de "
+                    "preço (create-price-discount/modify-promotion) para esse tipo"
+                ),
+            },
+        )
+    result = await service.enroll_offer(
+        mlb_id=body.mlb_id, promotion_type=pt, promotion_id=body.promo_id
+    )
+    sc = result.get("status_code")
+    if sc is None or sc >= 400:
+        raise HTTPException(
+            status_code=sc if (sc is not None and sc < 600) else 502,
+            detail={
+                "step": "enroll",
+                "response": result.get("response"),
+                "sent_body": result.get("sent_body"),
+            },
+        )
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    action_repo = MLPromoActionRepository(session)
+    await action_repo.log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="enroll_offer",
+        promo_type=pt,
+        reason=f"ativou campanha de co-participação {pt} (preço definido pelo ML)",
+        ml_response={"enroll": result},
         dry_run=False,
         decided_by=body.decided_by,
     )

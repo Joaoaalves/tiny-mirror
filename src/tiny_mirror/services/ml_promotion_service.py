@@ -62,6 +62,13 @@ FIXED_PRICE_TYPES = frozenset(
     }
 )
 
+# Co-participation campaigns (ML co-pays part of the discount). ML SETS the
+# price — the seller can only ACCEPT (enrol) or leave; there is no seller
+# price to send. Enrol/exit need the live ``offer_id`` (``ref_id`` of the
+# candidate in the per-item GET), so these go through enroll_offer/exit_offer
+# instead of the seller-driven create/modify/exit path.
+CO_PARTICIPATION_TYPES = frozenset({"SMART", "PRICE_MATCHING", "MARKETPLACE_CAMPAIGN"})
+
 
 # ===========================================================================
 # Decision algorithm — pure
@@ -679,16 +686,127 @@ class MLPromotionService:
         return None
 
     # -- Seller-driven price actions -------------------------------------
+    @staticmethod
+    def _find_offer(
+        promos: list[dict[str, Any]],
+        promotion_type: str,
+        *,
+        status: str | None = None,
+        promotion_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Acha a oferta de um item (resposta do GET /seller-promotions/items)
+        casando o ``type`` (e opcionalmente ``status``/``promotion_id``). Usado
+        pra resolver o ``offer_id`` (``ref_id``) ao vivo nas campanhas de
+        co-participação, onde o enrol/exit do ML exige esse id."""
+        pt = (promotion_type or "").upper()
+        for p in promos:
+            if (p.get("type") or "").upper() != pt:
+                continue
+            if promotion_id and p.get("id") != promotion_id:
+                continue
+            if status and (p.get("status") or "").lower() != status:
+                continue
+            return p
+        return None
+
+    async def enroll_offer(
+        self, *, mlb_id: str, promotion_type: str, promotion_id: str | None = None
+    ) -> dict[str, Any]:
+        """Inscreve (aceita) o item numa campanha de co-participação (SMART /
+        PRICE_MATCHING / MARKETPLACE_CAMPAIGN). O ML define o preço — o vendedor
+        só aceita —, então o body NÃO leva ``deal_price``: leva ``promotion_id``
+        + ``promotion_type`` + ``offer_id``. O ``offer_id`` (o ``ref_id`` do
+        candidato) é resolvido ao vivo do GET /seller-promotions/items, porque
+        a decisão não o armazena.
+
+        Devolve ``{status_code, response, sent_body}`` (nunca levanta em erro
+        operacional) pro caller persistir o resultado."""
+        promos = await self.fetch_eligible_promos(mlb_id)
+        offer = (
+            self._find_offer(promos, promotion_type, status="candidate", promotion_id=promotion_id)
+            or self._find_offer(promos, promotion_type, promotion_id=promotion_id)
+            or self._find_offer(promos, promotion_type)
+        )
+        if offer is None:
+            return {
+                "status_code": None,
+                "response": (
+                    f"nenhuma oferta {promotion_type} encontrada para {mlb_id} "
+                    "(item não foi convidado, ou a oferta já expirou no ML)"
+                ),
+                "sent_body": None,
+            }
+        offer_ref = offer.get("ref_id") or offer.get("offer_id")
+        pid = offer.get("id") or promotion_id
+        body: dict[str, Any] = {"promotion_type": (promotion_type or "").upper()}
+        if pid:
+            body["promotion_id"] = pid
+        if offer_ref:
+            body["offer_id"] = offer_ref
+
+        token = await self._token_service.get_valid_access_token()
+        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        try:
+            resp = await self._http.post(
+                url,
+                params={"app_version": "v2"},
+                json=body,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30.0,
+            )
+            if resp.status_code == 401:
+                token = await self._token_service.handle_unauthorized()
+                resp = await self._http.post(
+                    url,
+                    params={"app_version": "v2"},
+                    json=body,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=30.0,
+                )
+            content = resp.json() if resp.content else {}
+            return {"status_code": resp.status_code, "response": content, "sent_body": body}
+        except Exception as exc:
+            return {"status_code": None, "response": str(exc), "sent_body": body}
+
+    async def exit_offer(
+        self, *, mlb_id: str, promotion_type: str, promotion_id: str | None = None
+    ) -> dict[str, Any]:
+        """Sai de uma campanha de co-participação (SMART/PRICE_MATCHING/...). O
+        DELETE do ML para esses tipos exige ``promotion_id`` + ``offer_id`` além
+        do ``promotion_type``; resolvemos ambos ao vivo da oferta ``started`` do
+        item antes de chamar o DELETE."""
+        promos = await self.fetch_eligible_promos(mlb_id)
+        offer = (
+            self._find_offer(promos, promotion_type, status="started", promotion_id=promotion_id)
+            or self._find_offer(promos, promotion_type, promotion_id=promotion_id)
+            or self._find_offer(promos, promotion_type)
+        )
+        offer_ref = (offer.get("ref_id") or offer.get("offer_id")) if offer else None
+        pid = (offer.get("id") if offer else None) or promotion_id
+        return await self.exit_promotion(
+            mlb_id=mlb_id,
+            promotion_type=promotion_type,
+            promotion_id=pid,
+            offer_id=offer_ref,
+        )
+
     async def exit_promotion(
-        self, *, mlb_id: str, promotion_type: str | None = None
+        self,
+        *,
+        mlb_id: str,
+        promotion_type: str | None = None,
+        promotion_id: str | None = None,
+        offer_id: str | None = None,
     ) -> dict[str, Any]:
         """Remove o anúncio de uma promoção ativa.
 
         Chama DELETE /seller-promotions/items/{mlb_id}?promotion_type=X&app_version=v2.
         O preço volta ao list_price do anúncio. A doc do ML exige o
         ``promotion_type`` no DELETE (sem ele, o ML pode não saber qual oferta
-        remover) — passamos quando conhecido. Não levanta exceção em erros
-        operacionais — devolve {status_code, response} para o caller persistir.
+        remover) — passamos quando conhecido. Campanhas de co-participação
+        exigem também ``promotion_id`` + ``offer_id`` (passados por exit_offer).
+        Não levanta exceção em erros operacionais — devolve {status_code,
+        response} para o caller persistir.
 
         Nota (doc ML): ofertas LIGHTNING já *iniciadas* (started) NÃO podem ser
         removidas, apenas pausadas — o ML devolverá erro nesse caso.
@@ -698,6 +816,10 @@ class MLPromotionService:
         params = {"app_version": "v2"}
         if promotion_type:
             params["promotion_type"] = promotion_type
+        if promotion_id:
+            params["promotion_id"] = promotion_id
+        if offer_id:
+            params["offer_id"] = offer_id
         try:
             resp = await self._http.delete(
                 url,
