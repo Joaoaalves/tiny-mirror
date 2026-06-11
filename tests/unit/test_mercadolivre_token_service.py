@@ -270,3 +270,70 @@ async def test_refresh_rejected_raises_token_expired(
 
     with pytest.raises(TokenExpiredException):
         await service._refresh_with_token("bad.refresh")
+
+
+# ---------------------------------------------------------------------------
+# Pending-rotation stash (crash-safe token rotation) — mirrors TokenService
+# ---------------------------------------------------------------------------
+async def test_refresh_recovers_fresh_stashed_rotation_without_http(
+    service: MercadoLivreTokenService,
+    fake_repo: MagicMock,
+    mock_redis: AsyncMock,
+    mock_http_client: AsyncMock,
+) -> None:
+    import json
+    from datetime import timedelta
+
+    now = datetime.now(UTC)
+    stash = json.dumps(
+        {
+            "access_token": "stashed.ml.access",
+            "refresh_token": "stashed.ml.refresh",
+            "expires_at": (now + timedelta(hours=3)).isoformat(),
+            "refresh_expires_at": (now + timedelta(days=365)).isoformat(),
+        }
+    )
+
+    async def _get(key):
+        if key == MercadoLivreTokenService.REDIS_KEY_PENDING_ROTATION:
+            return stash
+        return None
+
+    mock_redis.get = AsyncMock(side_effect=_get)
+
+    token = await service._refresh_with_token("stale.db.refresh")
+
+    assert token.access_token == "stashed.ml.access"
+    mock_http_client.post.assert_not_awaited()
+    saved = fake_repo.save_token.await_args.args[0]
+    assert saved.refresh_token == "stashed.ml.refresh"
+
+
+async def test_refresh_stashes_rotation_and_clears_after_persist(
+    service: MercadoLivreTokenService,
+    fake_repo: MagicMock,
+    mock_redis: AsyncMock,
+    mock_http_client: AsyncMock,
+    make_response,
+) -> None:
+    events: list[str] = []
+    fake_repo.save_token = AsyncMock(side_effect=lambda *_: events.append("db_save"))
+
+    def _set(key, *a, **kw):
+        events.append(f"redis_set:{key}")
+        return True
+
+    def _delete(key):
+        events.append(f"redis_del:{key}")
+        return 1
+
+    mock_redis.set = AsyncMock(side_effect=_set)
+    mock_redis.delete = AsyncMock(side_effect=_delete)
+    mock_http_client.post = AsyncMock(return_value=make_response(200, json_body=_ML_TOKEN_PAYLOAD))
+
+    await service._refresh_with_token("some.refresh")
+
+    stash_key = f"redis_set:{MercadoLivreTokenService.REDIS_KEY_PENDING_ROTATION}"
+    assert stash_key in events
+    assert events.index(stash_key) < events.index("db_save")
+    assert f"redis_del:{MercadoLivreTokenService.REDIS_KEY_PENDING_ROTATION}" in events

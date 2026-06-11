@@ -54,7 +54,11 @@ class FlexFeeCalibrationService:
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> Any:
         r = await self._http.get(url, headers=await self._auth(), params=params, timeout=30.0)
         if r.status_code == 401:
-            r = await self._http.get(url, headers=await self._auth(), params=params, timeout=30.0)
+            # The cached token is the one that just got rejected — force a
+            # refresh instead of re-reading the same token from Redis.
+            access = await self._tok.handle_unauthorized()
+            headers = {"Authorization": f"Bearer {access}"}
+            r = await self._http.get(url, headers=headers, params=params, timeout=30.0)
         if r.status_code >= 400:
             return None
         return r.json()
@@ -98,9 +102,13 @@ class FlexFeeCalibrationService:
                             "shipping_id": shipping_id,
                         }
                     )
-            total = ((data or {}).get("paging") or {}).get("total", 0)
+            if not results:
+                break
+            total = ((data or {}).get("paging") or {}).get("total")
             offset += _PAGE
-            if offset >= total or offset >= 10000 or not results:
+            # Missing/zero paging metadata must not truncate a non-empty page;
+            # keep going until an empty page (or the 10k offset hard cap).
+            if (total is not None and int(total) > 0 and offset >= int(total)) or offset >= 10000:
                 break
         return rows
 

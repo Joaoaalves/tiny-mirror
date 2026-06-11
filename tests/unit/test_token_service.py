@@ -439,3 +439,173 @@ def test_is_token_expiring_soon_false_for_fresh_token(
     service: TokenService, fresh_token: OAuthToken
 ) -> None:
     assert service.is_token_expiring_soon(fresh_token) is False
+
+
+# ---------------------------------------------------------------------------
+# Pending-rotation stash (crash-safe token rotation)
+# ---------------------------------------------------------------------------
+def _stash_json(token: OAuthToken) -> str:
+    import json
+
+    return json.dumps(
+        {
+            "access_token": token.access_token,
+            "refresh_token": token.refresh_token,
+            "expires_at": token.expires_at.isoformat(),
+            "refresh_expires_at": token.refresh_expires_at.isoformat(),
+        }
+    )
+
+
+async def test_refresh_stashes_rotation_before_db_save_and_clears_after(
+    service: TokenService,
+    fake_repo: MagicMock,
+    fresh_token: OAuthToken,
+    mock_redis: AsyncMock,
+    mock_http_client: AsyncMock,
+    make_response,
+) -> None:
+    """The new pair must hit Redis before the DB save (crash window) and the
+    stash must be cleared once the DB row is written."""
+    events: list[str] = []
+    fake_repo.get_current_token = AsyncMock(return_value=fresh_token)
+    fake_repo.save_token = AsyncMock(side_effect=lambda *_: events.append("db_save"))
+
+    def _set(key, *a, **kw):
+        events.append(f"redis_set:{key}")
+        return True
+
+    def _delete(key):
+        events.append(f"redis_del:{key}")
+        return 1
+
+    mock_redis.set = AsyncMock(side_effect=_set)
+    mock_redis.delete = AsyncMock(side_effect=_delete)
+    mock_http_client.post = AsyncMock(
+        return_value=make_response(
+            200,
+            json_body={
+                "access_token": "new.access",
+                "refresh_token": "new.refresh",
+                "expires_in": 14400,
+                "refresh_expires_in": 86400,
+            },
+        )
+    )
+
+    await service.refresh_tokens()
+
+    stash_key = f"redis_set:{TokenService.REDIS_KEY_PENDING_ROTATION}"
+    assert stash_key in events
+    assert "db_save" in events
+    assert events.index(stash_key) < events.index("db_save")
+    assert f"redis_del:{TokenService.REDIS_KEY_PENDING_ROTATION}" in events
+
+
+async def test_refresh_recovers_fresh_stashed_rotation_without_http(
+    service: TokenService,
+    fake_repo: MagicMock,
+    mock_redis: AsyncMock,
+    mock_http_client: AsyncMock,
+) -> None:
+    """A stash holding an unexpired pair from a crashed rotation is persisted
+    and returned without burning another refresh call."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    stashed = OAuthToken(
+        access_token="stashed.access",
+        refresh_token="stashed.refresh",
+        expires_at=now + timedelta(hours=3),
+        refresh_expires_at=now + timedelta(days=1),
+    )
+
+    async def _get(key):
+        if key == TokenService.REDIS_KEY_PENDING_ROTATION:
+            return _stash_json(stashed)
+        return None
+
+    mock_redis.get = AsyncMock(side_effect=_get)
+
+    token = await service._refresh_with_token("stale.db.refresh")
+
+    assert token.access_token == "stashed.access"
+    mock_http_client.post.assert_not_awaited()
+    saved = fake_repo.save_token.await_args.args[0]
+    assert saved.refresh_token == "stashed.refresh"
+
+
+async def test_refresh_uses_stashed_refresh_token_when_stash_expired(
+    service: TokenService,
+    fake_repo: MagicMock,
+    mock_redis: AsyncMock,
+    mock_http_client: AsyncMock,
+    make_response,
+) -> None:
+    """If the stashed access token already expired, the refresh call must use
+    the stashed (newest) refresh token, not the stale DB one."""
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    stashed = OAuthToken(
+        access_token="stashed.access",
+        refresh_token="stashed.refresh",
+        expires_at=now - timedelta(minutes=5),
+        refresh_expires_at=now + timedelta(days=1),
+    )
+
+    async def _get(key):
+        if key == TokenService.REDIS_KEY_PENDING_ROTATION:
+            return _stash_json(stashed)
+        return None
+
+    mock_redis.get = AsyncMock(side_effect=_get)
+    mock_http_client.post = AsyncMock(
+        return_value=make_response(
+            200,
+            json_body={
+                "access_token": "new.access",
+                "refresh_token": "new.refresh",
+                "expires_in": 14400,
+                "refresh_expires_in": 86400,
+            },
+        )
+    )
+
+    token = await service._refresh_with_token("stale.db.refresh")
+
+    assert token.access_token == "new.access"
+    body = mock_http_client.post.await_args.kwargs["data"]
+    assert body["refresh_token"] == "stashed.refresh"
+
+
+async def test_refresh_discards_corrupt_stash_and_proceeds(
+    service: TokenService,
+    fake_repo: MagicMock,
+    mock_redis: AsyncMock,
+    mock_http_client: AsyncMock,
+    make_response,
+) -> None:
+    async def _get(key):
+        if key == TokenService.REDIS_KEY_PENDING_ROTATION:
+            return "{not-json"
+        return None
+
+    mock_redis.get = AsyncMock(side_effect=_get)
+    mock_http_client.post = AsyncMock(
+        return_value=make_response(
+            200,
+            json_body={
+                "access_token": "new.access",
+                "refresh_token": "new.refresh",
+                "expires_in": 14400,
+                "refresh_expires_in": 86400,
+            },
+        )
+    )
+
+    token = await service._refresh_with_token("db.refresh")
+
+    assert token.access_token == "new.access"
+    body = mock_http_client.post.await_args.kwargs["data"]
+    assert body["refresh_token"] == "db.refresh"

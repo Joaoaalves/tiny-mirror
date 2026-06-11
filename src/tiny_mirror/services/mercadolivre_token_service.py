@@ -15,6 +15,7 @@ After bootstrap the ``ml_oauth_tokens`` singleton row is the source of truth.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime, timedelta
@@ -41,9 +42,11 @@ logger = structlog.get_logger(__name__)
 class MercadoLivreTokenService:
     REDIS_KEY_ACCESS_TOKEN = "ml:access_token"
     REDIS_KEY_REFRESH_LOCK = "ml:token:refresh_lock"
+    REDIS_KEY_PENDING_ROTATION = "ml:token:pending_rotation"
     REDIS_TTL_BUFFER_SECONDS = 600
     REDIS_TTL_MIN_SECONDS = 60
     REFRESH_LOCK_TTL_SECONDS = 30
+    PENDING_ROTATION_TTL_SECONDS = 7 * 24 * 3600
     TOKEN_EXPIRY_WARNING_MINUTES = 30
     # ML access_token TTL is 6h (21600s); refresh_token has no documented expiry.
     ML_TOKEN_URL = "https://api.mercadolibre.com/oauth/token"
@@ -176,6 +179,22 @@ class MercadoLivreTokenService:
         return await self._refresh_with_token(refresh_token)
 
     async def _refresh_with_token(self, refresh_token: str) -> OAuthToken:
+        # Crash recovery: if a previous rotation died between the HTTP
+        # response and the DB save, the stash holds tokens newer than the DB
+        # row (ML rotates the refresh token on every call, so the DB token is
+        # already burned). Complete that rotation instead of retrying with the
+        # stale token.
+        stashed = await self._load_pending_rotation()
+        if stashed is not None and stashed.refresh_token != refresh_token:
+            logger.warning(
+                "Recovering ML token rotation interrupted before persistence; "
+                "using stashed tokens instead of the stale DB row"
+            )
+            await self._persist_token(stashed)
+            if not stashed.is_expired():
+                return stashed
+            refresh_token = stashed.refresh_token
+
         try:
             response = await self._http.post(
                 self.ML_TOKEN_URL,
@@ -218,15 +237,52 @@ class MercadoLivreTokenService:
             refresh_expires_at=refresh_expires_at,
         )
 
-        async with self._session_factory() as session:
-            await self._repository_factory(session).save_token(new_token)
-        await self._cache_access_token(new_token)
+        # Stash BEFORE the DB save: ML already burned the old refresh token,
+        # so losing new_token here would require manual re-authentication.
+        await self._stash_pending_rotation(new_token)
+        await self._persist_token(new_token)
 
         logger.info(
             "ML OAuth token refreshed successfully",
             new_expires_at=new_token.expires_at.isoformat(),
         )
         return new_token
+
+    async def _persist_token(self, token: OAuthToken) -> None:
+        async with self._session_factory() as session:
+            await self._repository_factory(session).save_token(token)
+        await self._cache_access_token(token)
+        await self._redis.delete(self.REDIS_KEY_PENDING_ROTATION)
+
+    async def _stash_pending_rotation(self, token: OAuthToken) -> None:
+        payload = json.dumps(
+            {
+                "access_token": token.access_token,
+                "refresh_token": token.refresh_token,
+                "expires_at": token.expires_at.isoformat(),
+                "refresh_expires_at": token.refresh_expires_at.isoformat(),
+            }
+        )
+        await self._redis.set(
+            self.REDIS_KEY_PENDING_ROTATION, payload, ex=self.PENDING_ROTATION_TTL_SECONDS
+        )
+
+    async def _load_pending_rotation(self) -> OAuthToken | None:
+        raw = await self._redis.get(self.REDIS_KEY_PENDING_ROTATION)
+        if raw is None:
+            return None
+        try:
+            data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+            return OAuthToken(
+                access_token=data["access_token"],
+                refresh_token=data["refresh_token"],
+                expires_at=datetime.fromisoformat(data["expires_at"]),
+                refresh_expires_at=datetime.fromisoformat(data["refresh_expires_at"]),
+            )
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("Discarding unreadable ML pending token rotation stash", error=str(exc))
+            await self._redis.delete(self.REDIS_KEY_PENDING_ROTATION)
+            return None
 
     async def _cache_access_token(self, token: OAuthToken) -> None:
         ttl = max(

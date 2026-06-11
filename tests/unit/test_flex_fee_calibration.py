@@ -153,3 +153,76 @@ def test_calc_cap_for_snapshot_honors_fee_override() -> None:
     assert default.margin_pct_at_floor is not None
     assert override.margin_pct_at_floor is not None
     assert override.margin_pct_at_floor < default.margin_pct_at_floor
+
+
+# ---------------------------------------------------------------------------
+# FlexFeeCalibrationService HTTP loop — 401 recovery + pagination guard
+# ---------------------------------------------------------------------------
+def _http_response(status_code: int, body=None):
+    from unittest.mock import MagicMock
+
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.json = MagicMock(return_value=body or {})
+    return resp
+
+
+def _calib_order(mlb: str):
+    return {
+        "status": "paid",
+        "shipping": {"id": 111},
+        "order_items": [
+            {"item": {"id": mlb}, "unit_price": 50.0, "sale_fee": 8.0, "quantity": 1},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_calibration_get_401_forces_refresh_and_retries() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    tok = MagicMock()
+    tok.get_valid_access_token = AsyncMock(return_value="cached.token")
+    tok.handle_unauthorized = AsyncMock(return_value="refreshed.token")
+    http = AsyncMock()
+    http.get = AsyncMock(
+        side_effect=[
+            _http_response(401),
+            _http_response(200, {"ok": True}),
+        ]
+    )
+    service = FlexFeeCalibrationService(tok, http, "12345")
+
+    data = await service._get("https://api.mercadolibre.com/x")
+
+    tok.handle_unauthorized.assert_awaited_once()
+    retry_headers = http.get.await_args_list[1].kwargs["headers"]
+    assert retry_headers == {"Authorization": "Bearer refreshed.token"}
+    assert data == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_orders_for_day_missing_paging_keeps_fetching_until_empty_page() -> None:
+    from datetime import date
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    tok = MagicMock()
+    tok.get_valid_access_token = AsyncMock(return_value="t")
+    http = AsyncMock()
+    http.get = AsyncMock(
+        side_effect=[
+            _http_response(200, {"results": [_calib_order("MLB1")]}),
+            _http_response(200, {"results": [_calib_order("MLB2")]}),
+            _http_response(200, {"results": []}),
+        ]
+    )
+    service = FlexFeeCalibrationService(tok, http, "12345")
+
+    rows = await service._orders_for_day(date(2026, 6, 10))
+
+    assert http.get.await_count == 3
+    assert [r["mlb"] for r in rows] == ["MLB1", "MLB2"]

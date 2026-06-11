@@ -56,7 +56,10 @@ class MLSalesSyncService:
             }
             r = await self._http.get(_API, headers=headers, params=params)
             if r.status_code == 401:
-                headers = await self._auth()
+                # The cached token is the one that just got rejected — force a
+                # refresh instead of re-reading the same token from Redis.
+                access = await self._tok.handle_unauthorized()
+                headers = {"Authorization": f"Bearer {access}"}
                 r = await self._http.get(_API, headers=headers, params=params)
             r.raise_for_status()
             data = r.json()
@@ -82,9 +85,13 @@ class MLSalesSyncService:
                     cur["qty"] += qty
                     if not cur["sku"]:
                         cur["sku"] = item.get("seller_sku")
-            total = (data.get("paging") or {}).get("total", 0)
+            if not results:
+                break
+            total = (data.get("paging") or {}).get("total")
             offset += _PAGE
-            if offset >= total or offset >= 10000 or not results:
+            # Missing/zero paging metadata must not truncate a non-empty page;
+            # keep going until an empty page (or the 10k offset hard cap).
+            if (total is not None and int(total) > 0 and offset >= int(total)) or offset >= 10000:
                 break
         return agg
 
