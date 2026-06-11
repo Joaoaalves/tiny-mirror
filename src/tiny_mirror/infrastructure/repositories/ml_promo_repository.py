@@ -9,7 +9,7 @@ Three logical surfaces:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -339,7 +339,7 @@ class MLPromoAlertRepository:
             return False
         row.acknowledged = True
         row.acknowledged_by = by
-        row.acknowledged_at = datetime.utcnow()
+        row.acknowledged_at = datetime.now(UTC)
         await self._session.flush()
         return True
 
@@ -491,7 +491,7 @@ class MLPromoDecisionRepository:
         if row is None or row.status != "pending":
             return None
         row.status = status
-        row.decided_at = datetime.utcnow()
+        row.decided_at = datetime.now(UTC)
         row.decided_by = by
         if notes is not None:
             row.notes = notes
@@ -529,7 +529,7 @@ class MLPromoDecisionRepository:
         row.ml_apply_status = status
         row.ml_apply_status_code = status_code
         row.ml_apply_response = response[:2000] if response else None
-        row.ml_applied_at = datetime.utcnow()
+        row.ml_applied_at = datetime.now(UTC)
         await self._session.flush()
         return row
 
@@ -551,7 +551,7 @@ class MLPromoDecisionRepository:
         if row is None or row.status != "pending":
             return None
         row.status = "expired"
-        row.expired_at = datetime.utcnow()
+        row.expired_at = datetime.now(UTC)
         row.expired_reason = reason
         await self._session.flush()
         return row

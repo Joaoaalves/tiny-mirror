@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from decimal import Decimal
 from typing import Literal
@@ -9,10 +10,10 @@ from typing import Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tiny_mirror.api.dependencies import get_tiny_client
+from tiny_mirror.api.dependencies import db_session, get_tiny_client
 from tiny_mirror.api.schemas import PaginationResponse
-from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.repositories.fulfillment_transfer_repository import (
     FulfillmentTransferRepository,
@@ -121,18 +122,16 @@ async def list_transfers(
     ),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=50, ge=1, le=100),
+    session: AsyncSession = Depends(db_session),
 ) -> TransferListResponse:
     """List fulfillment transfer records, optionally filtered by SKU or status."""
-    import math
-
-    async with AsyncSessionLocal() as session:
-        repo = FulfillmentTransferRepository(session)
-        rows, total = await repo.list_all(
-            sku=sku,
-            status=transfer_status,
-            limit=page_size,
-            offset=(page - 1) * page_size,
-        )
+    repo = FulfillmentTransferRepository(session)
+    rows, total = await repo.list_all(
+        sku=sku,
+        status=transfer_status,
+        limit=page_size,
+        offset=(page - 1) * page_size,
+    )
 
     total_pages = max(1, math.ceil(total / page_size)) if total > 0 else 0
     items = [

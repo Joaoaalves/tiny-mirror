@@ -9,6 +9,7 @@ when the window is almost exhausted.
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 
 import redis.asyncio as redis
@@ -54,7 +55,10 @@ class RateLimiter:
             remaining=remaining,
             seconds_to_wait=round(seconds_to_wait, 2),
         )
-        await asyncio.sleep(seconds_to_wait + 0.1)
+        # Jitter spreads concurrent waiters across the first second after the
+        # window resets, instead of all firing at the same instant and
+        # re-exhausting the fresh budget immediately.
+        await asyncio.sleep(seconds_to_wait + 0.1 + random.uniform(0, 1.0))
         logger.debug("Rate limit window reset, proceeding")
 
     async def update_from_headers(self, headers: dict[str, str]) -> None:
