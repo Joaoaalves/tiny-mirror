@@ -1014,3 +1014,48 @@ async def test_run_ml_fl_only_sync_counts_failures(
     sync_logs.update_sync_log_complete.assert_awaited_once_with(
         1, items_processed=1, items_failed=1
     )
+
+
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_commits_snapshot_on_early_return_paths(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """The snapshot repo no longer commits internally; every early-return
+    path of the webhook delta handler must commit the snapshot advance
+    itself (seed and negative-delta paths here)."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=None)
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+    mock_transfer_repo_cls.return_value = MagicMock()
+
+    # Seed path (no previous snapshot).
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=1,
+        sku="SKU-A",
+        new_tiny_fl_qty=5,
+        new_stock_galpao_qty=50,
+        product_data=None,
+    )
+    mock_session.commit.assert_awaited()
+
+    # Negative-delta path (previous snapshot above the new value).
+    mock_session.commit.reset_mock()
+    snapshot_repo.get = AsyncMock(return_value=_snap(fl=10, galpao=50))
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=1,
+        sku="SKU-A",
+        new_tiny_fl_qty=5,
+        new_stock_galpao_qty=50,
+        product_data=None,
+    )
+    mock_session.commit.assert_awaited()

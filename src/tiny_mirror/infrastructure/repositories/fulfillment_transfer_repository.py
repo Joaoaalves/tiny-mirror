@@ -121,17 +121,30 @@ class FulfillmentTransferRepository:
         ``last_event_at``. Transitions status to 'received' (with
         received_at = last_event_at) when the cumulative equals the
         ordered quantity; otherwise stays pending. Caller is responsible
-        for ensuring ``delta_quantity`` does not over-shoot."""
-        row = await self.get_by_id(transfer_id)
-        if row is None:
-            return None
-        row.quantity_received = min(row.quantity, row.quantity_received + delta_quantity)
-        row.last_event_at = last_event_at
-        if row.quantity_received >= row.quantity:
-            row.status = "received"
-            row.received_at = last_event_at
-        await self._session.flush()
-        return row
+        for ensuring ``delta_quantity`` does not over-shoot.
+
+        The increment runs as a single SQL UPDATE so concurrent scans (6h
+        cron racing the manual /reception/scan trigger) accumulate instead
+        of overwriting each other's read-modify-write.
+        """
+        from sqlalchemy import case, func, update
+
+        orm = FulfillmentTransferORM
+        new_received = func.least(orm.quantity, orm.quantity_received + delta_quantity)
+        is_complete = orm.quantity_received + delta_quantity >= orm.quantity
+        stmt = (
+            update(orm)
+            .where(orm.id == transfer_id)
+            .values(
+                quantity_received=new_received,
+                last_event_at=last_event_at,
+                status=case((is_complete, "received"), else_=orm.status),
+                received_at=case((is_complete, last_event_at), else_=orm.received_at),
+            )
+            .returning(orm)
+        )
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
 
     async def mark_cancelled(self, transfer_id: int, reason: str) -> FulfillmentTransferORM | None:
         """Cancel a pending transfer (e.g. SKU is not fulfillment on ML).

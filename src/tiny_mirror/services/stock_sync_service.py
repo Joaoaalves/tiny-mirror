@@ -418,10 +418,12 @@ class StockSyncService:
                     tiny_fl_qty=new_tiny_fl_qty,
                     stock_galpao_qty=new_stock_galpao_qty,
                 )
+                await session.commit()
                 return
 
             fl_delta = new_tiny_fl_qty - previous.tiny_fl_qty
             if fl_delta <= 0:
+                await session.commit()
                 return
 
             # Corroboration rule (2026-05-25): a real galpão→Full transfer
@@ -444,6 +446,7 @@ class StockSyncService:
                     new_tiny_fl_qty=new_tiny_fl_qty,
                     new_stock_galpao_qty=new_stock_galpao_qty,
                 )
+                await session.commit()
                 return
 
             transfers = FulfillmentTransferRepository(session)
@@ -458,6 +461,7 @@ class StockSyncService:
                     fl_delta=fl_delta,
                     new_tiny_fl_qty=new_tiny_fl_qty,
                 )
+                await session.commit()
                 return
 
             # Logistic-type guard: only create a pending transfer when the
@@ -494,6 +498,7 @@ class StockSyncService:
                     fl_delta=fl_delta,
                     new_tiny_fl_qty=new_tiny_fl_qty,
                 )
+                await session.commit()
                 return
             if fl_rows == 0:
                 logger.info(
@@ -504,6 +509,7 @@ class StockSyncService:
                     fl_delta=fl_delta,
                     new_tiny_fl_qty=new_tiny_fl_qty,
                 )
+                await session.commit()
                 return
 
             # Quantity = max(fl_delta, galpao_drop). The two diverge when ML

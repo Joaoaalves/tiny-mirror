@@ -48,6 +48,12 @@ class TinyFLStockSnapshotRepository:
         tiny_fl_qty: int,
         stock_galpao_qty: int,
     ) -> None:
+        """Stage the upsert in the caller's transaction — the caller commits.
+
+        The webhook delta path needs the snapshot advance and the pending
+        transfer it justifies to land in the SAME commit; committing here
+        would let a later failure swallow the delta forever.
+        """
         from sqlalchemy import func
 
         stmt = pg_insert(TinyFLStockSnapshotORM).values(
@@ -64,4 +70,3 @@ class TinyFLStockSnapshotRepository:
             },
         )
         await self._session.execute(stmt)
-        await self._session.commit()
