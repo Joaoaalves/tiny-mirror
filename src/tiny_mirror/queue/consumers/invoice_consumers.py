@@ -41,7 +41,12 @@ class InvoiceFullSyncConsumer(BaseConsumer):
 
         if message_body.get("is_cold_start"):
             if sync_log_id is None:
-                return
+                # Raise so BaseConsumer nacks to the DLQ — silently acking
+                # would drop the cold start with zero operator visibility.
+                raise ValueError(
+                    "invoices.full cold-start message missing sync_log_id; "
+                    "routing to DLQ for investigation"
+                )
             await self._service.run_cold_start(sync_log_id)
             return
 

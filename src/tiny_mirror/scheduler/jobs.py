@@ -335,6 +335,19 @@ def shutdown_scheduler(scheduler: AsyncIOScheduler | None) -> None:
 # ---------------------------------------------------------------------------
 # Initial sync trigger (called from lifespan after setup_scheduler)
 # ---------------------------------------------------------------------------
+async def _mark_sync_log_failed(sync_log_id: int, error_message: str) -> None:
+    try:
+        async with AsyncSessionLocal() as session:
+            await SyncLogRepository(session).update_sync_log_failed(
+                sync_log_id,
+                error_message=error_message,
+                items_processed=0,
+                items_failed=0,
+            )
+    except Exception:  # pragma: no cover — secondary failure logged
+        logger.exception("Failed to mark sync_log as failed", sync_log_id=sync_log_id)
+
+
 async def check_and_trigger_initial_sync(app: FastAPI) -> None:
     publisher: QueuePublisher = app.state.queue_publisher
 
@@ -373,32 +386,50 @@ async def check_and_trigger_initial_sync(app: FastAPI) -> None:
                 "stock", metadata={"triggered_by": "initial_sync"}
             )
 
-        await publisher.publish_sync_message(
-            "products.full",
-            {
-                "triggered_by": "initial_sync",
-                "sync_log_id": products_log,
-                "published_at": datetime.now(UTC).isoformat(),
-            },
-        )
-        await publisher.publish_sync_message(
-            "orders.full",
-            {
-                "is_historical": True,
-                "date_from": history_start.isoformat(),
-                "date_to": today.isoformat(),
-                "lookback_hours": None,
-                "sync_log_id": orders_log,
-                "published_at": datetime.now(UTC).isoformat(),
-            },
-        )
-        await publisher.publish_sync_message(
-            "stock.full",
-            {
-                "sync_log_id": stock_log,
-                "published_at": datetime.now(UTC).isoformat(),
-            },
-        )
+        initial_messages: list[tuple[str, dict[str, Any], int]] = [
+            (
+                "products.full",
+                {
+                    "triggered_by": "initial_sync",
+                    "sync_log_id": products_log,
+                    "published_at": datetime.now(UTC).isoformat(),
+                },
+                products_log,
+            ),
+            (
+                "orders.full",
+                {
+                    "is_historical": True,
+                    "date_from": history_start.isoformat(),
+                    "date_to": today.isoformat(),
+                    "lookback_hours": None,
+                    "sync_log_id": orders_log,
+                    "published_at": datetime.now(UTC).isoformat(),
+                },
+                orders_log,
+            ),
+            (
+                "stock.full",
+                {
+                    "sync_log_id": stock_log,
+                    "published_at": datetime.now(UTC).isoformat(),
+                },
+                stock_log,
+            ),
+        ]
+        for queue_type, message, log_id in initial_messages:
+            # A publish failure (e.g. RabbitMQ briefly down) must not crash
+            # startup nor strand the sync_log in 'running' forever.
+            try:
+                await publisher.publish_sync_message(queue_type, message)
+            except Exception as exc:
+                logger.error(
+                    "Initial sync publish failed; sync will retry on next startup",
+                    queue_type=queue_type,
+                    sync_log_id=log_id,
+                    error=str(exc),
+                )
+                await _mark_sync_log_failed(log_id, f"Initial sync publish failed: {exc}")
 
         logger.info(
             "Initial sync triggered. Products, orders (90 days) and stock are "
@@ -421,15 +452,24 @@ async def check_and_trigger_initial_sync(app: FastAPI) -> None:
                 "invoices",
                 metadata={"triggered_by": "cold_start"},
             )
-        await publisher.publish_sync_message(
-            "invoices.full",
-            {
-                "is_cold_start": True,
-                "sync_log_id": invoices_log,
-                "published_at": datetime.now(UTC).isoformat(),
-            },
-        )
-        logger.info("Invoice cold start triggered", invoices_sync_log_id=invoices_log)
+        try:
+            await publisher.publish_sync_message(
+                "invoices.full",
+                {
+                    "is_cold_start": True,
+                    "sync_log_id": invoices_log,
+                    "published_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        except Exception as exc:
+            logger.error(
+                "Invoice cold start publish failed; will retry on next startup",
+                sync_log_id=invoices_log,
+                error=str(exc),
+            )
+            await _mark_sync_log_failed(invoices_log, f"Cold start publish failed: {exc}")
+        else:
+            logger.info("Invoice cold start triggered", invoices_sync_log_id=invoices_log)
     else:
         logger.info(
             "Invoices table has existing data, skipping cold start",

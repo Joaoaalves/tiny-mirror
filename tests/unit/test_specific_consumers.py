@@ -136,3 +136,33 @@ async def test_bucket_refresh_consumer_parses_dates_and_delegates() -> None:
     await consumer.handle({"date_from": "2025-01-01", "date_to": "2025-01-05"})
 
     service.refresh_buckets.assert_awaited_once_with(date(2025, 1, 1), date(2025, 1, 5))
+
+
+# ---------------------------------------------------------------------------
+# Invoices
+# ---------------------------------------------------------------------------
+async def test_invoice_cold_start_without_sync_log_id_raises_for_dlq() -> None:
+    """A malformed cold-start message must raise (→ BaseConsumer nacks to the
+    DLQ) instead of being silently acked and lost."""
+    from tiny_mirror.queue.consumers.invoice_consumers import InvoiceFullSyncConsumer
+
+    service = MagicMock()
+    service.run_cold_start = AsyncMock()
+    consumer = InvoiceFullSyncConsumer(MagicMock(), MagicMock(), service)
+
+    with pytest.raises(ValueError, match="sync_log_id"):
+        await consumer.handle({"is_cold_start": True, "sync_log_id": None})
+
+    service.run_cold_start.assert_not_awaited()
+
+
+async def test_invoice_cold_start_with_sync_log_id_delegates() -> None:
+    from tiny_mirror.queue.consumers.invoice_consumers import InvoiceFullSyncConsumer
+
+    service = MagicMock()
+    service.run_cold_start = AsyncMock()
+    consumer = InvoiceFullSyncConsumer(MagicMock(), MagicMock(), service)
+
+    await consumer.handle({"is_cold_start": True, "sync_log_id": 7})
+
+    service.run_cold_start.assert_awaited_once_with(7)
