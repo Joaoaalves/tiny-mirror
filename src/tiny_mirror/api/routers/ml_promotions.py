@@ -2148,8 +2148,9 @@ async def modify_promotion_endpoint(
     )
 
     if not is_raise:
-        # Baixar/igual: altera in-place, sem sair da oferta.
-        result = await service.modify_promotion(
+        # Baixar/igual: edita IN-PLACE (PUT), sem sair da oferta. Doc ML: a
+        # edição de item numa promoção é PUT (≠ do POST que é inscrição).
+        result = await service.edit_promotion_price(
             mlb_id=body.mlb_id,
             deal_price=float(body.new_price),
             promotion_id=body.promo_id,
@@ -2188,7 +2189,7 @@ async def modify_promotion_endpoint(
                 detail={"step": "exit", "response": exit_result.get("response")},
             )
         # Reentra: PRICE_DISCOUNT (sem campanha) cria desconto de vendedor;
-        # campanha reentra com o promotion_id.
+        # campanha reentra com o promotion_id (POST = nova inscrição).
         if promo_type == "PRICE_DISCOUNT" or body.promo_id is None:
             enter_result = await service.create_price_discount(
                 mlb_id=body.mlb_id, deal_price=float(body.new_price)
@@ -2202,6 +2203,24 @@ async def modify_promotion_endpoint(
             )
         enter_sc = enter_result.get("status_code")
         if enter_sc is not None and enter_sc >= 400:
+            # RISCO da abordagem sair+reentrar: o DELETE deu certo (o anúncio
+            # JÁ voltou ao preço cheio) mas a reinscrição falhou. Para campanhas
+            # geridas pelo ML, depois do exit o item pode levar um tempo até ser
+            # RE-SUGERIDO como candidato — então a reinscrição imediata pode
+            # devolver "não elegível/oferta inexistente". Estado resultante: SEM
+            # promoção, a preço cheio. Logado num evento próprio pra a gente
+            # decidir o que fazer (retry com backoff? alerta? fila?).
+            logger.warning(
+                "promo.resubscribe_failed",
+                note=(
+                    "exit OK mas reinscrição falhou — anúncio voltou ao preço CHEIO, "
+                    "sem promoção. Campanha pode demorar a ser re-sugerida pelo ML."
+                ),
+                step="reenter",
+                exit_ok=True,
+                ml_status_code=enter_sc,
+                new_price=_fnum(body.new_price),
+            )
             _done(
                 "ml_rejected",
                 level="warning",

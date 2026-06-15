@@ -31,6 +31,7 @@ class FakeRow:
     promo_id: str | None = "PROMO_XYZ"
     target_price: Decimal | None = Decimal("78.90")
     target_total_pct: Decimal | None = Decimal("30.0")
+    stock_chosen: int | None = None
 
 
 def test_deal_would_activate_uses_deal_price() -> None:
@@ -51,6 +52,25 @@ def test_lightning_would_activate_same_shape_as_deal() -> None:
     assert body is not None
     assert body["promotion_type"] == "LIGHTNING"
     assert body["deal_price"] == 78.9
+
+
+def test_lightning_includes_stock_when_chosen() -> None:
+    # Doc ML "Specify items for a lightning deal": o body leva `stock` (qtd).
+    body = MLPromotionService._build_apply_body(
+        FakeRow(promo_type="LIGHTNING", decision_kind="would_activate", stock_chosen=12)
+    )
+    assert body is not None
+    assert body["stock"] == 12
+
+
+def test_dod_does_not_send_stock() -> None:
+    # Doc ML "Daily Deal": o POST é {deal_price, promotion_type}; `stock` ali é
+    # informativo (estoque mínimo), NÃO um campo do request — mandar pode dar 400.
+    body = MLPromotionService._build_apply_body(
+        FakeRow(promo_type="DOD", decision_kind="would_activate", stock_chosen=12)
+    )
+    assert body is not None
+    assert "stock" not in body
 
 
 def test_seller_coupon_uses_discount_percentage() -> None:

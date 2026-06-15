@@ -481,8 +481,13 @@ class MLPromotionService:
 
         async def _send(tok: str) -> httpx.Response:
             headers = {"Authorization": f"Bearer {tok}"}
-            if method.upper() == "DELETE":
+            m = method.upper()
+            if m == "DELETE":
                 return await self._http.delete(url, params=params, headers=headers, timeout=timeout)
+            if m == "PUT":
+                return await self._http.put(
+                    url, params=params, json=body, headers=headers, timeout=timeout
+                )
             return await self._http.post(
                 url, params=params, json=body, headers=headers, timeout=timeout
             )
@@ -724,11 +729,11 @@ class MLPromotionService:
                 "promotion_type": promo_type,
                 "deal_price": float(target),
             }
-            # LIGHTNING/DOD exigem reservar estoque pra oferta. Enviamos a
-            # quantidade escolhida pelo operador (stock_chosen). NOTA: o nome do
-            # campo ("stock") precisa ser confirmado na 1ª ativação real — se o
-            # ML recusar, o erro volta na UI e ajustamos.
-            if promo_type in {"LIGHTNING", "DOD"} and getattr(decision, "stock_chosen", None):
+            # LIGHTNING reserva estoque pra oferta: doc ML "Specify items for a
+            # lightning deal" → body leva `stock` (qtd disponível). DOD NÃO: lá o
+            # `stock` é informativo (estoque mínimo) e o POST é só
+            # {deal_price, promotion_type} — mandar `stock` no DOD pode dar 400.
+            if promo_type == "LIGHTNING" and getattr(decision, "stock_chosen", None):
                 body["stock"] = int(decision.stock_chosen)
             return body
 
@@ -885,6 +890,34 @@ class MLPromotionService:
         )
         return {"status_code": result["status_code"], "response": result["response"]}
 
+    async def edit_promotion_price(
+        self,
+        *,
+        mlb_id: str,
+        deal_price: float,
+        promotion_id: str | None = None,
+        promotion_type: str = "PRICE_DISCOUNT",
+    ) -> dict[str, Any]:
+        """Altera, IN-PLACE, o preço de uma promoção JÁ inscrita — sem sair dela.
+
+        Doc ML (Modify items): a edição de um item numa promoção é
+        ``PUT /seller-promotions/items/{mlb_id}?app_version=v2`` com
+        ``{deal_price, promotion_id, promotion_type}`` (≠ do POST, que é a
+        INSCRIÇÃO). O ML só permite **BAIXAR** o preço in-place; subir devolve
+        400 (preço fora do desconto sugerido) — por isso o endpoint roteia o
+        "subir" por sair+reentrar. A regra de só-baixar é validada no front
+        antes de chamar este método."""
+        body: dict[str, Any] = {
+            "promotion_type": promotion_type,
+            "deal_price": deal_price,
+        }
+        if promotion_id is not None:
+            body["promotion_id"] = promotion_id
+        result = await self._ml_write(
+            "PUT", mlb_id, op="edit_promotion_price", body=body, timeout=30.0
+        )
+        return {"status_code": result["status_code"], "response": result["response"]}
+
     async def modify_promotion(
         self,
         *,
@@ -893,14 +926,13 @@ class MLPromotionService:
         promotion_id: str | None = None,
         promotion_type: str = "PRICE_DISCOUNT",
     ) -> dict[str, Any]:
-        """Altera o preço de uma promoção JÁ inscrita, sem sair dela.
+        """Inscreve/RE-inscreve o anúncio numa campanha a um preço — ``POST``.
 
-        Re-envia ``POST /seller-promotions/items/{mlb_id}`` com o mesmo
-        ``promotion_id`` e ``promotion_type``, mudando só o ``deal_price``. O ML
-        trata o POST como idempotente por (anúncio, promoção) — atualiza o preço
-        no lugar, preservando a vaga na campanha. Espelha o "Alterar" nativo do
-        ML, que só permite BAIXAR o preço; subir exige sair e reentrar (a regra
-        de só-baixar é validada no front antes de chamar este método)."""
+        Usado pelo caminho de "subir preço" (sair + reentrar): depois do
+        DELETE, o item NÃO está mais na campanha, então reentrar é uma
+        INSCRIÇÃO (``POST /seller-promotions/items/{mlb_id}`` com
+        ``{promotion_id, promotion_type, deal_price}``), não uma edição
+        in-place (essa é ``edit_promotion_price`` via PUT)."""
         body: dict[str, Any] = {
             "promotion_type": promotion_type,
             "deal_price": deal_price,

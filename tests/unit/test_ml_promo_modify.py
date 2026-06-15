@@ -27,7 +27,9 @@ def _http(json_body: Any = None, status: int = 200) -> Any:
     resp.status_code = status
     resp.content = (json.dumps(json_body) if json_body is not None else "").encode()
     resp.json = MagicMock(return_value=json_body or {})
+    resp.text = json.dumps(json_body) if json_body is not None else ""
     mock.post = AsyncMock(return_value=resp)
+    mock.put = AsyncMock(return_value=resp)
     mock.delete = AsyncMock(return_value=resp)
     return mock
 
@@ -37,6 +39,29 @@ def _service(http: Any) -> MLPromotionService:
     token.get_valid_access_token = AsyncMock(return_value="tok")
     token.handle_unauthorized = AsyncMock(return_value="tok2")
     return MLPromotionService(token_service=token, http_client=http)
+
+
+@pytest.mark.asyncio
+async def test_edit_in_place_uses_put_not_post() -> None:
+    # Doc ML "Modify items": editar o preço de um item JÁ inscrito é PUT
+    # (≠ do POST que é inscrição). Só BAIXAR é permitido in-place.
+    http = _http({"price": 29.9, "top_price": 0, "original_price": 50})
+    svc = _service(http)
+    out = await svc.edit_promotion_price(
+        mlb_id="MLB123",
+        deal_price=29.90,
+        promotion_id="P-MLB1",
+        promotion_type="DEAL",
+    )
+    assert out["status_code"] == 200
+    http.post.assert_not_called()
+    _, kwargs = http.put.call_args
+    assert kwargs["json"] == {
+        "promotion_type": "DEAL",
+        "deal_price": 29.90,
+        "promotion_id": "P-MLB1",
+    }
+    assert kwargs["params"] == {"app_version": "v2"}
 
 
 @pytest.mark.asyncio
