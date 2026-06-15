@@ -1369,6 +1369,7 @@ class MLPromotionService:
             "decisions_skipped_existing": 0,
             "decisions_denied_inserted": 0,
             "decisions_active_inserted": 0,
+            "started_expired": 0,
         }
 
         for sku in skus:
@@ -1403,6 +1404,11 @@ class MLPromotionService:
                     list_price=list_price,
                     excluded_types=cap.excluded_promo_types or (),
                 )
+                # promo_keys das campanhas STARTED vistas AGORA neste MLB. Tudo
+                # que estava 'started/ignored' no banco e não aparece mais aqui
+                # = campanha encerrada no ML → expira (limpa promoções antigas
+                # que ficavam "ativas" pra sempre, ex.: SMART/SELLER de maio).
+                started_keys_now: set[str] = set()
                 for entry in entries:
                     entry_status = entry.get("status")
                     # Persistimos as 3 categorias:
@@ -1431,20 +1437,17 @@ class MLPromotionService:
                     # "2026-06-08T00:00:00" — fromisoformat handles both
                     # in Python 3.11+; strip trailing timezone offset
                     # manually for older runtimes.
-                    raw_finish = entry.get("finish_date")
-                    finish_dt: datetime | None = None
-                    if raw_finish:
-                        try:
-                            finish_dt = datetime.fromisoformat(str(raw_finish))
-                            if finish_dt.tzinfo is None:
-                                finish_dt = finish_dt.replace(tzinfo=UTC)
-                        except (ValueError, TypeError):
-                            pass
+                    finish_dt = _parse_iso_dt(entry.get("finish_date"))
+                    start_dt = _parse_iso_dt(entry.get("start_date"))
+
+                    key_now = str(promo_key)[:80]
+                    if entry.get("constraint") == "started":
+                        started_keys_now.add(key_now)
 
                     inserted = await decisions.insert_if_absent(
                         mlb_id=mlb_id,
                         sku=sku,
-                        promo_key=str(promo_key)[:80],
+                        promo_key=key_now,
                         promo_id=promo_id,
                         promo_type=entry.get("promo_type") or "?",
                         promo_name=entry.get("promo_name"),
@@ -1460,6 +1463,7 @@ class MLPromotionService:
                         reason=entry.get("reason") or "",
                         status=db_status,
                         promo_finish_date=finish_dt,
+                        promo_start_date=start_dt,
                         min_price=_to_dec(entry.get("min_price")),
                         max_price=_to_dec(entry.get("max_price")),
                         stock_min=entry.get("stock_min"),
@@ -1474,6 +1478,13 @@ class MLPromotionService:
                             stats["decisions_active_inserted"] += 1
                     else:
                         stats["decisions_skipped_existing"] += 1
+
+                # MLB consultado com sucesso: expira as STARTED antigas que o ML
+                # não retorna mais (campanha encerrada). Só roda pra MLBs que
+                # chegaram aqui (fetch ok), nunca pros que deram `continue`.
+                stats["started_expired"] += await decisions.expire_disappeared_started(
+                    mlb_id=mlb_id, seen_promo_keys=started_keys_now
+                )
         await session.commit()
         logger.info("decisions_generated", **stats)
         return stats
@@ -1825,6 +1836,20 @@ def _to_dec(v: Any) -> Decimal | None:
         return Decimal(str(v))
     except Exception:
         return None
+
+
+def _parse_iso_dt(raw: Any) -> datetime | None:
+    """Parse a ML ISO timestamp ("2026-06-08T00:00:00-03:00" or naive) into an
+    aware datetime (UTC when no offset). Returns None on missing/invalid."""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
 
 
 def score_candidate_promo(
@@ -2221,6 +2246,7 @@ def enumerate_activations_for_item(
                     "promo_type": p.get("type"),
                     "promo_name": p.get("name"),
                     "finish_date": p.get("finish_date"),
+                    "start_date": p.get("start_date"),
                     "status": "already_active",
                     "target_price": price or None,
                     "target_total_pct": total_pct,
@@ -2260,6 +2286,7 @@ def enumerate_activations_for_item(
                 "promo_type": p.get("type"),
                 "promo_name": p.get("name"),
                 "finish_date": p.get("finish_date"),
+                "start_date": p.get("start_date"),
                 "status": "would_activate" if accepted else "denied",
                 **scored,
             }

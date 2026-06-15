@@ -1479,6 +1479,14 @@ class MLPromoDecisionORM(Base):
             "Usado pelo expire-stale para descartar decisões de campanhas encerradas."
         ),
     )
+    promo_start_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=(
+            "Data de início da campanha ML (start_date do objeto Promo). "
+            "NULL quando o ML não informa. Exibe a vigência junto com o término."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

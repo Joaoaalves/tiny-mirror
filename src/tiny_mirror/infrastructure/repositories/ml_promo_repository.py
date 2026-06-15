@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -381,6 +381,7 @@ class MLPromoDecisionRepository:
         reason: str,
         status: str = "pending",
         promo_finish_date: Any | None = None,
+        promo_start_date: Any | None = None,
         min_price: Decimal | None = None,
         max_price: Decimal | None = None,
         stock_min: int | None = None,
@@ -415,6 +416,7 @@ class MLPromoDecisionRepository:
                 reason=reason,
                 status=status,
                 promo_finish_date=promo_finish_date,
+                promo_start_date=promo_start_date,
                 min_price=min_price,
                 max_price=max_price,
                 stock_min=stock_min,
@@ -555,6 +557,49 @@ class MLPromoDecisionRepository:
         row.expired_reason = reason
         await self._session.flush()
         return row
+
+    async def expire_disappeared_started(
+        self,
+        *,
+        mlb_id: str,
+        seen_promo_keys: set[str],
+        reason: str = "campaign_ended",
+    ) -> int:
+        """Expire 'started' decisions for an MLB whose campaign ML no longer
+        returns (campaign ended).
+
+        ML's live ``started`` set (``seen_promo_keys``) is the source of truth
+        for what's currently active. Any row still recorded as an active
+        campaign for this MLB but absent from that set is marked expired — this
+        is what stops finished campaigns (e.g. May SMART/SELLER) from lingering
+        forever in the "Inscritas" list. An empty ``seen_promo_keys`` means ML
+        returned no started promo for this MLB, so all of its started rows
+        expire.
+
+        Only touches rows in ``status='ignored'`` with
+        ``constraint_used='started'`` (the visibility-only active rows). Never
+        touches pending/approved/operator-decided rows. Returns the count.
+        """
+        conds = [
+            MLPromoDecisionORM.mlb_id == mlb_id,
+            MLPromoDecisionORM.constraint_used == "started",
+            MLPromoDecisionORM.status == "ignored",
+        ]
+        if seen_promo_keys:
+            conds.append(MLPromoDecisionORM.promo_key.notin_(seen_promo_keys))
+        stmt = (
+            update(MLPromoDecisionORM)
+            .where(*conds)
+            .values(
+                status="expired",
+                expired_at=datetime.now(UTC),
+                expired_reason=reason,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
     async def revert_to_pending(
         self,

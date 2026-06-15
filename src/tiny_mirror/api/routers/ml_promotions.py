@@ -228,6 +228,8 @@ class DecisionOut(BaseModel):
     stock_chosen: int | None = None
     reason: str
     status: str
+    promo_start_date: datetime | None = None
+    promo_finish_date: datetime | None = None
     created_at: datetime
     decided_at: datetime | None
     decided_by: str | None
