@@ -45,59 +45,55 @@ def test_deal_would_activate_uses_deal_price() -> None:
     }
 
 
-def test_lightning_would_activate_same_shape_as_deal() -> None:
-    body = MLPromotionService._build_apply_body(
+def test_lightning_requires_stock_and_omits_promotion_id() -> None:
+    # Doc ML "Ofertas relâmpago": body = {deal_price, stock, promotion_type},
+    # SEM promotion_id. `stock` (qtd reservada) é obrigatório → sem ele, skip.
+    no_stock = MLPromotionService._build_apply_body(
         FakeRow(promo_type="LIGHTNING", decision_kind="would_activate")
     )
-    assert body is not None
-    assert body["promotion_type"] == "LIGHTNING"
-    assert body["deal_price"] == 78.9
+    assert no_stock is None
 
-
-def test_lightning_includes_stock_when_chosen() -> None:
-    # Doc ML "Specify items for a lightning deal": o body leva `stock` (qtd).
     body = MLPromotionService._build_apply_body(
         FakeRow(promo_type="LIGHTNING", decision_kind="would_activate", stock_chosen=12)
     )
-    assert body is not None
-    assert body["stock"] == 12
+    assert body == {"promotion_type": "LIGHTNING", "deal_price": 78.9, "stock": 12}
+    assert "promotion_id" not in body
 
 
-def test_dod_does_not_send_stock() -> None:
-    # Doc ML "Daily Deal": o POST é {deal_price, promotion_type}; `stock` ali é
-    # informativo (estoque mínimo), NÃO um campo do request — mandar pode dar 400.
+def test_dod_minimal_body_no_id_no_stock() -> None:
+    # Doc ML "Ofertas do dia": POST = {deal_price, promotion_type}. Sem
+    # promotion_id e sem stock (lá o `stock` é só informativo).
     body = MLPromotionService._build_apply_body(
         FakeRow(promo_type="DOD", decision_kind="would_activate", stock_chosen=12)
     )
-    assert body is not None
-    assert "stock" not in body
+    assert body == {"promotion_type": "DOD", "deal_price": 78.9}
 
 
-def test_seller_coupon_uses_discount_percentage() -> None:
+def test_seller_coupon_sends_only_promotion_id_and_type() -> None:
+    # Doc ML "Indicar itens para uma campanha": o cupom é desconto FIXO da
+    # campanha aplicado no checkout — NÃO se envia preço nem %. Só {id, type}.
     body = MLPromotionService._build_apply_body(
         FakeRow(promo_type="SELLER_COUPON_CAMPAIGN", decision_kind="would_activate"),
     )
     assert body == {
         "promotion_id": "PROMO_XYZ",
         "promotion_type": "SELLER_COUPON_CAMPAIGN",
-        "discount_percentage": 30.0,
     }
+    assert "discount_percentage" not in body
 
 
-def test_seller_coupon_requires_target_total_pct() -> None:
+def test_seller_coupon_skips_without_promotion_id() -> None:
     body = MLPromotionService._build_apply_body(
         FakeRow(
             promo_type="SELLER_COUPON_CAMPAIGN",
             decision_kind="would_activate",
-            target_total_pct=None,
+            promo_id=None,
         )
     )
-    # Without a % the executor must skip — sending an empty body would
-    # surprise ML.
     assert body is None
 
 
-def test_price_discount_create_has_no_promotion_id() -> None:
+def test_price_discount_create_has_dates_and_no_promotion_id() -> None:
     body = MLPromotionService._build_apply_body(
         FakeRow(
             promo_type="PRICE_DISCOUNT",
@@ -105,24 +101,25 @@ def test_price_discount_create_has_no_promotion_id() -> None:
             promo_id=None,
         )
     )
-    assert body == {
-        "promotion_type": "PRICE_DISCOUNT",
-        "deal_price": 78.9,
-    }
-    # Critical: a CREATE must not carry a promotion_id (ML treats that
-    # as 'enrol in this existing campaign' which is the opposite).
-    assert body is not None and "promotion_id" not in body
+    assert body is not None
+    assert body["promotion_type"] == "PRICE_DISCOUNT"
+    assert body["deal_price"] == 78.9
+    # ML EXIGE start_date/finish_date em formato LOCAL (sem timezone/Z).
+    assert "start_date" in body and "finish_date" in body
+    assert "T" in body["start_date"] and not body["start_date"].endswith("Z")
+    # CREATE não leva promotion_id.
+    assert "promotion_id" not in body
 
 
-def test_price_discount_would_activate_carries_promotion_id() -> None:
+def test_price_discount_would_activate_carries_promotion_id_and_dates() -> None:
     body = MLPromotionService._build_apply_body(
         FakeRow(promo_type="PRICE_DISCOUNT", decision_kind="would_activate")
     )
-    assert body == {
-        "promotion_id": "PROMO_XYZ",
-        "promotion_type": "PRICE_DISCOUNT",
-        "deal_price": 78.9,
-    }
+    assert body is not None
+    assert body["promotion_id"] == "PROMO_XYZ"
+    assert body["promotion_type"] == "PRICE_DISCOUNT"
+    assert body["deal_price"] == 78.9
+    assert "start_date" in body and "finish_date" in body
 
 
 def test_smart_is_skipped() -> None:

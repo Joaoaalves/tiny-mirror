@@ -20,7 +20,7 @@ import json
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -708,53 +708,66 @@ class MLPromotionService:
         target = decision.target_price
         promo_id = decision.promo_id
 
-        # Coupon: % off at checkout, no fixed price.
+        # SELLER_COUPON_CAMPAIGN — "Indicar itens para uma campanha": o cupom é
+        # desconto FIXO da campanha aplicado no CHECKOUT, então NÃO se envia
+        # preço nem %; o body é só {promotion_id, promotion_type}. (O item não
+        # pode ser modificado depois — o valor/% é fixo da campanha.)
         if promo_type == "SELLER_COUPON_CAMPAIGN":
-            if promo_id is None or decision.target_total_pct is None:
+            if promo_id is None:
+                return None
+            return {"promotion_id": promo_id, "promotion_type": "SELLER_COUPON_CAMPAIGN"}
+
+        # DEAL / SELLER_CAMPAIGN — inscrição numa campanha existente pelo id:
+        # {promotion_id, promotion_type, deal_price} (top_deal_price é opcional).
+        if promo_type in {"DEAL", "SELLER_CAMPAIGN"} and decision_kind == "would_activate":
+            if promo_id is None or target is None:
                 return None
             return {
                 "promotion_id": promo_id,
                 "promotion_type": promo_type,
-                "discount_percentage": float(decision.target_total_pct),
-            }
-
-        # Interval / fixed-price campaigns with a known promotion_id.
-        if promo_type in {"DEAL", "DOD", "LIGHTNING", "SELLER_CAMPAIGN"} and (
-            decision_kind == "would_activate"
-        ):
-            if promo_id is None or target is None:
-                return None
-            body = {
-                "promotion_id": promo_id,
-                "promotion_type": promo_type,
                 "deal_price": float(target),
             }
-            # LIGHTNING reserva estoque pra oferta: doc ML "Specify items for a
-            # lightning deal" → body leva `stock` (qtd disponível). DOD NÃO: lá o
-            # `stock` é informativo (estoque mínimo) e o POST é só
-            # {deal_price, promotion_type} — mandar `stock` no DOD pode dar 400.
-            if promo_type == "LIGHTNING" and getattr(decision, "stock_chosen", None):
-                body["stock"] = int(decision.stock_chosen)
-            return body
 
-        # PRICE_DISCOUNT can come in two flavours:
-        #  - would_activate: ML already enumerated a PRICE_DISCOUNT
-        #    campaign we can opt into. Same shape as DEAL.
-        #  - create_price_discount: no campaign; create a seller-driven
-        #    discount from scratch. promotion_id is omitted.
+        # DOD (oferta do dia) — body é SÓ {deal_price, promotion_type}: SEM
+        # promotion_id, SEM stock (lá o `stock` é informativo, não vai no POST).
+        if promo_type == "DOD" and decision_kind == "would_activate":
+            if target is None:
+                return None
+            return {"promotion_type": "DOD", "deal_price": float(target)}
+
+        # LIGHTNING (relâmpago) — {deal_price, stock, promotion_type}: SEM
+        # promotion_id; `stock` (qtd reservada pra oferta) é OBRIGATÓRIO no body.
+        if promo_type == "LIGHTNING" and decision_kind == "would_activate":
+            stock = getattr(decision, "stock_chosen", None)
+            if target is None or not stock:
+                return None
+            return {
+                "promotion_type": "LIGHTNING",
+                "deal_price": float(target),
+                "stock": int(stock),
+            }
+
+        # PRICE_DISCOUNT (desconto individual) — o ML EXIGE start_date +
+        # finish_date em formato LOCAL (sem timezone; só a data conta). create =
+        # sem promotion_id; would_activate = com promotion_id.
         if promo_type == "PRICE_DISCOUNT":
             if target is None:
                 return None
+            start, finish = _price_discount_default_dates()
             if decision_kind == "create_price_discount":
                 return {
                     "promotion_type": "PRICE_DISCOUNT",
                     "deal_price": float(target),
+                    "start_date": start,
+                    "finish_date": finish,
                 }
             if decision_kind == "would_activate" and promo_id is not None:
                 return {
                     "promotion_id": promo_id,
                     "promotion_type": "PRICE_DISCOUNT",
                     "deal_price": float(target),
+                    "start_date": start,
+                    "finish_date": finish,
                 }
 
         # SMART / PRICE_MATCHING / MARKETPLACE_CAMPAIGN / VOLUME /
@@ -882,9 +895,30 @@ class MLPromotionService:
         )
         return {"status_code": result["status_code"], "response": result["response"]}
 
-    async def create_price_discount(self, *, mlb_id: str, deal_price: float) -> dict[str, Any]:
-        """Cria uma promoção PRICE_DISCOUNT direta para um MLB (sem campaign_id)."""
-        body = {"promotion_type": "PRICE_DISCOUNT", "deal_price": deal_price}
+    async def create_price_discount(
+        self,
+        *,
+        mlb_id: str,
+        deal_price: float,
+        start_date: str | None = None,
+        finish_date: str | None = None,
+    ) -> dict[str, Any]:
+        """Cria uma promoção PRICE_DISCOUNT direta para um MLB (sem campaign_id).
+
+        Doc ML "Desconto individual": o body EXIGE ``start_date`` + ``finish_date``
+        em formato LOCAL (sem timezone — o ML considera só a data: início/fim do
+        dia). Default quando não informado: hoje → +30 dias.
+        """
+        if not start_date or not finish_date:
+            ds, df = _price_discount_default_dates()
+            start_date = start_date or ds
+            finish_date = finish_date or df
+        body = {
+            "promotion_type": "PRICE_DISCOUNT",
+            "deal_price": deal_price,
+            "start_date": start_date,
+            "finish_date": finish_date,
+        }
         result = await self._ml_write(
             "POST", mlb_id, op="create_price_discount", body=body, timeout=30.0
         )
@@ -1867,6 +1901,21 @@ def _to_dec(v: Any) -> Decimal | None:
         return Decimal(str(v))
     except Exception:
         return None
+
+
+def _price_discount_default_dates(days: int = 30) -> tuple[str, str]:
+    """start_date/finish_date no formato LOCAL exigido pelo ML para
+    PRICE_DISCOUNT (sem timezone — o ML usa só a data: início/fim do dia).
+    Default: de hoje até +``days`` dias (horário de Brasília)."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        today = datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    except Exception:  # pragma: no cover — tzdata ausente
+        today = datetime.now(UTC).date()
+    start = f"{today.isoformat()}T00:00:00"
+    finish = f"{(today + timedelta(days=days)).isoformat()}T00:00:00"
+    return start, finish
 
 
 def _parse_iso_dt(raw: Any) -> datetime | None:

@@ -1759,6 +1759,10 @@ class CreatePriceDiscountIn(BaseModel):
     mlb_id: str
     deal_price: Decimal = Field(gt=0)
     decided_by: str | None = None
+    # Vigência do desconto — formato LOCAL "YYYY-MM-DDTHH:MM:SS" (o ML usa só a
+    # data). Opcional: o serviço usa hoje → +30d quando ausente.
+    start_date: str | None = None
+    finish_date: str | None = None
 
 
 @router.post("/create-price-discount")
@@ -1791,7 +1795,10 @@ async def create_price_discount_direct(
         floor_price=_fnum(cap.margin_floor_price if cap else None),
     )
     result = await service.create_price_discount(
-        mlb_id=body.mlb_id, deal_price=float(body.deal_price)
+        mlb_id=body.mlb_id,
+        deal_price=float(body.deal_price),
+        start_date=body.start_date,
+        finish_date=body.finish_date,
     )
     sc = result.get("status_code")
     if sc is not None and sc >= 400:

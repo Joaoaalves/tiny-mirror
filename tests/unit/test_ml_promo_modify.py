@@ -65,6 +65,33 @@ async def test_edit_in_place_uses_put_not_post() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_price_discount_sends_required_local_dates() -> None:
+    # Doc ML "Desconto individual": o POST EXIGE start_date + finish_date em
+    # formato LOCAL (sem timezone). Default = hoje → +30d quando não informado.
+    http = _http({"id": "P-1"})
+    svc = _service(http)
+    out = await svc.create_price_discount(mlb_id="MLB1", deal_price=10.0)
+    assert out["status_code"] == 200
+    _, kwargs = http.post.call_args
+    b = kwargs["json"]
+    assert b["promotion_type"] == "PRICE_DISCOUNT"
+    assert b["deal_price"] == 10.0
+    assert "start_date" in b and "finish_date" in b
+    assert not b["start_date"].endswith("Z")  # formato local, sem timezone
+
+    # Datas explícitas passam direto.
+    await svc.create_price_discount(
+        mlb_id="MLB1",
+        deal_price=10.0,
+        start_date="2026-06-15T00:00:00",
+        finish_date="2026-07-15T00:00:00",
+    )
+    _, kwargs2 = http.post.call_args
+    assert kwargs2["json"]["start_date"] == "2026-06-15T00:00:00"
+    assert kwargs2["json"]["finish_date"] == "2026-07-15T00:00:00"
+
+
+@pytest.mark.asyncio
 async def test_modify_preserves_promotion_id_and_type() -> None:
     http = _http({"status": "started"})
     svc = _service(http)
