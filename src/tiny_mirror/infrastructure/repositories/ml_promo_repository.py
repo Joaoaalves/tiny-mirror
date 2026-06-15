@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, literal_column, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -395,39 +395,61 @@ class MLPromoDecisionRepository:
         they end up in the table for visibility but don't pollute the
         operator's pending queue.
         """
-        stmt = (
-            pg_insert(MLPromoDecisionORM)
-            .values(
-                mlb_id=mlb_id,
-                sku=sku,
-                promo_key=promo_key,
-                promo_id=promo_id,
-                promo_type=promo_type,
-                promo_name=promo_name,
-                decision_kind=decision_kind,
-                target_price=target_price,
-                target_total_pct=target_total_pct,
-                target_seller_pct=target_seller_pct,
-                meli_percentage=meli_percentage,
-                constraint_used=constraint_used,
-                list_price=list_price,
-                cap_pct=cap_pct,
-                floor_price=floor_price,
-                reason=reason,
-                status=status,
-                promo_finish_date=promo_finish_date,
-                promo_start_date=promo_start_date,
-                min_price=min_price,
-                max_price=max_price,
-                stock_min=stock_min,
-                stock_max=stock_max,
-            )
-            .on_conflict_do_nothing(constraint="uq_ml_promo_decisions_mlb_promo")
-            .returning(MLPromoDecisionORM)
+        ins = pg_insert(MLPromoDecisionORM).values(
+            mlb_id=mlb_id,
+            sku=sku,
+            promo_key=promo_key,
+            promo_id=promo_id,
+            promo_type=promo_type,
+            promo_name=promo_name,
+            decision_kind=decision_kind,
+            target_price=target_price,
+            target_total_pct=target_total_pct,
+            target_seller_pct=target_seller_pct,
+            meli_percentage=meli_percentage,
+            constraint_used=constraint_used,
+            list_price=list_price,
+            cap_pct=cap_pct,
+            floor_price=floor_price,
+            reason=reason,
+            status=status,
+            promo_finish_date=promo_finish_date,
+            promo_start_date=promo_start_date,
+            min_price=min_price,
+            max_price=max_price,
+            stock_min=stock_min,
+            stock_max=stock_max,
         )
-        result = await self._session.execute(stmt)
+        # On conflict we DON'T touch the operator/engine state (status,
+        # target, etc.) — the row is idempotent. We only REFRESH the campaign
+        # validity dates so existing 'started' rows (first seen before these
+        # columns existed) get backfilled and any extended campaign updates.
+        # COALESCE(new, current) keeps the stored value when ML omits it.
+        stmt: Any = (
+            ins.on_conflict_do_update(
+                constraint="uq_ml_promo_decisions_mlb_promo",
+                set_={
+                    "promo_finish_date": func.coalesce(
+                        ins.excluded.promo_finish_date,
+                        MLPromoDecisionORM.promo_finish_date,
+                    ),
+                    "promo_start_date": func.coalesce(
+                        ins.excluded.promo_start_date,
+                        MLPromoDecisionORM.promo_start_date,
+                    ),
+                },
+            )
+            # xmax = 0 on a fresh INSERT, non-zero when the row already
+            # existed (UPDATE path) — lets the caller keep its insert-vs-skip
+            # stats unchanged: a refreshed existing row still counts as "skip".
+            .returning(MLPromoDecisionORM, literal_column("xmax = 0").label("was_insert"))
+        )
+        row = (await self._session.execute(stmt)).first()
         await self._session.flush()
-        return result.scalar_one_or_none()
+        if row is None:
+            return None
+        orm_obj, was_insert = row[0], row[1]
+        return orm_obj if was_insert else None
 
     async def list_(
         self,
