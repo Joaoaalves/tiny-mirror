@@ -11,6 +11,9 @@ Surfaces 4 groups:
 
 from __future__ import annotations
 
+import time
+import uuid
+from collections.abc import AsyncIterator
 from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any, Literal
@@ -40,7 +43,68 @@ from tiny_mirror.services.ml_promotion_service import (
 
 logger = structlog.get_logger(__name__)
 
-router = APIRouter()
+# Contextvars an operation may bind. Cleared after every request (the _op_ctx
+# teardown below) so promo-operation fields never leak into unrelated requests.
+_OP_CTX_KEYS = (
+    "promo_op",
+    "op_id",
+    "decision_id",
+    "mlb_id",
+    "sku",
+    "promo_type",
+    "promo_id",
+    "actor",
+    "apply_mode",
+)
+
+
+async def _op_ctx() -> AsyncIterator[None]:
+    """Router-wide dependency: stamp a fresh ``op_id`` on every request and
+    guarantee the per-operation log context is torn down afterwards.
+
+    Combined with ``_bind_op`` (called inside the mutation endpoints), this
+    makes every log line of one operation — including the ML request/response
+    lines emitted deep in the service — share the same ``op_id`` + domain
+    fields, so a failed promotion write can be reconstructed end-to-end in Seq
+    by filtering on a single id.
+    """
+    structlog.contextvars.bind_contextvars(op_id=uuid.uuid4().hex[:12])
+    try:
+        yield
+    finally:
+        structlog.contextvars.unbind_contextvars(*_OP_CTX_KEYS)
+
+
+def _bind_op(op: str, **fields: Any) -> None:
+    """Bind the operation name + domain context onto structlog contextvars so
+    every subsequent log in this request carries them. ``None`` values are
+    dropped to keep the log object clean."""
+    structlog.contextvars.bind_contextvars(
+        promo_op=op, **{k: v for k, v in fields.items() if v is not None}
+    )
+
+
+def _done(result: str, *, level: str = "info", **fields: Any) -> None:
+    """Emit the terminal ``promo_op.done`` log for the current operation,
+    carrying the bound op context + the per-call outcome fields."""
+    clean = {k: v for k, v in fields.items() if v is not None}
+    if level == "warning":
+        logger.warning("promo_op.done", result=result, **clean)
+    else:
+        logger.info("promo_op.done", result=result, **clean)
+
+
+def _fnum(v: Any) -> float | None:
+    """Coerce Decimal/str/None → float|None for log fields."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+router = APIRouter(dependencies=[Depends(_op_ctx)])
 
 
 # ---------------------------------------------------------------------------
@@ -1215,7 +1279,18 @@ async def bulk_act_decisions(
     approve would skip the per-row target/cap/floor revalidation that
     the single-row endpoint enforces, and promotions cost money.
     """
-    return await service.bulk_decide_pending(
+    started = time.monotonic()
+    _bind_op("bulk_act", actor=body.decided_by)
+    logger.info(
+        "promo_op.start",
+        bulk_action=body.action,
+        dry_run=body.dry_run,
+        promo_types=body.promo_types,
+        skus=body.skus,
+        min_delta_pct=body.min_delta_pct,
+        max_delta_pct=body.max_delta_pct,
+    )
+    result = await service.bulk_decide_pending(
         session,
         action=body.action,
         promo_types=body.promo_types,
@@ -1226,6 +1301,14 @@ async def bulk_act_decisions(
         decided_by=body.decided_by,
         notes=body.notes,
     )
+    _done(
+        "bulk_preview" if body.dry_run else "bulk_committed",
+        bulk_action=body.action,
+        matched=result.get("matched") if isinstance(result, dict) else None,
+        affected=result.get("affected") if isinstance(result, dict) else None,
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
+    return result
 
 
 @router.post("/decisions/expire-stale")
@@ -1375,6 +1458,13 @@ async def approve_decision(
     # ml_apply_status='skipped' so the audit trail records that the
     # engine deliberately did not contact ML.
     apply_enabled = feature_flags.is_enabled("ml_promo_apply")
+    started = time.monotonic()
+    _bind_op(
+        "approve",
+        decision_id=decision_id,
+        actor=body.decided_by,
+        apply_mode="live" if apply_enabled else "simulation",
+    )
     repo = MLPromoDecisionRepository(session)
     override: dict[str, Decimal] = {}
     notes = body.notes
@@ -1388,6 +1478,13 @@ async def approve_decision(
     pre = await repo.get(decision_id)
     ctx: dict[str, Any] = {}
     if pre is not None:
+        _bind_op(
+            "approve",
+            mlb_id=pre.mlb_id,
+            sku=pre.sku,
+            promo_type=pre.promo_type,
+            promo_id=pre.promo_id,
+        )
         ctx = await _build_decision_context(
             session,
             mlb_id=pre.mlb_id,
@@ -1396,6 +1493,18 @@ async def approve_decision(
             list_price=float(pre.list_price or 0) or None,
             floor_price=float(pre.floor_price or 0) or None,
         )
+    logger.info(
+        "promo_op.start",
+        target_price=_fnum(
+            body.target_price
+            if body.target_price is not None
+            else (pre.target_price if pre else None)
+        ),
+        list_price=_fnum(pre.list_price if pre else None),
+        floor_price=_fnum(pre.floor_price if pre else None),
+        units=body.units,
+        had_override=body.target_price is not None,
+    )
     row = await repo.decide(
         decision_id,
         status="approved",
@@ -1406,6 +1515,11 @@ async def approve_decision(
         **override,
     )
     if row is None:
+        logger.warning(
+            "promo_op.done",
+            result="not_found",
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         raise HTTPException(
             status_code=404,
             detail=f"decision {decision_id} not found or already decided",
@@ -1437,6 +1551,7 @@ async def approve_decision(
         # Flag OFF: stamp 'skipped' so a future flag flip doesn't make
         # this look like a never-attempted approval. Only set on the
         # first transition; idempotent.
+        apply_result = {"status": "skipped", "status_code": None, "response": "flag OFF"}
         if row.ml_apply_status is None:
             updated = await repo.record_apply_result(
                 decision_id,
@@ -1447,6 +1562,14 @@ async def approve_decision(
             await session.commit()
             if updated is not None:
                 row = updated
+    ml_status = apply_result["status"]
+    _done(
+        "approved",
+        ml_apply_status=ml_status,
+        ml_status_code=apply_result["status_code"],
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+        level="warning" if ml_status == "failed" else "info",
+    )
     return DecisionOut.model_validate(row)
 
 
@@ -1464,7 +1587,10 @@ async def retry_decision_ml(
     refused with 409 so the operator doesn't think they fired
     something when they didn't.
     """
+    started = time.monotonic()
+    _bind_op("retry_ml", decision_id=decision_id, apply_mode="live")
     if not feature_flags.is_enabled("ml_promo_apply"):
+        _done("refused_flag_off", level="warning")
         raise HTTPException(
             status_code=409,
             detail="ML_PROMO_APPLY_ENABLED is OFF; nothing was sent",
@@ -1474,10 +1600,15 @@ async def retry_decision_ml(
     if row is None:
         raise HTTPException(status_code=404, detail=f"decision {decision_id} not found")
     if row.status != "approved":
+        _done("refused_wrong_status", level="warning", row_status=row.status)
         raise HTTPException(
             status_code=409,
             detail=f"decision is {row.status}, only 'approved' rows can be retried",
         )
+    _bind_op(
+        "retry_ml", mlb_id=row.mlb_id, sku=row.sku, promo_type=row.promo_type, promo_id=row.promo_id
+    )
+    logger.info("promo_op.start", target_price=_fnum(row.target_price))
     try:
         apply_result = await service.apply_decision_to_ml(decision=row)
     except Exception as exc:  # pragma: no cover
@@ -1494,6 +1625,13 @@ async def retry_decision_ml(
         response=apply_result["response"],
     )
     await session.commit()
+    _done(
+        "retried",
+        ml_apply_status=apply_result["status"],
+        ml_status_code=apply_result["status_code"],
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+        level="warning" if apply_result["status"] == "failed" else "info",
+    )
     return DecisionOut.model_validate(updated or row)
 
 
@@ -1503,10 +1641,18 @@ async def reject_decision(
     body: DecisionDecideIn,
     session: AsyncSession = Depends(db_session),
 ) -> DecisionOut:
+    _bind_op("reject", decision_id=decision_id, actor=body.decided_by)
     repo = MLPromoDecisionRepository(session)
     pre = await repo.get(decision_id)
     ctx: dict[str, Any] = {}
     if pre is not None:
+        _bind_op(
+            "reject",
+            mlb_id=pre.mlb_id,
+            sku=pre.sku,
+            promo_type=pre.promo_type,
+            promo_id=pre.promo_id,
+        )
         ctx = await _build_decision_context(
             session,
             mlb_id=pre.mlb_id,
@@ -1515,6 +1661,7 @@ async def reject_decision(
             list_price=float(pre.list_price or 0) or None,
             floor_price=float(pre.floor_price or 0) or None,
         )
+    logger.info("promo_op.start")
     row = await repo.decide(
         decision_id,
         status="rejected",
@@ -1523,11 +1670,13 @@ async def reject_decision(
         decision_context=ctx or None,
     )
     if row is None:
+        _done("not_found", level="warning")
         raise HTTPException(
             status_code=404,
             detail=f"decision {decision_id} not found or already decided",
         )
     await session.commit()
+    _done("rejected")
     return DecisionOut.model_validate(row)
 
 
@@ -1540,10 +1689,18 @@ async def ignore_decision(
     """Skip without committing yes/no. Same dedupe semantics as reject —
     the row stays out of the pending queue and the cron will not
     re-prompt for it."""
+    _bind_op("ignore", decision_id=decision_id, actor=body.decided_by)
     repo = MLPromoDecisionRepository(session)
     pre = await repo.get(decision_id)
     ctx: dict[str, Any] = {}
     if pre is not None:
+        _bind_op(
+            "ignore",
+            mlb_id=pre.mlb_id,
+            sku=pre.sku,
+            promo_type=pre.promo_type,
+            promo_id=pre.promo_id,
+        )
         ctx = await _build_decision_context(
             session,
             mlb_id=pre.mlb_id,
@@ -1552,6 +1709,7 @@ async def ignore_decision(
             list_price=float(pre.list_price or 0) or None,
             floor_price=float(pre.floor_price or 0) or None,
         )
+    logger.info("promo_op.start")
     row = await repo.decide(
         decision_id,
         status="ignored",
@@ -1560,11 +1718,13 @@ async def ignore_decision(
         decision_context=ctx or None,
     )
     if row is None:
+        _done("not_found", level="warning")
         raise HTTPException(
             status_code=404,
             detail=f"decision {decision_id} not found or already decided",
         )
     await session.commit()
+    _done("ignored")
     return DecisionOut.model_validate(row)
 
 
@@ -1578,14 +1738,20 @@ async def undo_decision(
     audit da última ação — o operador volta a ter o item na fila
     pendente e pode revisar/aprovar/rejeitar de novo.
     """
+    _bind_op("undo", decision_id=decision_id)
     repo = MLPromoDecisionRepository(session)
     row = await repo.revert_to_pending(decision_id)
     if row is None:
+        _done("not_found", level="warning")
         raise HTTPException(
             status_code=404,
             detail=f"decision {decision_id} not found or already pending",
         )
+    _bind_op(
+        "undo", mlb_id=row.mlb_id, sku=row.sku, promo_type=row.promo_type, promo_id=row.promo_id
+    )
     await session.commit()
+    _done("reverted", prev_status=row.status)
     return DecisionOut.model_validate(row)
 
 
@@ -1609,12 +1775,32 @@ async def create_price_discount_direct(
     """
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
+    started = time.monotonic()
     cap = await session.get(MLPromoCapORM, body.mlb_id)
+    _bind_op(
+        "create_price_discount",
+        mlb_id=body.mlb_id,
+        sku=cap.sku if cap else None,
+        promo_type="PRICE_DISCOUNT",
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info(
+        "promo_op.start",
+        deal_price=_fnum(body.deal_price),
+        floor_price=_fnum(cap.margin_floor_price if cap else None),
+    )
     result = await service.create_price_discount(
         mlb_id=body.mlb_id, deal_price=float(body.deal_price)
     )
     sc = result.get("status_code")
     if sc is not None and sc >= 400:
+        _done(
+            "ml_rejected",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         raise HTTPException(status_code=sc if sc < 600 else 502, detail=result.get("response"))
 
     # Log para auditoria e futura automação
@@ -1640,6 +1826,7 @@ async def create_price_discount_direct(
         context=ctx,
     )
     await session.commit()
+    _done("created", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
 
@@ -1667,12 +1854,33 @@ async def reprice_listing(
     """
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
+    started = time.monotonic()
     cap = await session.get(MLPromoCapORM, body.mlb_id)
+    _bind_op(
+        "reprice",
+        mlb_id=body.mlb_id,
+        sku=cap.sku if cap else None,
+        promo_type="PRICE_DISCOUNT",
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info(
+        "promo_op.start",
+        new_price=_fnum(body.new_price),
+        floor_price=_fnum(cap.margin_floor_price if cap else None),
+    )
 
     exit_result = await service.exit_promotion(mlb_id=body.mlb_id)
     exit_sc = exit_result.get("status_code")
     # Toleramos 404 (não estava em promo) e 200/204 como sucesso.
     if exit_sc is not None and exit_sc >= 400 and exit_sc != 404:
+        _done(
+            "ml_rejected",
+            level="warning",
+            step="exit",
+            ml_status_code=exit_sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         raise HTTPException(
             status_code=exit_sc if exit_sc < 600 else 502,
             detail={"step": "exit", "response": exit_result.get("response")},
@@ -1683,6 +1891,14 @@ async def reprice_listing(
     )
     enter_sc = enter_result.get("status_code")
     if enter_sc is not None and enter_sc >= 400:
+        _done(
+            "ml_rejected",
+            level="warning",
+            step="enter",
+            exit_ok=True,
+            ml_status_code=enter_sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         raise HTTPException(
             status_code=enter_sc if enter_sc < 600 else 502,
             detail={"step": "enter", "exit_ok": True, "response": enter_result.get("response")},
@@ -1711,6 +1927,12 @@ async def reprice_listing(
         context=ctx,
     )
     await session.commit()
+    _done(
+        "repriced",
+        exit_status_code=exit_sc,
+        enter_status_code=enter_sc,
+        elapsed_ms=round((time.monotonic() - started) * 1000),
+    )
     return {"exit": exit_result, "enter": enter_result}
 
 
@@ -1736,6 +1958,24 @@ async def exit_promotion_endpoint(
     roteamos por ``exit_offer``, que resolve esses ids ao vivo."""
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
+    started = time.monotonic()
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    _bind_op(
+        "exit_promotion",
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=body.promo_type,
+        promo_id=body.promo_id,
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info(
+        "promo_op.start",
+        co_participation=bool(
+            body.promo_type and body.promo_type.upper() in CO_PARTICIPATION_TYPES
+        ),
+    )
     if body.promo_type and body.promo_type.upper() in CO_PARTICIPATION_TYPES:
         result = await service.exit_offer(
             mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
@@ -1744,12 +1984,16 @@ async def exit_promotion_endpoint(
         result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=body.promo_type)
     sc = result.get("status_code")
     if sc is not None and sc >= 400 and sc != 404:
+        _done(
+            "ml_rejected",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         raise HTTPException(
             status_code=sc if sc < 600 else 502,
             detail={"step": "exit", "response": result.get("response")},
         )
-    cap = await session.get(MLPromoCapORM, body.mlb_id)
-    sku = cap.sku if cap else body.mlb_id
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
         sku=sku,
@@ -1762,6 +2006,7 @@ async def exit_promotion_endpoint(
         decided_by=body.decided_by,
     )
     await session.commit()
+    _done("exited", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
 
@@ -1786,8 +2031,22 @@ async def activate_smart_endpoint(
     chama isto após confirmação explícita do operador."""
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
+    started = time.monotonic()
     pt = (body.promo_type or "SMART").upper()
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    _bind_op(
+        "activate_smart",
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=pt,
+        promo_id=body.promo_id,
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info("promo_op.start")
     if pt not in CO_PARTICIPATION_TYPES:
+        _done("refused_wrong_type", level="warning")
         raise HTTPException(
             status_code=422,
             detail={
@@ -1803,6 +2062,12 @@ async def activate_smart_endpoint(
     )
     sc = result.get("status_code")
     if sc is None or sc >= 400:
+        _done(
+            "ml_rejected",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
         raise HTTPException(
             status_code=sc if (sc is not None and sc < 600) else 502,
             detail={
@@ -1811,8 +2076,6 @@ async def activate_smart_endpoint(
                 "sent_body": result.get("sent_body"),
             },
         )
-    cap = await session.get(MLPromoCapORM, body.mlb_id)
-    sku = cap.sku if cap else body.mlb_id
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
         sku=sku,
@@ -1825,6 +2088,7 @@ async def activate_smart_endpoint(
         decided_by=body.decided_by,
     )
     await session.commit()
+    _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
 
@@ -1860,9 +2124,27 @@ async def modify_promotion_endpoint(
     """
     from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
 
+    started = time.monotonic()
     promo_type = body.promo_type
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
     is_raise = body.current_price is not None and body.new_price > body.current_price + Decimal(
         "0.005"
+    )
+    _bind_op(
+        "modify_promotion",
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=promo_type,
+        promo_id=body.promo_id,
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info(
+        "promo_op.start",
+        new_price=_fnum(body.new_price),
+        current_price=_fnum(body.current_price),
+        is_raise=is_raise,
     )
 
     if not is_raise:
@@ -1875,6 +2157,13 @@ async def modify_promotion_endpoint(
         )
         sc = result.get("status_code")
         if sc is not None and sc >= 400:
+            _done(
+                "ml_rejected",
+                level="warning",
+                step="modify",
+                ml_status_code=sc,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             raise HTTPException(
                 status_code=sc if sc < 600 else 502,
                 detail={"step": "modify", "response": result.get("response")},
@@ -1887,6 +2176,13 @@ async def modify_promotion_endpoint(
         exit_result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=promo_type)
         exit_sc = exit_result.get("status_code")
         if exit_sc is not None and exit_sc >= 400 and exit_sc != 404:
+            _done(
+                "ml_rejected",
+                level="warning",
+                step="exit",
+                ml_status_code=exit_sc,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             raise HTTPException(
                 status_code=exit_sc if exit_sc < 600 else 502,
                 detail={"step": "exit", "response": exit_result.get("response")},
@@ -1906,6 +2202,14 @@ async def modify_promotion_endpoint(
             )
         enter_sc = enter_result.get("status_code")
         if enter_sc is not None and enter_sc >= 400:
+            _done(
+                "ml_rejected",
+                level="warning",
+                step="reenter",
+                exit_ok=True,
+                ml_status_code=enter_sc,
+                elapsed_ms=round((time.monotonic() - started) * 1000),
+            )
             raise HTTPException(
                 status_code=enter_sc if enter_sc < 600 else 502,
                 detail={
@@ -1918,8 +2222,6 @@ async def modify_promotion_endpoint(
         reason = "alterar promoção inscrita: re-inscrição automática (subiu acima do teto)"
         ml_response = {"exit": exit_result, "enter": enter_result}
 
-    cap = await session.get(MLPromoCapORM, body.mlb_id)
-    sku = cap.sku if cap else body.mlb_id
     ctx = await _build_decision_context(
         session,
         mlb_id=body.mlb_id,
@@ -1941,6 +2243,7 @@ async def modify_promotion_endpoint(
         context=ctx,
     )
     await session.commit()
+    _done("modified", resubscribed=is_raise, elapsed_ms=round((time.monotonic() - started) * 1000))
     return {"resubscribed": is_raise, **ml_response}
 
 

@@ -17,6 +17,7 @@ production. The action log records dry_run=True to make this explicit.
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -440,6 +441,123 @@ class MLPromotionService:
         self._http = http_client
 
     # -- ML promotions (write) --------------------------------------------
+    async def _ml_write(
+        self,
+        method: str,
+        mlb_id: str,
+        *,
+        op: str,
+        body: dict[str, Any] | None = None,
+        extra_params: dict[str, str] | None = None,
+        timeout: float = 30.0,
+    ) -> dict[str, Any]:
+        """Single funnel for EVERY seller-promotions write (POST/DELETE).
+
+        Logs the exact request (``op``, method, url, params, body — never the
+        bearer token) and the full response (status, parsed body, elapsed_ms,
+        and the parsed ML error envelope ``{message,error,status,cause}``) so a
+        failed ML call can be reconstructed end-to-end from Seq without a
+        screenshot. Handles the 401→refresh→retry dance. Never raises for
+        operational errors — returns a uniform dict::
+
+            {ok, status_code, response, raw, sent_body, elapsed_ms, error}
+
+        where ``response`` is the parsed JSON when available (raw text
+        otherwise) and ``error`` is one of None/"http"/"transport".
+        """
+        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
+        params: dict[str, str] = {"app_version": "v2", **(extra_params or {})}
+        log = logger.bind(
+            op=op,
+            mlb_id=mlb_id,
+            ml_method=method.upper(),
+            ml_url=url,
+            ml_params=params,
+            ml_body=body,
+        )
+        # The request line carries the EXACT payload we hand to ML — this is
+        # the single most useful thing when ML rejects a write.
+        log.info("ml_write.request")
+
+        async def _send(tok: str) -> httpx.Response:
+            headers = {"Authorization": f"Bearer {tok}"}
+            if method.upper() == "DELETE":
+                return await self._http.delete(url, params=params, headers=headers, timeout=timeout)
+            return await self._http.post(
+                url, params=params, json=body, headers=headers, timeout=timeout
+            )
+
+        token = await self._token_service.get_valid_access_token()
+        started = time.monotonic()
+        retried_auth = False
+        try:
+            resp = await _send(token)
+            if resp.status_code == 401:
+                log.info("ml_write.unauthorized_refresh")
+                token = await self._token_service.handle_unauthorized()
+                resp = await _send(token)
+                retried_auth = True
+        except httpx.RequestError as exc:
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            log.warning(
+                "ml_write.transport_error",
+                error=str(exc),
+                error_type=type(exc).__name__,
+                elapsed_ms=elapsed_ms,
+                retried_auth=retried_auth,
+            )
+            return {
+                "ok": False,
+                "status_code": None,
+                "response": f"transport error: {exc!s}",
+                "raw": str(exc),
+                "sent_body": body,
+                "elapsed_ms": elapsed_ms,
+                "error": "transport",
+            }
+
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        raw = resp.text or ""
+        parsed: Any = None
+        if resp.content:
+            try:
+                parsed = resp.json()
+            except ValueError:
+                parsed = None
+        ok = 200 <= resp.status_code < 300
+
+        fields: dict[str, Any] = {
+            "status_code": resp.status_code,
+            "elapsed_ms": elapsed_ms,
+            "retried_auth": retried_auth,
+            # Full parsed body when JSON; bounded raw text otherwise. Seq keeps
+            # the whole object, so we can read ML's exact answer.
+            "ml_response": parsed if parsed is not None else raw[:8000],
+        }
+        if not ok and isinstance(parsed, dict):
+            # ML error envelope — surface each field as its own property so it's
+            # filterable in Seq (ml_error_code:"item_already_in_promotion", etc.)
+            fields["ml_error_message"] = parsed.get("message")
+            fields["ml_error_code"] = parsed.get("error")
+            fields["ml_error_status"] = parsed.get("status")
+            if parsed.get("cause"):
+                fields["ml_error_cause"] = parsed.get("cause")
+
+        if ok:
+            log.info("ml_write.ok", **fields)
+        else:
+            log.warning("ml_write.failed", **fields)
+
+        return {
+            "ok": ok,
+            "status_code": resp.status_code,
+            "response": parsed if parsed is not None else raw,
+            "raw": raw,
+            "sent_body": body,
+            "elapsed_ms": elapsed_ms,
+            "error": None if ok else "http",
+        }
+
     async def apply_decision_to_ml(
         self,
         *,
@@ -528,61 +646,14 @@ class MLPromotionService:
                 ),
             }
 
-        token = await self._token_service.get_valid_access_token()
-        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
-        params = {"app_version": "v2"}
-        try:
-            resp = await self._http.post(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {token}"},
-                json=body,
-                timeout=20.0,
-            )
-            if resp.status_code == 401:
-                token = await self._token_service.handle_unauthorized()
-                resp = await self._http.post(
-                    url,
-                    params=params,
-                    headers={"Authorization": f"Bearer {token}"},
-                    json=body,
-                    timeout=20.0,
-                )
-        except httpx.RequestError as exc:
-            logger.warning(
-                "promo_apply transport error",
-                decision_id=decision.id,
-                mlb_id=mlb_id,
-                error=str(exc),
-            )
-            return {
-                "status": "failed",
-                "status_code": None,
-                "response": f"transport error: {exc!s}"[:2000],
-            }
-
-        # Bound the persisted body so a chatty ML can't blow up the row.
-        snippet = (resp.text or "")[:2000]
-        if 200 <= resp.status_code < 300:
-            logger.info(
-                "promo_apply ok",
-                decision_id=decision.id,
-                mlb_id=mlb_id,
-                status_code=resp.status_code,
-            )
-            return {"status": "ok", "status_code": resp.status_code, "response": snippet}
-
-        logger.warning(
-            "promo_apply non-2xx",
-            decision_id=decision.id,
-            mlb_id=mlb_id,
-            promo_type=promo_type,
-            status_code=resp.status_code,
-            body=snippet[:300],
-        )
+        # All transport + 401-retry + rich request/response logging lives in
+        # _ml_write. We persist a bounded TEXT snippet on the row
+        # (ml_apply_response) so keep that contract here.
+        result = await self._ml_write("POST", mlb_id, op="apply", body=body, timeout=20.0)
+        snippet = (result["raw"] or "")[:2000]
         return {
-            "status": "failed",
-            "status_code": resp.status_code,
+            "status": "ok" if result["ok"] else "failed",
+            "status_code": result["status_code"],
             "response": snippet,
         }
 
@@ -744,29 +815,12 @@ class MLPromotionService:
         if offer_ref:
             body["offer_id"] = offer_ref
 
-        token = await self._token_service.get_valid_access_token()
-        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
-        try:
-            resp = await self._http.post(
-                url,
-                params={"app_version": "v2"},
-                json=body,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0,
-            )
-            if resp.status_code == 401:
-                token = await self._token_service.handle_unauthorized()
-                resp = await self._http.post(
-                    url,
-                    params={"app_version": "v2"},
-                    json=body,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=30.0,
-                )
-            content = resp.json() if resp.content else {}
-            return {"status_code": resp.status_code, "response": content, "sent_body": body}
-        except Exception as exc:
-            return {"status_code": None, "response": str(exc), "sent_body": body}
+        result = await self._ml_write("POST", mlb_id, op="enroll_offer", body=body, timeout=30.0)
+        return {
+            "status_code": result["status_code"],
+            "response": result["response"],
+            "sent_body": body,
+        }
 
     async def exit_offer(
         self, *, mlb_id: str, promotion_type: str, promotion_id: str | None = None
@@ -811,61 +865,25 @@ class MLPromotionService:
         Nota (doc ML): ofertas LIGHTNING já *iniciadas* (started) NÃO podem ser
         removidas, apenas pausadas — o ML devolverá erro nesse caso.
         """
-        token = await self._token_service.get_valid_access_token()
-        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
-        params = {"app_version": "v2"}
+        extra: dict[str, str] = {}
         if promotion_type:
-            params["promotion_type"] = promotion_type
+            extra["promotion_type"] = promotion_type
         if promotion_id:
-            params["promotion_id"] = promotion_id
+            extra["promotion_id"] = promotion_id
         if offer_id:
-            params["offer_id"] = offer_id
-        try:
-            resp = await self._http.delete(
-                url,
-                params=params,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0,
-            )
-            if resp.status_code == 401:
-                token = await self._token_service.handle_unauthorized()
-                resp = await self._http.delete(
-                    url,
-                    params=params,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=30.0,
-                )
-            content = resp.json() if resp.content else {}
-            return {"status_code": resp.status_code, "response": content}
-        except Exception as exc:
-            return {"status_code": None, "response": str(exc)}
+            extra["offer_id"] = offer_id
+        result = await self._ml_write(
+            "DELETE", mlb_id, op="exit_promotion", extra_params=extra, timeout=30.0
+        )
+        return {"status_code": result["status_code"], "response": result["response"]}
 
     async def create_price_discount(self, *, mlb_id: str, deal_price: float) -> dict[str, Any]:
         """Cria uma promoção PRICE_DISCOUNT direta para um MLB (sem campaign_id)."""
-        token = await self._token_service.get_valid_access_token()
-        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
         body = {"promotion_type": "PRICE_DISCOUNT", "deal_price": deal_price}
-        try:
-            resp = await self._http.post(
-                url,
-                params={"app_version": "v2"},
-                json=body,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0,
-            )
-            if resp.status_code == 401:
-                token = await self._token_service.handle_unauthorized()
-                resp = await self._http.post(
-                    url,
-                    params={"app_version": "v2"},
-                    json=body,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=30.0,
-                )
-            content = resp.json() if resp.content else {}
-            return {"status_code": resp.status_code, "response": content}
-        except Exception as exc:
-            return {"status_code": None, "response": str(exc)}
+        result = await self._ml_write(
+            "POST", mlb_id, op="create_price_discount", body=body, timeout=30.0
+        )
+        return {"status_code": result["status_code"], "response": result["response"]}
 
     async def modify_promotion(
         self,
@@ -883,35 +901,16 @@ class MLPromotionService:
         no lugar, preservando a vaga na campanha. Espelha o "Alterar" nativo do
         ML, que só permite BAIXAR o preço; subir exige sair e reentrar (a regra
         de só-baixar é validada no front antes de chamar este método)."""
-        token = await self._token_service.get_valid_access_token()
-        url = f"{ML_API_BASE}/seller-promotions/items/{mlb_id}"
         body: dict[str, Any] = {
             "promotion_type": promotion_type,
             "deal_price": deal_price,
         }
         if promotion_id is not None:
             body["promotion_id"] = promotion_id
-        try:
-            resp = await self._http.post(
-                url,
-                params={"app_version": "v2"},
-                json=body,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=30.0,
-            )
-            if resp.status_code == 401:
-                token = await self._token_service.handle_unauthorized()
-                resp = await self._http.post(
-                    url,
-                    params={"app_version": "v2"},
-                    json=body,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=30.0,
-                )
-            content = resp.json() if resp.content else {}
-            return {"status_code": resp.status_code, "response": content}
-        except Exception as exc:
-            return {"status_code": None, "response": str(exc)}
+        result = await self._ml_write(
+            "POST", mlb_id, op="modify_promotion", body=body, timeout=30.0
+        )
+        return {"status_code": result["status_code"], "response": result["response"]}
 
     # -- ML promotions ----------------------------------------------------
     async def fetch_eligible_promos(self, mlb_id: str) -> list[dict[str, Any]]:
