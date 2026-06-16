@@ -1796,7 +1796,7 @@ async def create_price_discount_direct(
     operador decide, e o front exige dupla confirmação quando a margem fica
     negativa. O CAP só será exigido na aprovação automática.
     """
-    from tiny_mirror.infrastructure.orm.models import MLPromoCapORM
+    from tiny_mirror.infrastructure.orm.models import MLListingORM, MLPromoCapORM
 
     started = time.monotonic()
     cap = await session.get(MLPromoCapORM, body.mlb_id)
@@ -1813,6 +1813,24 @@ async def create_price_discount_direct(
         deal_price=_fnum(body.deal_price),
         floor_price=_fnum(cap.margin_floor_price if cap else None),
     )
+    # Anúncio pausado/encerrado não pode receber promoção: ela não é exibida a
+    # ninguém e o generate (que alimenta "Inscritas") nem varre anúncio inativo,
+    # então a promo ficaria órfã. Bloqueia aqui — é a fonte de verdade.
+    listing = await session.get(MLListingORM, body.mlb_id)
+    if listing is None or listing.status != "active":
+        _done(
+            "refused_inactive_listing",
+            level="warning",
+            listing_status=listing.status if listing else None,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "O anúncio não está ativo no Mercado Livre "
+                f"({listing.status if listing else 'não encontrado'}). "
+                "Promoção só pode ser criada em anúncio ativo — reative o anúncio primeiro."
+            ),
+        )
     result = await service.create_price_discount(
         mlb_id=body.mlb_id,
         deal_price=float(body.deal_price),
