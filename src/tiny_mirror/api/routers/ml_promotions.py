@@ -2063,6 +2063,51 @@ async def exit_promotion_endpoint(
             status_code=sc if sc < 600 else 502,
             detail={"step": "exit", "response": result.get("response")},
         )
+
+    # Verifica se a promoção REALMENTE saiu. O ML às vezes devolve 200 num DELETE
+    # que NÃO remove nada — visto em PRICE_DISCOUNT de anúncio de CATÁLOGO pausado
+    # (DELETE → 200, mas a oferta continua 'started'; e na 2ª tentativa devolve
+    # 400 "No offers found"). Sem essa checagem o app reportava sucesso FALSO e a
+    # linha sumia de "Inscritas" enquanto a promo seguia ativa no ML.
+    pt = (body.promo_type or "PRICE_DISCOUNT").upper()
+    still_active = False
+    try:
+        for p in await service.fetch_eligible_promos(body.mlb_id):
+            if (p.get("type") or "").upper() != pt:
+                continue
+            if (p.get("status") or "").lower() != "started":
+                continue
+            if body.promo_id and p.get("id") not in (body.promo_id, None):
+                continue
+            still_active = True
+            break
+    except Exception as exc:  # pragma: no cover — verificação é best-effort
+        logger.warning("promo.exit_verify_failed", error=str(exc))
+
+    if still_active:
+        logger.warning(
+            "promo.exit_not_effective",
+            note=(
+                "ML aceitou o DELETE mas a promoção continua 'started' — típico de "
+                "PRICE_DISCOUNT em anúncio de catálogo pausado."
+            ),
+            ml_status_code=sc,
+        )
+        _done(
+            "exit_not_effective",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "O Mercado Livre aceitou a remoção mas a promoção continua ATIVA "
+                "(costuma ocorrer em anúncio de catálogo pausado). Reative o anúncio "
+                "para conseguir removê-la, ou aguarde o término da promoção."
+            ),
+        )
+
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
         sku=sku,
