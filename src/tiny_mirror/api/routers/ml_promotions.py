@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
 
@@ -25,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.api.dependencies import db_session
+from tiny_mirror.config import settings
 from tiny_mirror.infrastructure.repositories.ml_listing_repository import (
     MLListingRepository,
 )
@@ -34,6 +35,7 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
     MLPromoAlertRepository,
     MLPromoCapRepository,
     MLPromoDecisionRepository,
+    MLPromoResubscribeRepository,
 )
 from tiny_mirror.services import feature_flags
 from tiny_mirror.services.ml_promotion_service import (
@@ -2260,6 +2262,68 @@ async def modify_promotion_endpoint(
                 ml_status_code=enter_sc,
                 new_price=_fnum(body.new_price),
             )
+            # Campanha (DEAL/SELLER_CAMPAIGN) subindo: o atraso de re-sugestão do
+            # ML é esperado. Em vez de deixar o anúncio a preço cheio, enfileira
+            # a re-inscrição — o poller reentra assim que a oferta reaparecer.
+            can_queue = (
+                is_raise and body.promo_id is not None and promo_type_u in (EDITABLE_INPLACE_TYPES)
+            )
+            if can_queue:
+                now = datetime.now(UTC)
+                deadline = now + timedelta(hours=settings.ml_promo_resubscribe_deadline_hours)
+                interval = max(1, settings.ml_promo_resubscribe_poll_interval_seconds)
+                max_attempts = max(
+                    1,
+                    int(settings.ml_promo_resubscribe_deadline_hours * 3600 / interval) + 5,
+                )
+                op_id = structlog.contextvars.get_contextvars().get("op_id")
+                job = await MLPromoResubscribeRepository(session).enqueue(
+                    mlb_id=body.mlb_id,
+                    sku=sku,
+                    promo_type=promo_type_u,
+                    target_price=body.new_price,
+                    deadline=deadline,
+                    promo_id=body.promo_id,
+                    max_attempts=max_attempts,
+                    op_id=op_id,
+                    decided_by=body.decided_by,
+                    last_error=str(enter_result.get("response"))[:500],
+                    last_status_code=enter_sc,
+                )
+                await MLPromoActionRepository(session).log(
+                    sku=sku,
+                    mlb_id=body.mlb_id,
+                    action="resubscribe_scheduled",
+                    promo_type=promo_type_u,
+                    promo_id=body.promo_id,
+                    price_after=body.new_price,
+                    reason=(
+                        "subir o preço exige sair + reentrar; o ML ainda não re-sugeriu "
+                        "a oferta — re-inscrição agendada na fila"
+                    ),
+                    ml_response={"exit": exit_result, "enter": enter_result},
+                    decided_by=body.decided_by,
+                )
+                await session.commit()
+                _done(
+                    "resubscribe_scheduled",
+                    step="reenter",
+                    exit_ok=True,
+                    ml_status_code=enter_sc,
+                    resubscribe_job_id=job.id,
+                    elapsed_ms=round((time.monotonic() - started) * 1000),
+                )
+                return {
+                    "exit": exit_result,
+                    "enter": enter_result,
+                    "resubscribe_scheduled": True,
+                    "resubscribe_job_id": job.id,
+                    "message": (
+                        "Saiu da promoção, mas o Mercado Livre ainda não re-sugeriu a "
+                        "oferta com o novo preço. A re-inscrição foi agendada e vai "
+                        "entrar automaticamente assim que a promoção reaparecer."
+                    ),
+                }
             _done(
                 "ml_rejected",
                 level="warning",
@@ -2308,6 +2372,60 @@ async def modify_promotion_endpoint(
         "modified", resubscribed=resubscribed, elapsed_ms=round((time.monotonic() - started) * 1000)
     )
     return {"resubscribed": resubscribed, **ml_response}
+
+
+def _serialize_resub_job(job: Any) -> dict[str, Any]:
+    return {
+        "id": job.id,
+        "mlb_id": job.mlb_id,
+        "sku": job.sku,
+        "promo_type": job.promo_type,
+        "promo_id": job.promo_id,
+        "target_price": _fnum(job.target_price),
+        "status": job.status,
+        "attempts": job.attempts,
+        "max_attempts": job.max_attempts,
+        "next_attempt_at": job.next_attempt_at.isoformat() if job.next_attempt_at else None,
+        "deadline": job.deadline.isoformat() if job.deadline else None,
+        "last_error": job.last_error,
+        "last_status_code": job.last_status_code,
+        "created_at": job.created_at.isoformat() if job.created_at else None,
+        "resolved_at": job.resolved_at.isoformat() if job.resolved_at else None,
+    }
+
+
+@router.get("/resubscribe-jobs")
+async def list_resubscribe_jobs(
+    status_filter: str | None = Query(
+        None, alias="status", description="pending|done|failed|cancelled"
+    ),
+    mlb_id: str | None = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    session: AsyncSession = Depends(db_session),
+) -> list[dict[str, Any]]:
+    """Fila de re-inscrição automática (raise = sair + reentrar). A UI usa pra
+    mostrar quais anúncios estão aguardando o ML re-sugerir a oferta."""
+    jobs = await MLPromoResubscribeRepository(session).list_(
+        status=status_filter, mlb_id=mlb_id, limit=limit
+    )
+    return [_serialize_resub_job(j) for j in jobs]
+
+
+@router.post("/resubscribe-jobs/{job_id}/cancel")
+async def cancel_resubscribe_job(
+    job_id: int,
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
+    """Cancela um job de re-inscrição pendente (o operador desistiu de subir o
+    preço). Não mexe no ML — o anúncio fica como está (preço cheio)."""
+    repo = MLPromoResubscribeRepository(session)
+    job = await repo.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job de re-inscrição não encontrado.")
+    if job.status == "pending":
+        await repo.cancel(job)
+        await session.commit()
+    return _serialize_resub_job(job)
 
 
 @router.get("/catalog-competitors")

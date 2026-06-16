@@ -166,6 +166,17 @@ class Settings(BaseSettings):
     # handler and never trusts the client.
     ml_promo_apply_enabled: bool = False
 
+    # Re-subscribe queue poller. Raising a promo price = exit + re-enroll, but
+    # the ML can lag re-suggesting the offer as a candidate. The modify endpoint
+    # enqueues an ml_promo_resubscribe_jobs row; this cron drives the queue,
+    # re-enrolling at the target price as soon as the offer reappears.
+    #   - cron: how often the poller wakes (default every 5 min);
+    #   - poll_interval_seconds: min gap between re-checks of the SAME job;
+    #   - deadline_hours: give up + alert after this long without success.
+    sync_ml_promo_resubscribe_cron: str = "*/5 * * * *"
+    ml_promo_resubscribe_poll_interval_seconds: int = 300
+    ml_promo_resubscribe_deadline_hours: int = 24
+
     # Auto-expire thresholds for the pending promo decisions queue.
     # The daily expire_stale_decisions job (piggybacking on the recompute
     # cron) flips pending rows to status='expired' when ANY of these

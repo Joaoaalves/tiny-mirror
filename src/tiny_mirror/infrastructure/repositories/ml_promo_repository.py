@@ -23,6 +23,7 @@ from tiny_mirror.infrastructure.orm.models import (
     MLPromoAlertORM,
     MLPromoCapORM,
     MLPromoDecisionORM,
+    MLPromoResubscribeJobORM,
 )
 
 
@@ -646,3 +647,152 @@ class MLPromoDecisionRepository:
         row.expired_reason = None
         await self._session.flush()
         return row
+
+
+# ---------------------------------------------------------------------------
+# Re-subscribe queue (raise = exit + re-enroll, with ML re-suggest delay)
+# ---------------------------------------------------------------------------
+class MLPromoResubscribeRepository:
+    """CRUD for ``ml_promo_resubscribe_jobs`` — the queue that retries a
+    promotion re-enrollment until the ML re-suggests the offer as candidate."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def enqueue(
+        self,
+        *,
+        mlb_id: str,
+        sku: str,
+        promo_type: str,
+        target_price: Decimal,
+        deadline: datetime,
+        promo_id: str | None = None,
+        max_attempts: int = 288,
+        op_id: str | None = None,
+        decided_by: str | None = None,
+        last_error: str | None = None,
+        last_status_code: int | None = None,
+    ) -> MLPromoResubscribeJobORM:
+        """Create (or reset) the pending re-subscribe job for this
+        (mlb_id, promo_type). A partial unique index allows at most one
+        pending row per pair, so a new raise on the same listing updates the
+        existing pending job in place instead of stacking duplicates."""
+        existing = (
+            await self._session.execute(
+                select(MLPromoResubscribeJobORM).where(
+                    MLPromoResubscribeJobORM.mlb_id == mlb_id,
+                    MLPromoResubscribeJobORM.promo_type == promo_type,
+                    MLPromoResubscribeJobORM.status == "pending",
+                )
+            )
+        ).scalar_one_or_none()
+        now = datetime.now(UTC)
+        if existing is not None:
+            existing.sku = sku
+            existing.promo_id = promo_id
+            existing.target_price = target_price
+            existing.deadline = deadline
+            existing.max_attempts = max_attempts
+            existing.attempts = 0
+            existing.next_attempt_at = now
+            existing.op_id = op_id
+            existing.decided_by = decided_by
+            existing.last_error = last_error
+            existing.last_status_code = last_status_code
+            existing.resolved_at = None
+            await self._session.flush()
+            return existing
+        row = MLPromoResubscribeJobORM(
+            mlb_id=mlb_id,
+            sku=sku,
+            promo_type=promo_type,
+            promo_id=promo_id,
+            target_price=target_price,
+            deadline=deadline,
+            max_attempts=max_attempts,
+            next_attempt_at=now,
+            op_id=op_id,
+            decided_by=decided_by,
+            last_error=last_error,
+            last_status_code=last_status_code,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def due(
+        self, *, now: datetime | None = None, limit: int = 100
+    ) -> list[MLPromoResubscribeJobORM]:
+        """Pending jobs whose ``next_attempt_at`` has passed, oldest first."""
+        ref = now or datetime.now(UTC)
+        q = (
+            select(MLPromoResubscribeJobORM)
+            .where(
+                MLPromoResubscribeJobORM.status == "pending",
+                MLPromoResubscribeJobORM.next_attempt_at <= ref,
+            )
+            .order_by(MLPromoResubscribeJobORM.next_attempt_at.asc())
+            .limit(limit)
+        )
+        return list((await self._session.execute(q)).scalars().all())
+
+    async def list_(
+        self,
+        *,
+        status: str | None = None,
+        mlb_id: str | None = None,
+        limit: int = 200,
+    ) -> list[MLPromoResubscribeJobORM]:
+        q = select(MLPromoResubscribeJobORM)
+        if status is not None:
+            q = q.where(MLPromoResubscribeJobORM.status == status)
+        if mlb_id is not None:
+            q = q.where(MLPromoResubscribeJobORM.mlb_id == mlb_id)
+        q = q.order_by(MLPromoResubscribeJobORM.created_at.desc()).limit(limit)
+        return list((await self._session.execute(q)).scalars().all())
+
+    async def get(self, job_id: int) -> MLPromoResubscribeJobORM | None:
+        return await self._session.get(MLPromoResubscribeJobORM, job_id)
+
+    async def mark_done(self, job: MLPromoResubscribeJobORM) -> None:
+        job.status = "done"
+        job.resolved_at = datetime.now(UTC)
+        job.last_error = None
+        await self._session.flush()
+
+    async def mark_failed(
+        self, job: MLPromoResubscribeJobORM, *, error: str, status_code: int | None = None
+    ) -> None:
+        job.status = "failed"
+        job.resolved_at = datetime.now(UTC)
+        job.last_error = error
+        if status_code is not None:
+            job.last_status_code = status_code
+        await self._session.flush()
+
+    async def cancel(self, job: MLPromoResubscribeJobORM) -> None:
+        job.status = "cancelled"
+        job.resolved_at = datetime.now(UTC)
+        await self._session.flush()
+
+    async def bump_attempt(
+        self,
+        job: MLPromoResubscribeJobORM,
+        *,
+        next_attempt_at: datetime,
+        error: str | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        """Record one failed/idle poll: increment ``attempts`` and push out
+        ``next_attempt_at``. If the attempt budget is exhausted, flip to failed."""
+        job.attempts += 1
+        job.next_attempt_at = next_attempt_at
+        job.last_error = error
+        job.last_status_code = status_code
+        if job.attempts >= job.max_attempts:
+            job.status = "failed"
+            job.resolved_at = datetime.now(UTC)
+            if error is None:
+                job.last_error = "max_attempts atingido"
+        await self._session.flush()

@@ -124,6 +124,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "flex_calibration": CronTrigger.from_crontab(
                 settings.sync_flex_calibration_cron, timezone="UTC"
             ),
+            "ml_promo_resubscribe": CronTrigger.from_crontab(
+                settings.sync_ml_promo_resubscribe_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -198,6 +201,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _flex_calibration() -> None:
         await flex_calibration_job(http_client, app.state.ml_token_service)
+
+    async def _ml_promo_resubscribe() -> None:
+        await ml_promo_resubscribe_job(http_client, app.state.ml_token_service)
 
     scheduler.add_job(
         _token_rotation,
@@ -317,6 +323,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _flex_calibration,
         trigger=triggers["flex_calibration"],
         id="flex_calibration",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_promo_resubscribe,
+        trigger=triggers["ml_promo_resubscribe"],
+        id="ml_promo_resubscribe",
         replace_existing=True,
     )
 
@@ -920,6 +932,32 @@ async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:
     logger.info("flex calibration job completed", **stats)
 
 
+async def ml_promo_resubscribe_job(http_client: Any, ml_token_service: Any) -> None:
+    """Every few minutes: drive the re-subscribe queue. For each due
+    ml_promo_resubscribe_jobs row, check the listing's eligible promos and
+    re-enroll at the target price as soon as the offer reappears as a candidate
+    (raising a promo price = exit + re-enroll, and the ML lags re-suggesting).
+    No-op without ML credentials."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML promo resubscribe skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.services.ml_promotion_service import MLPromotionService
+    from tiny_mirror.services.ml_resubscribe_service import ResubscribeService
+
+    promo_service = MLPromotionService(token_service=ml_token_service, http_client=http_client)
+    service = ResubscribeService(
+        promotion_service=promo_service,
+        poll_interval_seconds=settings.ml_promo_resubscribe_poll_interval_seconds,
+    )
+    async with AsyncSessionLocal() as session:
+        stats = await service.process_due(session)
+    # Only log when there was anything in the queue — keeps the every-5-min
+    # cron from spamming the stream when idle.
+    if stats.get("due"):
+        logger.info("ML promo resubscribe job completed", **stats)
+
+
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:
     """Poll ML INBOUND_RECEPTION and mark pending fulfillment transfers as received."""
     from tiny_mirror.services.fulfillment_reception_service import FulfillmentReceptionService
@@ -953,6 +991,7 @@ __all__ = [
     "manual_status_sync_job",
     "ml_listings_sync_job",
     "ml_promo_recompute_job",
+    "ml_promo_resubscribe_job",
     "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",

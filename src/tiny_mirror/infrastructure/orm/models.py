@@ -1490,6 +1490,93 @@ class MLPromoDecisionORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_promo_resubscribe_jobs — fila de re-inscrição (raise = sair + reentrar)
+# ---------------------------------------------------------------------------
+class MLPromoResubscribeJobORM(Base):
+    __tablename__ = "ml_promo_resubscribe_jobs"
+    __table_args__ = (
+        # Fila de trabalho: o poller varre pending com next_attempt_at vencido.
+        Index("ix_ml_promo_resub_due", "status", "next_attempt_at"),
+        Index("ix_ml_promo_resub_mlb", "mlb_id"),
+        # No máximo UM job pendente por (mlb_id, promo_type) — um novo raise no
+        # mesmo anúncio reusa/reseta o pendente em vez de duplicar.
+        Index(
+            "uq_ml_promo_resub_pending",
+            "mlb_id",
+            "promo_type",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'done', 'failed', 'cancelled')",
+            name="ck_ml_promo_resub_status",
+        ),
+        {
+            "comment": (
+                "Fila de re-inscrição automática. Subir o preço de uma promoção "
+                "no ML exige SAIR (DELETE) e REENTRAR (POST), mas o ML pode levar "
+                "um tempo até re-sugerir a campanha como candidata. Quando a "
+                "reentrada imediata falha, enfileiramos aqui; o poller checa a "
+                "elegibilidade do anúncio e reentra assim que a oferta reaparece."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sku: Mapped[str] = mapped_column(String(100), nullable=False)
+    promo_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    promo_id: Mapped[str | None] = mapped_column(
+        String(80),
+        nullable=True,
+        comment="promotion_id da campanha a reentrar (resolvido ao vivo se mudar).",
+    )
+    target_price: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2),
+        nullable=False,
+        comment="Preço (deal_price) para reentrar quando a oferta reaparecer.",
+    )
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default=text("'pending'"),
+        comment="pending | done | failed | cancelled",
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("288"))
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    deadline: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Após esse instante, desiste e marca failed (alerta o operador).",
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    op_id: Mapped[str | None] = mapped_column(
+        String(40),
+        nullable=True,
+        comment="op_id da operação modify que originou o job — correlaciona logs no Seq.",
+    )
+    decided_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Quando virou done/failed/cancelled.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # fl_stock_corrections_log
 # ---------------------------------------------------------------------------
 class FLStockCorrectionLogORM(Base):
