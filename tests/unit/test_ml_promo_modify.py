@@ -64,6 +64,24 @@ async def test_edit_in_place_uses_put_not_post() -> None:
     assert kwargs["params"] == {"app_version": "v2"}
 
 
+def test_editable_type_sets_match_ml_business_rules() -> None:
+    # Regra de negócio do ML (conforme docs): só DEAL/SELLER_CAMPAIGN têm edição
+    # in-place (PUT "Modificar item"); PRICE_DISCOUNT é editável só via
+    # remover+recriar; co-participação (ML-priced), cupom (fixo) e DOD/LIGHTNING
+    # NÃO permitem alterar o preço.
+    from tiny_mirror.services.ml_promotion_service import (
+        CO_PARTICIPATION_TYPES,
+        EDITABLE_INPLACE_TYPES,
+        PRICE_EDITABLE_TYPES,
+    )
+
+    assert EDITABLE_INPLACE_TYPES == {"DEAL", "SELLER_CAMPAIGN"}
+    assert "PRICE_DISCOUNT" in PRICE_EDITABLE_TYPES
+    assert "PRICE_DISCOUNT" not in EDITABLE_INPLACE_TYPES
+    for t in CO_PARTICIPATION_TYPES | {"SELLER_COUPON_CAMPAIGN", "DOD", "LIGHTNING"}:
+        assert t not in PRICE_EDITABLE_TYPES
+
+
 @pytest.mark.asyncio
 async def test_create_price_discount_sends_required_local_dates() -> None:
     # Doc ML "Desconto individual": o POST EXIGE start_date + finish_date em

@@ -70,6 +70,15 @@ FIXED_PRICE_TYPES = frozenset(
 # instead of the seller-driven create/modify/exit path.
 CO_PARTICIPATION_TYPES = frozenset({"SMART", "PRICE_MATCHING", "MARKETPLACE_CAMPAIGN"})
 
+# Editabilidade do PREÇO por tipo (regra de negócio do ML, conforme docs):
+#  - IN-PLACE (têm "Modificar item" = PUT): DEAL, SELLER_CAMPAIGN.
+#  - via REMOVER+RECRIAR (sem PUT, mas o vendedor define o preço): PRICE_DISCOUNT.
+#  - NÃO editável: co-participação (preço definido pelo ML), cupom (desconto
+#    FIXO da campanha) e DOD/LIGHTNING (sem operação de edição) → só dá pra
+#    inscrever/sair.
+EDITABLE_INPLACE_TYPES = frozenset({"DEAL", "SELLER_CAMPAIGN"})
+PRICE_EDITABLE_TYPES = EDITABLE_INPLACE_TYPES | {"PRICE_DISCOUNT"}
+
 
 # ===========================================================================
 # Decision algorithm — pure

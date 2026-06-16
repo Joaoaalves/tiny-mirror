@@ -38,6 +38,8 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
 from tiny_mirror.services import feature_flags
 from tiny_mirror.services.ml_promotion_service import (
     CO_PARTICIPATION_TYPES,
+    EDITABLE_INPLACE_TYPES,
+    PRICE_EDITABLE_TYPES,
     MLPromotionService,
 )
 
@@ -2154,9 +2156,30 @@ async def modify_promotion_endpoint(
         is_raise=is_raise,
     )
 
-    if not is_raise:
-        # Baixar/igual: edita IN-PLACE (PUT), sem sair da oferta. Doc ML: a
-        # edição de item numa promoção é PUT (≠ do POST que é inscrição).
+    # Guard: só DEAL/SELLER_CAMPAIGN/PRICE_DISCOUNT permitem alterar o preço. O
+    # resto (co-participação SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN — preço do
+    # ML; cupom — desconto fixo; DOD/LIGHTNING — sem edição) só dá pra sair.
+    promo_type_u = (promo_type or "").upper()
+    if promo_type_u not in PRICE_EDITABLE_TYPES:
+        _done("refused_not_editable", level="warning")
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "step": "validate",
+                "response": (
+                    f"{promo_type_u} não permite alterar o preço (regra do ML) — "
+                    "use 'sair da promoção' para desativar."
+                ),
+            },
+        )
+
+    # PRICE_DISCOUNT não tem edição in-place (PUT); só DEAL/SELLER_CAMPAIGN têm.
+    # Então: DEAL/SELLER_CAMPAIGN baixando → PUT; PRICE_DISCOUNT (qualquer
+    # direção) e DEAL/SELLER_CAMPAIGN subindo → sair + reentrar.
+    inplace_edit = promo_type_u in EDITABLE_INPLACE_TYPES and not is_raise
+
+    if inplace_edit:
+        # DEAL/SELLER_CAMPAIGN baixando/igual: edita IN-PLACE (PUT), sem sair.
         result = await service.edit_promotion_price(
             mlb_id=body.mlb_id,
             deal_price=float(body.new_price),
@@ -2180,7 +2203,9 @@ async def modify_promotion_endpoint(
         reason = "alterar promoção inscrita: baixou o preço in-place"
         ml_response: dict[str, Any] = result
     else:
-        # Subir acima do teto: re-inscrição automática (sai e reentra).
+        # Sair + reentrar. Vale para: DEAL/SELLER_CAMPAIGN SUBINDO (o ML não
+        # deixa subir in-place) e PRICE_DISCOUNT em QUALQUER direção (não tem
+        # PUT — a única forma de alterar é remover e recriar).
         exit_result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=promo_type)
         exit_sc = exit_result.get("status_code")
         if exit_sc is not None and exit_sc >= 400 and exit_sc != 404:
@@ -2245,7 +2270,9 @@ async def modify_promotion_endpoint(
                 },
             )
         action = "resubscribe_promotion"
-        reason = "alterar promoção inscrita: re-inscrição automática (subiu acima do teto)"
+        reason = "alterar promoção inscrita: re-inscrição automática (sair + reentrar) — " + (
+            "subiu acima do teto" if is_raise else "PRICE_DISCOUNT não tem edição in-place"
+        )
         ml_response = {"exit": exit_result, "enter": enter_result}
 
     ctx = await _build_decision_context(
@@ -2269,8 +2296,11 @@ async def modify_promotion_endpoint(
         context=ctx,
     )
     await session.commit()
-    _done("modified", resubscribed=is_raise, elapsed_ms=round((time.monotonic() - started) * 1000))
-    return {"resubscribed": is_raise, **ml_response}
+    resubscribed = not inplace_edit
+    _done(
+        "modified", resubscribed=resubscribed, elapsed_ms=round((time.monotonic() - started) * 1000)
+    )
+    return {"resubscribed": resubscribed, **ml_response}
 
 
 @router.get("/catalog-competitors")
