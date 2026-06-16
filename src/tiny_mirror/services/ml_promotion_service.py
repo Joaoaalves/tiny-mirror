@@ -1411,10 +1411,18 @@ class MLPromotionService:
         *,
         only_sku: str | None = None,
         limit_skus: int | None = None,
+        refresh_active_prices: bool = False,
     ) -> dict[str, Any]:
         """Walk every (sku, MLB) and write a pending decision per
         candidate promo that fits the cap+floor. Idempotent: existing
         rows in any status are skipped by the unique constraint.
+
+        ``refresh_active_prices``: when True, also force-update the cached price
+        of EXISTING 'started' (active) rows to match ML's live value. The normal
+        idempotent path skips them, so a promo whose price changed on ML (or via
+        the app) since the last generate would otherwise stay stale until the
+        next day. Only touches visibility-only started rows — never an operator's
+        pending/approved decision.
 
         Returns aggregate counts so the cron / API can log them.
         """
@@ -1444,6 +1452,7 @@ class MLPromotionService:
             "decisions_denied_inserted": 0,
             "decisions_active_inserted": 0,
             "started_expired": 0,
+            "active_prices_refreshed": 0,
         }
 
         for sku in skus:
@@ -1552,6 +1561,18 @@ class MLPromotionService:
                             stats["decisions_active_inserted"] += 1
                     else:
                         stats["decisions_skipped_existing"] += 1
+                        # Linha já existia: a inserção idempotente NÃO atualiza o
+                        # preço. Quando pedido, força o preço da linha 'started'
+                        # a bater com o valor vivo do ML (corrige promos cujo
+                        # preço mudou desde o último generate).
+                        if refresh_active_prices and entry.get("constraint") == "started":
+                            tp = _to_dec(entry.get("target_price"))
+                            if tp is not None:
+                                stats[
+                                    "active_prices_refreshed"
+                                ] += await decisions.update_started_price(
+                                    mlb_id=mlb_id, new_price=tp, promo_id=key_now
+                                )
 
                 # MLB consultado com sucesso: expira as STARTED antigas que o ML
                 # não retorna mais (campanha encerrada). Só roda pra MLBs que

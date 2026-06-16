@@ -1259,14 +1259,27 @@ async def get_config() -> dict[str, Any]:
 async def generate_decisions(
     only_sku: str | None = Query(default=None, description="restrict to a single SKU"),
     limit_skus: int | None = Query(default=None, ge=1, le=2000),
+    refresh_active_prices: bool = Query(
+        default=False,
+        description=(
+            "também atualiza o preço das linhas 'started' já existentes com o "
+            "valor vivo do ML (resync completo, corrige preços defasados)"
+        ),
+    ),
     session: AsyncSession = Depends(db_session),
     service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, Any]:
     """Enumerate eligible candidate promos per MLB and insert one PENDING
     decision per (mlb_id, promo_key). Idempotent — re-running this skips
-    decisions already in the queue (pending / approved / rejected)."""
+    decisions already in the queue (pending / approved / rejected).
+
+    Pass ``refresh_active_prices=true`` for a full resync that also refreshes the
+    cached price of existing active promos to match ML live."""
     return await service.generate_pending_decisions(
-        session, only_sku=only_sku, limit_skus=limit_skus
+        session,
+        only_sku=only_sku,
+        limit_skus=limit_skus,
+        refresh_active_prices=refresh_active_prices,
     )
 
 
