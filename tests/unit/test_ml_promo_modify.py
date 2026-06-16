@@ -169,3 +169,19 @@ async def test_exit_without_type_omits_param() -> None:
     _, kwargs = http.delete.call_args
     assert kwargs["params"] == {"app_version": "v2"}
     assert "promotion_type" not in kwargs["params"]
+
+
+@pytest.mark.asyncio
+async def test_exit_includes_promotion_id_when_present() -> None:
+    # Doc ML: o DELETE de DEAL/SELLER_CAMPAIGN exige promotion_id, senão o ML
+    # responde 400 "Promotion id is required". Os endpoints exit/modify passam
+    # body.promo_id; aqui garantimos que ele vai no params do DELETE.
+    http = _http({})
+    svc = _service(http)
+    await svc.exit_promotion(mlb_id="MLB1", promotion_type="SELLER_CAMPAIGN", promotion_id="P-9")
+    _, kwargs = http.delete.call_args
+    assert kwargs["params"] == {
+        "app_version": "v2",
+        "promotion_type": "SELLER_CAMPAIGN",
+        "promotion_id": "P-9",
+    }

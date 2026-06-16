@@ -1990,7 +1990,12 @@ async def exit_promotion_endpoint(
             mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
         )
     else:
-        result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=body.promo_type)
+        # Doc ML: o DELETE de DEAL/SELLER_CAMPAIGN exige promotion_id (senão
+        # 400 "Promotion id is required"). exit_promotion só inclui o param
+        # quando truthy, então é seguro passar sempre o promo_id da oferta.
+        result = await service.exit_promotion(
+            mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
+        )
     sc = result.get("status_code")
     if sc is not None and sc >= 400 and sc != 404:
         _done(
@@ -2206,7 +2211,9 @@ async def modify_promotion_endpoint(
         # Sair + reentrar. Vale para: DEAL/SELLER_CAMPAIGN SUBINDO (o ML não
         # deixa subir in-place) e PRICE_DISCOUNT em QUALQUER direção (não tem
         # PUT — a única forma de alterar é remover e recriar).
-        exit_result = await service.exit_promotion(mlb_id=body.mlb_id, promotion_type=promo_type)
+        exit_result = await service.exit_promotion(
+            mlb_id=body.mlb_id, promotion_type=promo_type, promotion_id=body.promo_id
+        )
         exit_sc = exit_result.get("status_code")
         if exit_sc is not None and exit_sc >= 400 and exit_sc != 404:
             _done(
