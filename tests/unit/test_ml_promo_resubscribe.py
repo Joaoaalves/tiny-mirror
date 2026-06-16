@@ -112,6 +112,10 @@ def _fake_session() -> Any:
     s.add = MagicMock()
     s.flush = AsyncMock()
     s.commit = AsyncMock()
+    # restore_started_price runs a SELECT; return an empty result set.
+    result = MagicMock()
+    result.scalars = MagicMock(return_value=[])
+    s.execute = AsyncMock(return_value=result)
     return s
 
 

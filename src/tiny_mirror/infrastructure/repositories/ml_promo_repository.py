@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, literal_column, select, update
+from sqlalchemy import func, literal_column, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -624,6 +624,129 @@ class MLPromoDecisionRepository:
         await self._session.flush()
         return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
+    async def update_started_price(
+        self,
+        *,
+        mlb_id: str,
+        new_price: Decimal,
+        promo_id: str | None = None,
+        promo_type: str | None = None,
+    ) -> int:
+        """After a live price change on an active (started) promo, update the
+        cached 'started' decision row(s) so the UI reflects the new price BEFORE
+        the daily re-sync (ML writes don't touch our mirror). Matches by
+        mlb_id + (promo_id or promo_type) among active started rows and
+        recomputes the discount % vs list_price. Returns rows updated.
+        """
+        conds = [
+            MLPromoDecisionORM.mlb_id == mlb_id,
+            MLPromoDecisionORM.constraint_used == "started",
+            MLPromoDecisionORM.status.notin_(["expired", "rejected"]),
+        ]
+        if promo_id:
+            conds.append(
+                or_(
+                    MLPromoDecisionORM.promo_id == promo_id,
+                    MLPromoDecisionORM.promo_key == promo_id,
+                )
+            )
+        elif promo_type:
+            conds.append(MLPromoDecisionORM.promo_type == promo_type)
+        rows = list(
+            (await self._session.execute(select(MLPromoDecisionORM).where(*conds))).scalars()
+        )
+        for r in rows:
+            r.target_price = new_price
+            if r.list_price and r.list_price > 0:
+                r.target_total_pct = (
+                    (r.list_price - new_price) / r.list_price * Decimal(100)
+                ).quantize(Decimal("0.01"))
+        await self._session.flush()
+        return len(rows)
+
+    async def expire_started(
+        self,
+        *,
+        mlb_id: str,
+        promo_id: str | None = None,
+        promo_type: str | None = None,
+        reason: str = "exited",
+    ) -> int:
+        """After a live exit, drop the cached 'started' row(s) from the active
+        list immediately (status=expired) so they leave 'Inscritas' before the
+        daily re-sync. Returns rows expired."""
+        conds = [
+            MLPromoDecisionORM.mlb_id == mlb_id,
+            MLPromoDecisionORM.constraint_used == "started",
+            MLPromoDecisionORM.status.notin_(["expired", "rejected"]),
+        ]
+        if promo_id:
+            conds.append(
+                or_(
+                    MLPromoDecisionORM.promo_id == promo_id,
+                    MLPromoDecisionORM.promo_key == promo_id,
+                )
+            )
+        elif promo_type:
+            conds.append(MLPromoDecisionORM.promo_type == promo_type)
+        stmt = (
+            update(MLPromoDecisionORM)
+            .where(*conds)
+            .values(status="expired", expired_at=datetime.now(UTC), expired_reason=reason)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(stmt)
+        await self._session.flush()
+        return int(result.rowcount or 0)  # type: ignore[attr-defined]
+
+    async def restore_started_price(
+        self,
+        *,
+        mlb_id: str,
+        new_price: Decimal,
+        promo_id: str | None = None,
+        promo_type: str | None = None,
+    ) -> int:
+        """Re-activate a 'started' decision row that was expired while a
+        re-subscribe was pending, now that the queue re-enrolled at ``new_price``.
+        Un-expires the matching started row(s) and sets the new price so the
+        listing reappears in 'Inscritas' before the daily re-sync. Returns rows
+        restored (0 if none — the daily sync will recreate it)."""
+        conds = [
+            MLPromoDecisionORM.mlb_id == mlb_id,
+            MLPromoDecisionORM.constraint_used == "started",
+            MLPromoDecisionORM.status != "rejected",
+        ]
+        if promo_id:
+            conds.append(
+                or_(
+                    MLPromoDecisionORM.promo_id == promo_id,
+                    MLPromoDecisionORM.promo_key == promo_id,
+                )
+            )
+        elif promo_type:
+            conds.append(MLPromoDecisionORM.promo_type == promo_type)
+        rows = list(
+            (
+                await self._session.execute(
+                    select(MLPromoDecisionORM)
+                    .where(*conds)
+                    .order_by(MLPromoDecisionORM.created_at.desc())
+                )
+            ).scalars()
+        )
+        for r in rows:
+            r.status = "ignored"
+            r.expired_at = None
+            r.expired_reason = None
+            r.target_price = new_price
+            if r.list_price and r.list_price > 0:
+                r.target_total_pct = (
+                    (r.list_price - new_price) / r.list_price * Decimal(100)
+                ).quantize(Decimal("0.01"))
+        await self._session.flush()
+        return len(rows)
+
     async def revert_to_pending(
         self,
         decision_id: int,
@@ -716,6 +839,38 @@ class MLPromoResubscribeRepository:
             decided_by=decided_by,
             last_error=last_error,
             last_status_code=last_status_code,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
+    async def record_completed(
+        self,
+        *,
+        mlb_id: str,
+        sku: str,
+        promo_type: str,
+        target_price: Decimal,
+        promo_id: str | None = None,
+        op_id: str | None = None,
+        decided_by: str | None = None,
+    ) -> MLPromoResubscribeJobORM:
+        """Record an IMMEDIATE re-subscription (exit + re-enroll that succeeded
+        on the first try, no ML lag) as a done job, so the operator still sees
+        the re-inscrição confirmed in the dock for a short while."""
+        now = datetime.now(UTC)
+        row = MLPromoResubscribeJobORM(
+            mlb_id=mlb_id,
+            sku=sku,
+            promo_type=promo_type,
+            promo_id=promo_id,
+            target_price=target_price,
+            status="done",
+            next_attempt_at=now,
+            deadline=now,
+            resolved_at=now,
+            op_id=op_id,
+            decided_by=decided_by,
         )
         self._session.add(row)
         await self._session.flush()

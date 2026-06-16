@@ -28,6 +28,7 @@ from tiny_mirror.infrastructure.orm.models import MLPromoResubscribeJobORM
 from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
     MLPromoActionRepository,
     MLPromoAlertRepository,
+    MLPromoDecisionRepository,
     MLPromoResubscribeRepository,
 )
 from tiny_mirror.services.ml_promotion_service import MLPromotionService
@@ -220,6 +221,14 @@ class ResubscribeService:
             reason="re-inscrição automática concluída pela fila (oferta voltou a ser candidata)",
             ml_response=enter,
             decided_by=job.decided_by or "resubscribe-queue",
+        )
+        # Reaparece em 'Inscritas' com o novo preço antes do re-sync diário (a
+        # linha 'started' foi expirada quando a re-inscrição foi agendada).
+        await MLPromoDecisionRepository(session).restore_started_price(
+            mlb_id=job.mlb_id,
+            new_price=Decimal(job.target_price),
+            promo_id=job.promo_id,
+            promo_type=job.promo_type,
         )
         log.info("promo.resubscribe_done", ml_status_code=sc)
         return "resubscribed"

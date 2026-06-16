@@ -2021,6 +2021,11 @@ async def exit_promotion_endpoint(
         dry_run=False,
         decided_by=body.decided_by,
     )
+    # Tira a linha 'started' do espelho imediatamente pra ela sair de 'Inscritas'
+    # antes do re-sync diário (a escrita no ML não toca no nosso espelho).
+    await MLPromoDecisionRepository(session).expire_started(
+        mlb_id=body.mlb_id, promo_id=body.promo_id, promo_type=body.promo_type
+    )
     await session.commit()
     _done("exited", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
@@ -2304,6 +2309,12 @@ async def modify_promotion_endpoint(
                     ml_response={"exit": exit_result, "enter": enter_result},
                     decided_by=body.decided_by,
                 )
+                # O exit deu certo: o anúncio voltou ao preço cheio, sem promoção.
+                # Tira a linha 'started' do espelho pra não mostrar promoção que
+                # já saiu — a fila recoloca quando reentrar.
+                await MLPromoDecisionRepository(session).expire_started(
+                    mlb_id=body.mlb_id, promo_id=body.promo_id, promo_type=promo_type_u
+                )
                 await session.commit()
                 _done(
                     "resubscribe_scheduled",
@@ -2366,8 +2377,28 @@ async def modify_promotion_endpoint(
         decided_by=body.decided_by,
         context=ctx,
     )
-    await session.commit()
     resubscribed = not inplace_edit
+    # Reflete o novo preço na linha 'started' em cache para a UI atualizar ANTES
+    # do re-sync diário (a escrita no ML não toca no nosso espelho).
+    dec_repo = MLPromoDecisionRepository(session)
+    await dec_repo.update_started_price(
+        mlb_id=body.mlb_id,
+        new_price=body.new_price,
+        promo_id=body.promo_id,
+        promo_type=promo_type,
+    )
+    if resubscribed:
+        # Visibilidade no dock: registra a re-inscrição imediata como concluída.
+        await MLPromoResubscribeRepository(session).record_completed(
+            mlb_id=body.mlb_id,
+            sku=sku,
+            promo_type=promo_type_u,
+            promo_id=body.promo_id,
+            target_price=body.new_price,
+            op_id=structlog.contextvars.get_contextvars().get("op_id"),
+            decided_by=body.decided_by,
+        )
+    await session.commit()
     _done(
         "modified", resubscribed=resubscribed, elapsed_ms=round((time.monotonic() - started) * 1000)
     )
