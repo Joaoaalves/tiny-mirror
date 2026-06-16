@@ -43,6 +43,8 @@ from tiny_mirror.services.ml_promotion_service import (
     EDITABLE_INPLACE_TYPES,
     PRICE_EDITABLE_TYPES,
     MLPromotionService,
+    _parse_iso_dt,
+    _to_dec,
 )
 
 logger = structlog.get_logger(__name__)
@@ -1848,6 +1850,26 @@ async def create_price_discount_direct(
         dry_run=False,
         decided_by=body.decided_by,
         context=ctx,
+    )
+    # Grava a linha 'started' no espelho na hora pra a promoção aparecer em
+    # "Inscritas" já — o generate diário pula anúncios pausados e só roda 1x/dia,
+    # então sem isso a promoção recém-criada ficava invisível (e indeletável).
+    resp = result.get("response") if isinstance(result.get("response"), dict) else {}
+    list_price = _to_dec((resp or {}).get("original_price"))
+    if list_price is None:
+        snap = await MLCostsSnapshotRepository(session).get(body.mlb_id)
+        list_price = snap.list_price if snap else None
+    await MLPromoDecisionRepository(session).upsert_started(
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type="PRICE_DISCOUNT",
+        target_price=body.deal_price,
+        list_price=list_price,
+        cap_pct=cap.max_seller_share_pct if cap else None,
+        floor_price=cap.margin_floor_price if cap else None,
+        promo_start_date=_parse_iso_dt(body.start_date),
+        promo_finish_date=_parse_iso_dt(body.finish_date),
+        reason="PRICE_DISCOUNT criada manualmente pelo operador",
     )
     await session.commit()
     _done("created", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))

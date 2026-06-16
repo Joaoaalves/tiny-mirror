@@ -664,6 +664,86 @@ class MLPromoDecisionRepository:
         await self._session.flush()
         return len(rows)
 
+    async def upsert_started(
+        self,
+        *,
+        mlb_id: str,
+        sku: str,
+        promo_type: str,
+        target_price: Decimal,
+        promo_id: str | None = None,
+        promo_key: str | None = None,
+        list_price: Decimal | None = None,
+        cap_pct: Decimal | None = None,
+        floor_price: Decimal | None = None,
+        promo_name: str | None = None,
+        promo_start_date: datetime | None = None,
+        promo_finish_date: datetime | None = None,
+        reason: str = "",
+    ) -> MLPromoDecisionORM:
+        """Insert (or re-activate) a 'started' decision row right after a promo is
+        created live on the ML, so it shows up in 'Inscritas' immediately —
+        without waiting for the daily generate (which, besides, skips paused
+        listings entirely). Keyed by (mlb_id, promo_key); seller PRICE_DISCOUNT
+        has no ML id, so the caller passes a stable synthetic key matching what
+        generate would use (``CREATE-started``). Re-activates an expired row on
+        re-creation. Returns the row."""
+        key = promo_key or (promo_id if promo_id else "CREATE-started")
+        total_pct: Decimal | None = None
+        if list_price and list_price > 0:
+            total_pct = ((list_price - target_price) / list_price * Decimal(100)).quantize(
+                Decimal("0.01")
+            )
+        existing = (
+            await self._session.execute(
+                select(MLPromoDecisionORM).where(
+                    MLPromoDecisionORM.mlb_id == mlb_id,
+                    MLPromoDecisionORM.promo_key == key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            existing.status = "ignored"
+            existing.constraint_used = "started"
+            existing.decision_kind = "already_active"
+            existing.promo_type = promo_type
+            existing.promo_id = promo_id
+            existing.target_price = target_price
+            existing.expired_at = None
+            existing.expired_reason = None
+            if total_pct is not None:
+                existing.target_total_pct = total_pct
+            if list_price is not None:
+                existing.list_price = list_price
+            if promo_finish_date is not None:
+                existing.promo_finish_date = promo_finish_date
+            if promo_start_date is not None:
+                existing.promo_start_date = promo_start_date
+            await self._session.flush()
+            return existing
+        row = MLPromoDecisionORM(
+            mlb_id=mlb_id,
+            sku=sku,
+            promo_key=key,
+            promo_id=promo_id,
+            promo_type=promo_type,
+            promo_name=promo_name,
+            decision_kind="already_active",
+            target_price=target_price,
+            target_total_pct=total_pct,
+            constraint_used="started",
+            list_price=list_price,
+            cap_pct=cap_pct,
+            floor_price=floor_price,
+            reason=reason or "promoção criada manualmente pelo operador",
+            status="ignored",
+            promo_start_date=promo_start_date,
+            promo_finish_date=promo_finish_date,
+        )
+        self._session.add(row)
+        await self._session.flush()
+        return row
+
     async def expire_started(
         self,
         *,
