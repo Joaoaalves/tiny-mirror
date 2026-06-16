@@ -2052,27 +2052,18 @@ async def exit_promotion_endpoint(
             mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
         )
     sc = result.get("status_code")
-    if sc is not None and sc >= 400 and sc != 404:
-        _done(
-            "ml_rejected",
-            level="warning",
-            ml_status_code=sc,
-            elapsed_ms=round((time.monotonic() - started) * 1000),
-        )
-        raise HTTPException(
-            status_code=sc if sc < 600 else 502,
-            detail={"step": "exit", "response": result.get("response")},
-        )
 
-    # Verifica se a promoção REALMENTE saiu. O ML às vezes devolve 200 num DELETE
-    # que NÃO remove nada — visto em PRICE_DISCOUNT de anúncio de CATÁLOGO pausado
-    # (DELETE → 200, mas a oferta continua 'started'; e na 2ª tentativa devolve
-    # 400 "No offers found"). Sem essa checagem o app reportava sucesso FALSO e a
-    # linha sumia de "Inscritas" enquanto a promo seguia ativa no ML.
+    # Confere o estado REAL no ML antes de declarar sucesso. O DELETE de promoção
+    # é enganoso em alguns casos (PRICE_DISCOUNT em anúncio de CATÁLOGO pausado):
+    # devolve 200 sem remover nada, ou 400 "No offers found" tanto quando JÁ tinha
+    # saído (idempotente) quanto quando segue ativa. Então a fonte de verdade é a
+    # consulta de elegibilidade, não o status code.
     pt = (body.promo_type or "PRICE_DISCOUNT").upper()
     still_active = False
+    verify_ok = True
     try:
-        for p in await service.fetch_eligible_promos(body.mlb_id):
+        promos = await service.fetch_eligible_promos(body.mlb_id)
+        for p in promos:
             if (p.get("type") or "").upper() != pt:
                 continue
             if (p.get("status") or "").lower() != "started":
@@ -2082,15 +2073,14 @@ async def exit_promotion_endpoint(
             still_active = True
             break
     except Exception as exc:  # pragma: no cover — verificação é best-effort
+        verify_ok = False
         logger.warning("promo.exit_verify_failed", error=str(exc))
 
     if still_active:
+        # Não saiu. Se o ML deu erro, repassa-o; senão (200 mentiroso) explica.
         logger.warning(
             "promo.exit_not_effective",
-            note=(
-                "ML aceitou o DELETE mas a promoção continua 'started' — típico de "
-                "PRICE_DISCOUNT em anúncio de catálogo pausado."
-            ),
+            note="DELETE não removeu a promoção — típico de catálogo pausado.",
             ml_status_code=sc,
         )
         _done(
@@ -2102,11 +2092,26 @@ async def exit_promotion_endpoint(
         raise HTTPException(
             status_code=409,
             detail=(
-                "O Mercado Livre aceitou a remoção mas a promoção continua ATIVA "
-                "(costuma ocorrer em anúncio de catálogo pausado). Reative o anúncio "
+                "Não foi possível remover a promoção: o Mercado Livre não a removeu "
+                "(costuma ocorrer em anúncio de CATÁLOGO pausado). Reative o anúncio "
                 "para conseguir removê-la, ou aguarde o término da promoção."
             ),
         )
+
+    # Não está mais ativa. Se a verificação falhou (rede) E o DELETE deu erro real,
+    # não dá pra afirmar sucesso — repassa o erro do ML.
+    if not verify_ok and sc is not None and sc >= 400 and sc != 404:
+        _done(
+            "ml_rejected",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise HTTPException(
+            status_code=sc if sc < 600 else 502,
+            detail={"step": "exit", "response": result.get("response")},
+        )
+    # Promoção confirmada fora (ou DELETE 404/idempotente) → sucesso.
 
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
