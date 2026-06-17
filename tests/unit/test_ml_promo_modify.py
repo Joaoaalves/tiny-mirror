@@ -34,11 +34,49 @@ def _http(json_body: Any = None, status: int = 200) -> Any:
     return mock
 
 
+def _resp(status: int, json_body: Any = None, headers: dict[str, str] | None = None) -> Any:
+    r = MagicMock()
+    r.status_code = status
+    r.headers = headers or {}
+    r.content = (json.dumps(json_body) if json_body is not None else "").encode()
+    r.json = MagicMock(return_value=json_body or {})
+    r.text = json.dumps(json_body) if json_body is not None else ""
+    return r
+
+
 def _service(http: Any) -> MLPromotionService:
     token = MagicMock()
     token.get_valid_access_token = AsyncMock(return_value="tok")
     token.handle_unauthorized = AsyncMock(return_value="tok2")
     return MLPromotionService(token_service=token, http_client=http)
+
+
+@pytest.mark.asyncio
+async def test_ml_write_retries_on_429_then_succeeds() -> None:
+    # ML devolve 429 (rate-limit) com Retry-After: 0 → o write espera e reenvia,
+    # tendo sucesso na 2ª. Essencial pra criação em massa não falhar em lote.
+    http = AsyncMock(spec=httpx.AsyncClient)
+    http.post = AsyncMock(
+        side_effect=[
+            _resp(429, {"message": "too many requests"}, {"Retry-After": "0"}),
+            _resp(200, {"price": 10.0}),
+        ]
+    )
+    svc = _service(http)
+    out = await svc.modify_promotion(mlb_id="MLB1", deal_price=10.0)
+    assert out["status_code"] == 200
+    assert http.post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_ml_write_gives_up_after_max_rate_retries() -> None:
+    # 429 persistente: tenta MAX+1 vezes e devolve o 429 (sem levantar).
+    http = AsyncMock(spec=httpx.AsyncClient)
+    http.post = AsyncMock(return_value=_resp(429, {"message": "slow down"}, {"Retry-After": "0"}))
+    svc = _service(http)
+    out = await svc.modify_promotion(mlb_id="MLB1", deal_price=10.0)
+    assert out["status_code"] == 429
+    assert http.post.call_count == 4  # 1 inicial + 3 retries
 
 
 @pytest.mark.asyncio

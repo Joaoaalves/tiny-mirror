@@ -16,6 +16,7 @@ production. The action log records dry_run=True to make this explicit.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from collections.abc import Iterable
@@ -43,6 +44,24 @@ from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenSer
 logger = structlog.get_logger(__name__)
 
 ML_API_BASE = "https://api.mercadolibre.com"
+
+# Quantas vezes reenviar uma escrita no ML após 429/502/503/504 (rate-limit /
+# gateway transitório), com backoff respeitando Retry-After. Protege a criação
+# em massa de promoções, que dispara muitas escritas em sequência.
+_ML_WRITE_MAX_RATE_RETRIES = 3
+
+
+def _retry_after_seconds(resp: httpx.Response) -> float | None:
+    """Lê o header Retry-After (segundos) de uma resposta 429/503. Ignora o
+    formato HTTP-date (raro nessa API) e limita a 30s pra não travar a request."""
+    raw = resp.headers.get("Retry-After")
+    if not raw:
+        return None
+    try:
+        return min(max(float(raw), 0.0), 30.0)
+    except ValueError:
+        return None
+
 
 # Promo types that get extra exposure in ML's UI (interval-based deals).
 # Boost is informational — surfaced in the decision so the UI/operator can
@@ -504,6 +523,7 @@ class MLPromotionService:
         token = await self._token_service.get_valid_access_token()
         started = time.monotonic()
         retried_auth = False
+        rate_retries = 0
         try:
             resp = await _send(token)
             if resp.status_code == 401:
@@ -511,6 +531,25 @@ class MLPromotionService:
                 token = await self._token_service.handle_unauthorized()
                 resp = await _send(token)
                 retried_auth = True
+            # Rate-limit (429) e gateways transitórios (502/503/504): espera e
+            # tenta de novo, respeitando Retry-After. Essencial pra criação em
+            # massa, que dispara muitas escritas seguidas.
+            while (
+                resp.status_code in (429, 502, 503, 504)
+                and rate_retries < _ML_WRITE_MAX_RATE_RETRIES
+            ):
+                delay = _retry_after_seconds(resp)
+                if delay is None:
+                    delay = float(2**rate_retries)  # 1s, 2s, 4s
+                rate_retries += 1
+                log.warning(
+                    "ml_write.rate_limited",
+                    status=resp.status_code,
+                    retry_in_s=delay,
+                    attempt=rate_retries,
+                )
+                await asyncio.sleep(delay)
+                resp = await _send(token)
         except httpx.RequestError as exc:
             elapsed_ms = round((time.monotonic() - started) * 1000)
             log.warning(
@@ -544,6 +583,7 @@ class MLPromotionService:
             "status_code": resp.status_code,
             "elapsed_ms": elapsed_ms,
             "retried_auth": retried_auth,
+            "rate_retries": rate_retries,
             # Full parsed body when JSON; bounded raw text otherwise. Seq keeps
             # the whole object, so we can read ML's exact answer.
             "ml_response": parsed if parsed is not None else raw[:8000],
