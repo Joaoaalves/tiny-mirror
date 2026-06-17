@@ -700,9 +700,14 @@ async def _enrich_cap(
 
     st = (await _stock_by_skus(session, [cap.sku])).get(cap.sku)
     if st is not None:
+        # FLEX → galpão (nosso banco). 'a caminho' = transfer interno do Full (ML
+        # Inventory). Ambos por produto, vindos de stock_deposits.
         out.warehouse_available = st["warehouse_available"]
-        out.full_available = st["full_available"]
         out.full_in_transit = st["full_in_transit"]
+    # FULL → o estoque REAL do anúncio no ML (ml_listings.available_quantity, por
+    # MLB), NÃO o Full do nosso banco: stock_deposits é por produto Tiny e diverge
+    # muito do anúncio (kits dão 0, depósitos furados inflam).
+    out.full_available = out.available_quantity
 
     cat = (
         await session.execute(
@@ -2186,8 +2191,8 @@ async def list_campaign_candidates(
         rows = (
             await session.execute(
                 text(
-                    "SELECT mlb_id, sku, title, thumbnail, logistic_type FROM ml_listings "
-                    "WHERE mlb_id = ANY(:ids)"
+                    "SELECT mlb_id, sku, title, thumbnail, logistic_type, available_quantity "
+                    "FROM ml_listings WHERE mlb_id = ANY(:ids)"
                 ),
                 {"ids": mlb_ids},
             )
@@ -2224,7 +2229,9 @@ async def list_campaign_candidates(
                 thumbnail=m.get("thumbnail"),
                 logistic_type=m.get("logistic_type"),
                 warehouse_available=st["warehouse_available"] if st else None,
-                full_available=st["full_available"] if st else None,
+                # FULL = estoque real do anúncio no ML (available_quantity), não o
+                # Full do nosso banco (stock_deposits diverge por ser por produto).
+                full_available=m.get("available_quantity"),
                 full_in_transit=st["full_in_transit"] if st else None,
                 original_price=_f(c.get("original_price")),
                 min_price=lo,
