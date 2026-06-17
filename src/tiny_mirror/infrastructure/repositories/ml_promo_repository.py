@@ -459,6 +459,7 @@ class MLPromoDecisionRepository:
         sku: str | None = None,
         constraint_used: str | None = None,
         exclude_promo_types: list[str] | None = None,
+        exclude_active: bool = False,
         limit: int = 200,
         offset: int = 0,
     ) -> tuple[list[MLPromoDecisionORM], int]:
@@ -476,6 +477,16 @@ class MLPromoDecisionRepository:
         if exclude_promo_types:
             q = q.where(MLPromoDecisionORM.promo_type.notin_(exclude_promo_types))
             count_q = count_q.where(MLPromoDecisionORM.promo_type.notin_(exclude_promo_types))
+        if exclude_active:
+            # Exclui decisões de MLBs que JÁ têm promoção ativa (linha 'started'
+            # não expirada) — pra "sem promoção" mostrar só anúncios realmente
+            # sem nenhuma promo rodando. (Antes era ignorado no backend.)
+            active_mlbs = select(MLPromoDecisionORM.mlb_id).where(
+                MLPromoDecisionORM.constraint_used == "started",
+                MLPromoDecisionORM.status.notin_(["expired", "rejected"]),
+            )
+            q = q.where(MLPromoDecisionORM.mlb_id.notin_(active_mlbs))
+            count_q = count_q.where(MLPromoDecisionORM.mlb_id.notin_(active_mlbs))
         q = q.order_by(MLPromoDecisionORM.created_at.desc()).limit(limit).offset(offset)
         rows = list((await self._session.execute(q)).scalars().all())
         total = int((await self._session.execute(count_q)).scalar_one())

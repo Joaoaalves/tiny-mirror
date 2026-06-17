@@ -1443,6 +1443,13 @@ async def list_decisions(
     sku: str | None = Query(default=None),
     constraint_used: str | None = Query(default=None),
     exclude_types: Annotated[list[str] | None, Query()] = None,
+    exclude_active: bool = Query(
+        default=False,
+        description=(
+            "exclui decisões de MLBs que já têm promoção ATIVA (started) — "
+            "usado pela view 'sem promoção' pra mostrar só anúncios sem promo rodando"
+        ),
+    ),
     limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(db_session),
@@ -1456,6 +1463,7 @@ async def list_decisions(
         sku=sku,
         constraint_used=constraint_used,
         exclude_promo_types=exclude_types,
+        exclude_active=exclude_active,
         limit=limit,
         offset=offset,
     )
