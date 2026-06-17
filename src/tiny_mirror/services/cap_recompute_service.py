@@ -360,6 +360,69 @@ async def _fetch_active_baseline_for_mlb(
     return _baseline_from_active_promos(promos)
 
 
+def _snapshot_has_cost(s: MLCostsSnapshotORM) -> bool:
+    """True when a snapshot carries the full cost set a cap needs."""
+    return (
+        not s.fetch_error
+        and s.base_cost is not None
+        and s.commission_pct is not None
+        and s.list_price is not None
+        and s.list_price > Decimal(0)
+        and bool(s.freight_bands)
+    )
+
+
+def _build_inherited_snapshots(
+    snapshots: list[MLCostsSnapshotORM],
+    active_by_mlb: dict[str, str | None],
+) -> tuple[list[MLCostsSnapshotORM], dict[str, str]]:
+    """SKU fallback for duplicate anúncios missing from the sheet.
+
+    The cost dump (``costs_all``) is keyed by MLB, so a second anúncio of the
+    same product (same SKU, different MLB) often has no snapshot — or only an
+    errored one — and never got a cap. Cost is per PRODUCT, so for every active
+    MLB without its own complete snapshot we synthesise one inheriting cost from
+    a sibling MLB of the same SKU. Returns ``(synthesised_snapshots,
+    inherited_from)`` where ``inherited_from[mlb_id]`` is the donor MLB.
+
+    Only cost/freight numbers are inherited; live-promo anchoring and the upsert
+    still key on the real MLB downstream.
+    """
+    good_snap_by_sku: dict[str, MLCostsSnapshotORM] = {}
+    for s in snapshots:
+        if s.sku and _snapshot_has_cost(s):
+            good_snap_by_sku.setdefault(s.sku, s)
+    mlbs_with_own_cost = {s.mlb_id for s in snapshots if _snapshot_has_cost(s)}
+
+    synths: list[MLCostsSnapshotORM] = []
+    inherited_from: dict[str, str] = {}
+    for mlb_id, lst_sku in active_by_mlb.items():
+        if not lst_sku or mlb_id in mlbs_with_own_cost:
+            continue
+        sib = good_snap_by_sku.get(lst_sku)
+        if sib is None or sib.mlb_id == mlb_id:
+            continue
+        synths.append(
+            MLCostsSnapshotORM(
+                mlb_id=mlb_id,
+                sku=lst_sku,
+                active_on_sheet=sib.active_on_sheet,
+                base_cost=sib.base_cost,
+                commission_pct=sib.commission_pct,
+                commission_label=sib.commission_label,
+                list_price=sib.list_price,
+                sheet_promo_price=sib.sheet_promo_price,
+                sheet_discount_pct=sib.sheet_discount_pct,
+                sheet_margin_pct=sib.sheet_margin_pct,
+                sheet_margin_value=sib.sheet_margin_value,
+                freight_bands=sib.freight_bands,
+                fetch_error=None,
+            )
+        )
+        inherited_from[mlb_id] = sib.mlb_id
+    return synths, inherited_from
+
+
 async def recompute_all_caps(
     session: AsyncSession,
     *,
@@ -404,6 +467,24 @@ async def recompute_all_caps(
             continue
         by_sku.setdefault(snap.sku, []).append(snap)
 
+    # ── Fallback por SKU ────────────────────────────────────────────────
+    # Anúncios DUPLICADOS (mesmo produto, outro MLB) muitas vezes não estão na
+    # planilha pelo seu próprio MLB — o dump costs_all é indexado por MLB, então
+    # o 2º anúncio fica sem snapshot (ou com fetch_error) e nunca ganhava cap.
+    # Herdamos o custo de um anúncio irmão do mesmo SKU (custo é por PRODUTO). O
+    # ancoramento à promo ativa segue usando o MLB real (fetch por snap.mlb_id).
+    active_by_mlb: dict[str, str | None] = {
+        r[0]: r[1]
+        for r in (
+            await session.execute(
+                select(MLListingORM.mlb_id, MLListingORM.sku).where(MLListingORM.status == "active")
+            )
+        ).all()
+    }
+    synths, inherited_from = _build_inherited_snapshots(snapshots, active_by_mlb)
+    for synth in synths:
+        by_sku.setdefault(synth.sku, []).append(synth)
+
     actor = actor or f"auto-cap-recompute-{datetime.now(UTC).date().isoformat()}"
     stats = {
         "snapshots_read": len(snapshots),
@@ -413,6 +494,7 @@ async def recompute_all_caps(
         "mlbs_fallback_sheet": 0,
         "mlbs_zero_cap": 0,
         "mlbs_fetched_promos": 0,
+        "mlbs_inherited_cost": len(inherited_from),
     }
     examples: list[dict[str, Any]] = []
 
@@ -461,6 +543,9 @@ async def recompute_all_caps(
             if calc.cap_pct == Decimal(0):
                 stats["mlbs_zero_cap"] += 1
 
+            cap_notes = calc.reason
+            if snap.mlb_id in inherited_from:
+                cap_notes = f"[custo herdado de {inherited_from[snap.mlb_id]}] {cap_notes}"
             await cap_repo.upsert(
                 snap.mlb_id,
                 sku=sku,
@@ -468,7 +553,7 @@ async def recompute_all_caps(
                 margin_floor_price=calc.floor_price,
                 has_active_promo=has_active_promo,
                 active_promo_price=active_promo_price,
-                notes=calc.reason[:500],
+                notes=cap_notes[:500],
                 updated_by=actor,
             )
             if len(examples) < 10:

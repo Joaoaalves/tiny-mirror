@@ -26,6 +26,18 @@ from tiny_mirror.infrastructure.orm.models import (
     MLPromoResubscribeJobORM,
 )
 
+# Kit unit prefix ("10U-", "5U-", …). The card grid groups variants by the base
+# SKU (``getBaseSku`` no front), so the drawer opens with the BASE sku
+# ("NIT-PT-RSP-TRV-500-N") while the rows live under "1U-/5U-/10U-…". SKU-keyed
+# reads fall back to this family match when the exact SKU has no rows.
+_KIT_PREFIX_RE = r"^[0-9]+U-"
+
+
+def _strip_kit_prefix(sku: str) -> str:
+    import re
+
+    return re.sub(_KIT_PREFIX_RE, "", sku)
+
 
 # ---------------------------------------------------------------------------
 # Caps
@@ -48,11 +60,22 @@ class MLPromoCapRepository:
 
     async def get_by_sku(self, sku: str) -> list[MLPromoCapORM]:
         """All caps belonging to a SKU. Used by the drawer to render the
-        SKU-level summary alongside its per-MLB editable rows."""
+        SKU-level summary alongside its per-MLB editable rows. Falls back to the
+        kit family (1U/5U/10U/…) when the exact SKU has no caps — the drawer
+        opens with the base SKU for grouped kit cards."""
         result = await self._session.execute(
             select(MLPromoCapORM).where(MLPromoCapORM.sku == sku).order_by(MLPromoCapORM.mlb_id)
         )
-        return list(result.scalars().all())
+        rows = list(result.scalars().all())
+        if not rows:
+            base = _strip_kit_prefix(sku)
+            result = await self._session.execute(
+                select(MLPromoCapORM)
+                .where(func.regexp_replace(MLPromoCapORM.sku, _KIT_PREFIX_RE, "") == base)
+                .order_by(MLPromoCapORM.sku, MLPromoCapORM.mlb_id)
+            )
+            rows = list(result.scalars().all())
+        return rows
 
     async def list_all(
         self,
@@ -156,7 +179,16 @@ class MLCostsSnapshotRepository:
             .where(MLCostsSnapshotORM.sku == sku)
             .order_by(MLCostsSnapshotORM.fetched_at.desc())
         )
-        return list(result.scalars().all())
+        rows = list(result.scalars().all())
+        if not rows:  # kit base SKU → match the whole family (1U/5U/10U/…)
+            base = _strip_kit_prefix(sku)
+            result = await self._session.execute(
+                select(MLCostsSnapshotORM)
+                .where(func.regexp_replace(MLCostsSnapshotORM.sku, _KIT_PREFIX_RE, "") == base)
+                .order_by(MLCostsSnapshotORM.sku, MLCostsSnapshotORM.fetched_at.desc())
+            )
+            rows = list(result.scalars().all())
+        return rows
 
     async def upsert(
         self,

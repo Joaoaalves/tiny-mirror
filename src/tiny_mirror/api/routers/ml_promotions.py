@@ -1474,6 +1474,7 @@ class NoPromoOut(BaseModel):
     mlb_id: str
     sku: str | None = None
     title: str | None = None
+    thumbnail: str | None = None
     logistic_type: str | None = None
     catalog_listing: bool | None = None
     catalog_status: str | None = None
@@ -1495,7 +1496,7 @@ async def list_no_decisions(
         (
             await session.execute(
                 text(
-                    "SELECT l.mlb_id, l.sku, l.title, l.logistic_type, "
+                    "SELECT l.mlb_id, l.sku, l.title, l.thumbnail, l.logistic_type, "
                     "c.catalog_listing, c.status AS catalog_status, c.winner_price, "
                     "c.price_to_win, c.current_price "
                     "FROM ml_listings l LEFT JOIN ml_catalog_status c ON c.mlb_id = l.mlb_id "
@@ -1521,6 +1522,7 @@ async def list_no_decisions(
             mlb_id=r["mlb_id"],
             sku=r["sku"],
             title=r["title"],
+            thumbnail=r["thumbnail"],
             logistic_type=r["logistic_type"],
             catalog_listing=r["catalog_listing"],
             catalog_status=r["catalog_status"],

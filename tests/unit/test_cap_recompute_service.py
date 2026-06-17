@@ -358,3 +358,82 @@ def test_fallback_skips_when_fetch_error_set() -> None:
 # Per-SKU consolidation tests were removed on 2026-05-21 when caps became
 # per-MLB. The engine now operates on each anúncio independently, so there
 # is no max(cap)/min(floor) reduction to test.
+
+
+# ── SKU fallback (duplicate anúncios missing from the MLB-keyed sheet) ──────
+from tiny_mirror.infrastructure.orm.models import MLCostsSnapshotORM  # noqa: E402
+from tiny_mirror.services.cap_recompute_service import (  # noqa: E402
+    _build_inherited_snapshots,
+)
+
+
+def _real_snap(mlb: str, sku: str, *, has_cost: bool) -> MLCostsSnapshotORM:
+    """A detached ORM snapshot (no session) — the helper reads sibling cost
+    fields off it and constructs new ORM rows, so FakeSnap won't do here."""
+    if has_cost:
+        return MLCostsSnapshotORM(
+            mlb_id=mlb,
+            sku=sku,
+            base_cost=Decimal("10"),
+            commission_pct=Decimal("12"),
+            list_price=Decimal("100"),
+            freight_bands=[{"min": 0, "max": None, "cost": 5}],
+            sheet_discount_pct=Decimal("30"),
+        )
+    # Errored sibling like the real ones: empty sku, no cost, fetch_error set.
+    return MLCostsSnapshotORM(
+        mlb_id=mlb,
+        sku=sku,
+        base_cost=None,
+        commission_pct=None,
+        list_price=None,
+        freight_bands=None,
+        fetch_error="listing not found",
+    )
+
+
+def test_inherits_cost_from_sibling_of_same_sku() -> None:
+    snaps = [_real_snap("MLB_GOOD", "10U-RTA-GAV3-AZ", has_cost=True)]
+    active = {"MLB_GOOD": "10U-RTA-GAV3-AZ", "MLB_DUP": "10U-RTA-GAV3-AZ"}
+    synths, inherited = _build_inherited_snapshots(snaps, active)
+    assert inherited == {"MLB_DUP": "MLB_GOOD"}
+    assert len(synths) == 1
+    s = synths[0]
+    assert s.mlb_id == "MLB_DUP"
+    assert s.sku == "10U-RTA-GAV3-AZ"
+    assert s.base_cost == Decimal("10")
+    assert s.list_price == Decimal("100")
+    assert s.fetch_error is None
+
+
+def test_inherits_even_when_duplicate_has_errored_snapshot() -> None:
+    # Real shape: the dup's own snapshot is errored with an empty sku, while its
+    # active listing carries the real sku — must still inherit from the sibling.
+    snaps = [
+        _real_snap("MLB_GOOD", "10U-RTA-GAV3-AZ", has_cost=True),
+        _real_snap("MLB_DUP", "", has_cost=False),
+    ]
+    active = {"MLB_GOOD": "10U-RTA-GAV3-AZ", "MLB_DUP": "10U-RTA-GAV3-AZ"}
+    synths, inherited = _build_inherited_snapshots(snaps, active)
+    assert inherited == {"MLB_DUP": "MLB_GOOD"}
+
+
+def test_no_inherit_when_no_sibling_has_cost() -> None:
+    snaps = [_real_snap("MLB_BAD", "", has_cost=False)]
+    active = {"MLB_X": "OUR-PAR30-9W-3000K"}
+    synths, inherited = _build_inherited_snapshots(snaps, active)
+    assert synths == [] and inherited == {}
+
+
+def test_no_inherit_when_listing_has_its_own_cost() -> None:
+    snaps = [_real_snap("MLB_OK", "SKU-A", has_cost=True)]
+    active = {"MLB_OK": "SKU-A"}
+    synths, inherited = _build_inherited_snapshots(snaps, active)
+    assert synths == [] and inherited == {}
+
+
+def test_no_inherit_when_listing_has_no_sku() -> None:
+    snaps = [_real_snap("MLB_GOOD", "SKU-A", has_cost=True)]
+    active = {"MLB_NOSKU": None}
+    synths, inherited = _build_inherited_snapshots(snaps, active)
+    assert synths == [] and inherited == {}

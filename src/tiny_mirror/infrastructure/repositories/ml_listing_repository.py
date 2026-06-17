@@ -67,8 +67,12 @@ class MLListingRepository:
         return int(result.scalar_one())
 
     async def get_active_mlb_ids_for_sku(self, sku: str) -> list[str]:
-        """Return all active MLB IDs (any logistic type) for a given seller SKU."""
-        from sqlalchemy import select
+        """Return all active MLB IDs (any logistic type) for a given seller SKU.
+
+        Falls back to the kit family (1U/5U/10U/… of the same base) when the
+        exact SKU has no active listing — the promoções drawer opens grouped kit
+        cards with the BASE sku ("NIT-PT-RSP-TRV-500-N")."""
+        from sqlalchemy import func, select
 
         result = await self._session.execute(
             select(MLListingORM.mlb_id).where(
@@ -76,7 +80,19 @@ class MLListingRepository:
                 MLListingORM.status == "active",
             )
         )
-        return [str(r) for r in result.scalars().all()]
+        mlb_ids = [str(r) for r in result.scalars().all()]
+        if not mlb_ids:
+            import re
+
+            base = re.sub(r"^[0-9]+U-", "", sku)
+            result = await self._session.execute(
+                select(MLListingORM.mlb_id).where(
+                    func.regexp_replace(MLListingORM.sku, r"^[0-9]+U-", "") == base,
+                    MLListingORM.status == "active",
+                )
+            )
+            mlb_ids = [str(r) for r in result.scalars().all()]
+        return mlb_ids
 
     async def get_all_active_mlb_ids(self) -> list[tuple[str, str]]:
         """Return (mlb_id, sku) pairs for every active listing in the catalog."""
