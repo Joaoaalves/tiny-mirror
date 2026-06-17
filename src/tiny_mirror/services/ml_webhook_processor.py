@@ -28,6 +28,26 @@ logger = structlog.get_logger(__name__)
 
 _MLB_RE = re.compile(r"MLB\d{6,}")
 
+# Tópicos de PROMOÇÃO que disparam re-sync. O mesmo callback recebe MUITOS outros
+# tópicos (orders_v2, shipments, items, price_suggestion, ...) que NÃO são nossa
+# conta aqui — esses são marcados 'ignored' (sem re-sync) pra não bater no ML à
+# toa. Set explícito + fallback por palavra-chave (offer/candidate/competition),
+# que nenhum tópico não-promo visto contém.
+_PROMO_TOPICS = frozenset(
+    {
+        "public_offers",
+        "public_candidates",
+        "catalog_item_competition_status",
+        "marketplace_item_competition_status",
+    }
+)
+_PROMO_KEYWORDS = ("offer", "candidate", "competition", "promotion")
+
+
+def _is_promo_topic(topic: str) -> bool:
+    t = (topic or "").lower()
+    return t in _PROMO_TOPICS or any(k in t for k in _PROMO_KEYWORDS)
+
 
 class WebhookProcessor:
     """Drena ``ml_webhook_notifications`` re-sincronizando os anúncios afetados."""
@@ -62,15 +82,20 @@ class WebhookProcessor:
             "processed": 0,
             "errors": 0,
             "unresolved": 0,
+            "ignored": 0,
         }
         if not pending:
             return stats
+
+        # Separa os tópicos de promoção (que re-sincronizam) dos demais (ignorados).
+        promo = [n for n in pending if _is_promo_topic(n.topic)]
+        ignored_ids = [n.id for n in pending if not _is_promo_topic(n.topic)]
 
         # 1) Resolve (id da notificação → SKU). Lê tudo do ORM AGORA, antes de
         #    qualquer commit do generate (que expira os objetos).
         items: list[tuple[int, str | None]] = []
         skus: set[str] = set()
-        for n in pending:
+        for n in promo:
             mlb = n.mlb_id or await self._resolve_mlb(n.resource)
             sku: str | None = None
             if mlb:
@@ -105,6 +130,7 @@ class WebhookProcessor:
             (processed_ids, "processed", None),
             (failed_ids, "error", "resync falhou"),
             (unresolved_ids, "error", "MLB/SKU não resolvido a partir da notificação"),
+            (ignored_ids, "ignored", "tópico não-promo"),
         ):
             if ids:
                 await session.execute(
@@ -116,6 +142,7 @@ class WebhookProcessor:
         stats["processed"] = len(processed_ids)
         stats["errors"] = len(failed_ids)
         stats["unresolved"] = len(unresolved_ids)
+        stats["ignored"] = len(ignored_ids)
         logger.info("ml_webhook.process_done", **stats)
         return stats
 

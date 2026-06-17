@@ -80,3 +80,21 @@ async def test_resolve_mlb_via_get_when_absent() -> None:
 async def test_resolve_mlb_none_on_non_path() -> None:
     proc = _processor(MagicMock())
     assert await proc._resolve_mlb("garbage") is None
+
+
+def test_is_promo_topic_filter() -> None:
+    from tiny_mirror.services.ml_webhook_processor import _is_promo_topic
+
+    # Promo → re-sync
+    for t in ["public_offers", "public_candidates", "catalog_item_competition_status"]:
+        assert _is_promo_topic(t) is True
+    # Não-promo (mesmo callback recebe esses) → ignorado
+    for t in [
+        "orders_v2",
+        "shipments",
+        "items",
+        "price_suggestion",
+        "stock-locations",
+        "fbm_stock_operations",
+    ]:
+        assert _is_promo_topic(t) is False
