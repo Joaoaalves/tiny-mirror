@@ -1470,6 +1470,68 @@ async def list_decisions(
     return [DecisionOut.model_validate(r) for r in rows]
 
 
+class NoPromoOut(BaseModel):
+    mlb_id: str
+    sku: str | None = None
+    title: str | None = None
+    logistic_type: str | None = None
+    catalog_listing: bool | None = None
+    catalog_status: str | None = None
+    winner_price: float | None = None
+    price_to_win: float | None = None
+    current_price: float | None = None
+
+
+@router.get("/no-decisions", response_model=list[NoPromoOut])
+async def list_no_decisions(
+    limit: int = Query(default=2000, ge=1, le=5000),
+    session: AsyncSession = Depends(db_session),
+) -> list[NoPromoOut]:
+    """Anúncios ATIVOS sem nenhuma promoção rodando E sem candidata pendente —
+    'livres' pra criar uma promoção de vendedor. Completa a view 'sem promoção':
+    o ``/decisions?exclude_active`` só traz quem tem candidata pendente; este
+    traz os que o ML nunca ofereceu nenhuma (senão a view some com eles)."""
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT l.mlb_id, l.sku, l.title, l.logistic_type, "
+                    "c.catalog_listing, c.status AS catalog_status, c.winner_price, "
+                    "c.price_to_win, c.current_price "
+                    "FROM ml_listings l LEFT JOIN ml_catalog_status c ON c.mlb_id = l.mlb_id "
+                    "WHERE l.status = 'active' "
+                    "AND NOT EXISTS (SELECT 1 FROM ml_promo_decisions d WHERE d.mlb_id = l.mlb_id "
+                    "  AND d.constraint_used = 'started' AND d.status NOT IN ('expired','rejected')) "
+                    "AND NOT EXISTS (SELECT 1 FROM ml_promo_decisions d WHERE d.mlb_id = l.mlb_id "
+                    "  AND d.status = 'pending') "
+                    "ORDER BY l.sku NULLS LAST, l.mlb_id LIMIT :lim"
+                ),
+                {"lim": limit},
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    def _f(v: Any) -> float | None:
+        return float(v) if v is not None else None
+
+    return [
+        NoPromoOut(
+            mlb_id=r["mlb_id"],
+            sku=r["sku"],
+            title=r["title"],
+            logistic_type=r["logistic_type"],
+            catalog_listing=r["catalog_listing"],
+            catalog_status=r["catalog_status"],
+            winner_price=_f(r["winner_price"]),
+            price_to_win=_f(r["price_to_win"]),
+            current_price=_f(r["current_price"]),
+        )
+        for r in rows
+    ]
+
+
 async def _apply_target_override(
     repo: MLPromoDecisionRepository,
     decision_id: int,
