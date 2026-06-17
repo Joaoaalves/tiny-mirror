@@ -1941,6 +1941,40 @@ class CreatePriceDiscountIn(BaseModel):
     finish_date: str | None = None
 
 
+class SellerCampaignOut(BaseModel):
+    """Campanha em que o vendedor pode inscrever anúncios em massa."""
+
+    id: str
+    type: str  # SELLER_CAMPAIGN | DEAL
+    sub_type: str | None = None
+    name: str | None = None
+    status: str | None = None
+    start_date: str | None = None
+    finish_date: str | None = None
+
+
+class CampaignCandidateOut(BaseModel):
+    """Anúncio ELEGÍVEL a entrar numa campanha + faixa de preço permitida."""
+
+    mlb_id: str
+    sku: str | None = None
+    title: str | None = None
+    thumbnail: str | None = None
+    original_price: float | None = None
+    min_price: float | None = None  # menor preço permitido (maior desconto)
+    max_price: float | None = None  # maior preço permitido (menor desconto)
+    suggested_price: float | None = None
+
+
+class EnrollCampaignItemIn(BaseModel):
+    mlb_id: str
+    promotion_id: str
+    promotion_type: str  # SELLER_CAMPAIGN | DEAL
+    deal_price: Decimal = Field(gt=0)
+    decided_by: str | None = None
+    source: str | None = None  # 'single' | 'bulk'
+
+
 @router.post("/create-price-discount")
 async def create_price_discount_direct(
     body: CreatePriceDiscountIn,
@@ -2050,6 +2084,186 @@ async def create_price_discount_direct(
     )
     await session.commit()
     _done("created", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
+    return result
+
+
+@router.get("/seller-campaigns", response_model=list[SellerCampaignOut])
+async def list_seller_campaigns(
+    service: MLPromotionService = Depends(_service_dep),
+) -> list[SellerCampaignOut]:
+    """Campanhas entráveis (SELLER_CAMPAIGN + DEAL) pra inscrição em massa."""
+    raw = await service.list_seller_campaigns()
+    return [
+        SellerCampaignOut(
+            id=c["id"],
+            type=c.get("type", ""),
+            sub_type=c.get("sub_type"),
+            name=c.get("name"),
+            status=c.get("status"),
+            start_date=c.get("start_date"),
+            finish_date=c.get("finish_date"),
+        )
+        for c in raw
+    ]
+
+
+@router.get(
+    "/seller-campaigns/{promotion_id}/candidates",
+    response_model=list[CampaignCandidateOut],
+)
+async def list_campaign_candidates(
+    promotion_id: str,
+    promotion_type: str = Query(...),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> list[CampaignCandidateOut]:
+    """Anúncios elegíveis a entrar numa campanha, com a faixa de preço por item.
+    Enriquece com sku/título/imagem do espelho pra busca + UI."""
+    cands = await service.list_campaign_candidates(promotion_id, promotion_type)
+    mlb_ids = [c["id"] for c in cands if c.get("id")]
+    meta: dict[str, Any] = {}
+    if mlb_ids:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT mlb_id, sku, title, thumbnail FROM ml_listings "
+                    "WHERE mlb_id = ANY(:ids)"
+                ),
+                {"ids": mlb_ids},
+            )
+        ).mappings()
+        meta = {r["mlb_id"]: r for r in rows}
+
+    def _f(v: Any) -> float | None:
+        return float(v) if v is not None else None
+
+    out: list[CampaignCandidateOut] = []
+    for c in cands:
+        mlb = c.get("id")
+        if not mlb:
+            continue
+        lo_raw = _f(c.get("min_discounted_price"))
+        hi_raw = _f(c.get("max_discounted_price"))
+        # ML pode nomear min/max ao contrário por tipo — normaliza pra lo<=hi.
+        lo = hi = None
+        if lo_raw is not None and hi_raw is not None:
+            lo, hi = min(lo_raw, hi_raw), max(lo_raw, hi_raw)
+        elif lo_raw is not None:
+            lo = hi = lo_raw
+        elif hi_raw is not None:
+            lo = hi = hi_raw
+        m = meta.get(mlb) or {}
+        out.append(
+            CampaignCandidateOut(
+                mlb_id=mlb,
+                sku=m.get("sku"),
+                title=m.get("title"),
+                thumbnail=m.get("thumbnail"),
+                original_price=_f(c.get("original_price")),
+                min_price=lo,
+                max_price=hi,
+                suggested_price=_f(c.get("suggested_discounted_price")),
+            )
+        )
+    return out
+
+
+@router.post("/enroll-campaign-item")
+async def enroll_campaign_item(
+    body: EnrollCampaignItemIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Inscreve UM anúncio numa campanha (SELLER_CAMPAIGN/DEAL) a um preço. O
+    front chama em loop (com pacing) pra inscrição em massa — reusa o mesmo
+    funil de _ml_write (com retry de rate-limit) do create-price-discount."""
+    from tiny_mirror.infrastructure.orm.models import MLListingORM, MLPromoCapORM
+
+    started = time.monotonic()
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    _bind_op(
+        "enroll_campaign_item",
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=body.promotion_type,
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info("promo_op.start", deal_price=_fnum(body.deal_price), promotion_id=body.promotion_id)
+
+    listing = await session.get(MLListingORM, body.mlb_id)
+    if listing is None or listing.status != "active":
+        _done(
+            "refused_inactive_listing",
+            level="warning",
+            listing_status=listing.status if listing else None,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"O anúncio não está ativo no Mercado Livre "
+                f"({listing.status if listing else 'não encontrado'}). "
+                "Inscrição só em anúncio ativo."
+            ),
+        )
+
+    result = await service.modify_promotion(
+        mlb_id=body.mlb_id,
+        deal_price=float(body.deal_price),
+        promotion_id=body.promotion_id,
+        promotion_type=body.promotion_type,
+    )
+    sc = result.get("status_code")
+    if sc is not None and sc >= 400:
+        _done(
+            "ml_rejected",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise HTTPException(status_code=sc if sc < 600 else 502, detail=result.get("response"))
+
+    ctx = await _build_decision_context(
+        session,
+        mlb_id=body.mlb_id,
+        sku=sku,
+        price_after=float(body.deal_price),
+        floor_price=float(cap.margin_floor_price) if cap and cap.margin_floor_price else None,
+        promo_type=body.promotion_type,
+        source=body.source or "bulk",
+    )
+    await MLPromoActionRepository(session).log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="enroll_campaign_item",
+        promo_type=body.promotion_type,
+        price_after=body.deal_price,
+        reason=f"inscrição na campanha {body.promotion_id} pelo operador",
+        ml_response=result,
+        dry_run=False,
+        decided_by=body.decided_by,
+        context=ctx,
+    )
+    resp = result.get("response") if isinstance(result.get("response"), dict) else {}
+    list_price = _to_dec((resp or {}).get("original_price"))
+    if list_price is None:
+        snap = await MLCostsSnapshotRepository(session).get(body.mlb_id)
+        list_price = snap.list_price if snap else None
+    await MLPromoDecisionRepository(session).upsert_started(
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=body.promotion_type,
+        target_price=body.deal_price,
+        promo_id=body.promotion_id,
+        promo_key=body.promotion_id,
+        list_price=list_price,
+        cap_pct=cap.max_seller_share_pct if cap else None,
+        floor_price=cap.margin_floor_price if cap else None,
+        reason=f"inscrito na campanha {body.promotion_id} pelo operador",
+    )
+    await session.commit()
+    _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
 

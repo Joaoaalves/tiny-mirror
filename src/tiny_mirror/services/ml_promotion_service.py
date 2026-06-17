@@ -1055,6 +1055,80 @@ class MLPromotionService:
         body = resp.json()
         return body if isinstance(body, list) else []
 
+    async def _ml_get_json(self, url: str, params: dict[str, Any], *, op: str) -> Any:
+        """Autenticated GET with one 401-refresh retry. Returns parsed JSON or
+        None on >=400 (logged). Shared by the campaign-listing reads."""
+        token = await self._token_service.get_valid_access_token()
+        resp = await self._http.get(
+            url, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=20.0
+        )
+        if resp.status_code == 401:
+            token = await self._token_service.handle_unauthorized()
+            resp = await self._http.get(
+                url, params=params, headers={"Authorization": f"Bearer {token}"}, timeout=20.0
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "ml_get_failed", op=op, url=url, status=resp.status_code, body=resp.text[:300]
+            )
+            return None
+        return resp.json()
+
+    async def list_seller_campaigns(self) -> list[dict[str, Any]]:
+        """Campanhas em que o vendedor pode INSCREVER anúncios em massa —
+        SELLER_CAMPAIGN (campanha do vendedor) e DEAL (oferta do ML). Mesmo
+        contrato de inscrição (``{promotion_id, promotion_type, deal_price}``).
+        Exclui campanhas encerradas; mantém started/pending (entráveis)."""
+        body = await self._ml_get_json(
+            f"{ML_API_BASE}/seller-promotions/users/{_settings.ml_user_id}",
+            {"app_version": "v2"},
+            op="list_seller_campaigns",
+        )
+        results = (body or {}).get("results") or [] if isinstance(body, dict) else []
+        out: list[dict[str, Any]] = []
+        for p in results:
+            if not isinstance(p, dict):
+                continue
+            if p.get("type") not in ("SELLER_CAMPAIGN", "DEAL"):
+                continue
+            if (p.get("status") or "").lower() in ("finished", "expired", "cancelled"):
+                continue
+            out.append(p)
+        return out
+
+    async def list_campaign_candidates(
+        self, promotion_id: str, promotion_type: str, *, status: str = "candidate"
+    ) -> list[dict[str, Any]]:
+        """Itens de uma campanha por status (``candidate`` = elegíveis a entrar,
+        ``started`` = já inscritos). Pagina até esgotar (ML retorna ``paging``).
+        Cada candidato traz ``original_price``, ``min_discounted_price``,
+        ``max_discounted_price`` e ``suggested_discounted_price``."""
+        url = f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items"
+        out: list[dict[str, Any]] = []
+        offset = 0
+        for _ in range(40):  # hard stop ~2000 itens
+            body = await self._ml_get_json(
+                url,
+                {
+                    "promotion_type": promotion_type,
+                    "status": status,
+                    "app_version": "v2",
+                    "limit": 50,
+                    "offset": offset,
+                },
+                op="list_campaign_candidates",
+            )
+            if not isinstance(body, dict):
+                break
+            page = body.get("results") or []
+            out.extend(r for r in page if isinstance(r, dict))
+            paging = body.get("paging") or {}
+            total = int(paging.get("total") or 0)
+            offset += 50
+            if offset >= total or not page:
+                break
+        return out
+
     async def fetch_catalog_competitors(self, catalog_product_id: str) -> list[dict[str, Any]]:
         """Lista os anúncios concorrentes de um produto de catálogo, com preços.
 
