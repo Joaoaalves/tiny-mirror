@@ -12,18 +12,22 @@ Both endpoints follow the same contract:
 
 from __future__ import annotations
 
+import hmac
+import re
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Header, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tiny_mirror.api.dependencies import get_queue_publisher
+from tiny_mirror.api.dependencies import db_session, get_queue_publisher
 from tiny_mirror.api.schemas import OrderWebhookPayload, StockWebhookPayload
 from tiny_mirror.config import settings
 from tiny_mirror.exceptions import QueueException
+from tiny_mirror.infrastructure.orm.models import MLWebhookNotificationORM
 from tiny_mirror.queue.publisher import QueuePublisher
 
 logger = structlog.get_logger(__name__)
@@ -181,6 +185,87 @@ async def receive_stock_webhook(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+@router.post("/ml-notifications", tags=["Webhooks"])
+async def receive_ml_notification(
+    request: Request,
+    session: AsyncSession = Depends(db_session),
+    x_webhook_token: str | None = Header(default=None),
+) -> JSONResponse:
+    """Recebe as notificações push do Mercado Livre (tópicos public_offers,
+    public_candidates, catalog_item_competition_status, ...).
+
+    Segurança: o ML NÃO assina as notificações, então a URL pública carrega um
+    token secreto (validado aqui em tempo constante) — sem token correto, 401.
+    Fail-closed: se o segredo não está configurado, recusa tudo. O payload é
+    tratado como NÃO confiável: só dispara um re-sync do anúncio afetado, cujos
+    dados reais vêm da API autenticada do ML (não do corpo da notificação).
+
+    Contrato com o ML: responder 200 rápido. Aqui só gravamos a notificação
+    (1 insert) e devolvemos 200; o processamento (re-sync) roda num job à parte.
+    """
+    expected = (settings.ml_webhook_token or "").strip()
+    if not expected or not x_webhook_token or not hmac.compare_digest(x_webhook_token, expected):
+        logger.warning("ml_webhook.unauthorized", has_token=bool(x_webhook_token))
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED, content={"error": "unauthorized"}
+        )
+
+    raw = await _read_json(request)
+    if raw is None:
+        logger.warning("ml_webhook: invalid JSON, acknowledged anyway")
+        return _ack()
+    topic = str(raw.get("topic") or "").strip()
+    resource = str(raw.get("resource") or "").strip()
+    if not topic or not resource:
+        logger.warning("ml_webhook: missing topic/resource", raw=raw)
+        return _ack()
+
+    user_id = raw.get("user_id")
+    # Defesa extra: ignora notificações de OUTRO vendedor (payload spoofado).
+    own = not settings.ml_user_id or user_id is None or str(user_id) == str(settings.ml_user_id)
+    row = MLWebhookNotificationORM(
+        topic=topic[:60],
+        resource=resource,
+        mlb_id=_parse_mlb_from_resource(resource),
+        ml_user_id=str(user_id) if user_id is not None else None,
+        application_id=str(raw["application_id"])
+        if raw.get("application_id") is not None
+        else None,
+        attempts=raw.get("attempts") if isinstance(raw.get("attempts"), int) else None,
+        sent_at=_parse_iso(raw.get("sent")),
+        raw=raw,
+        status="pending" if own else "ignored",
+    )
+    try:
+        session.add(row)
+        await session.commit()
+    except Exception as exc:
+        # Falha ao gravar → 503 pro ML reenviar (não perdemos a notificação).
+        logger.error("ml_webhook.store_failed", error=str(exc), topic=topic)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content={"error": "store_failed"}
+        )
+    logger.info("ml_webhook.received", topic=topic, resource=resource, own=own)
+    return _ack()
+
+
+_MLB_RE = re.compile(r"MLB\d{6,}")
+
+
+def _parse_mlb_from_resource(resource: str) -> str | None:
+    m = _MLB_RE.search(resource or "")
+    return m.group(0) if m else None
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 async def _read_json(request: Request) -> dict[str, Any] | None:
     try:
         body = await request.json()

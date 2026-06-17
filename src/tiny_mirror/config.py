@@ -89,6 +89,11 @@ class Settings(BaseSettings):
     ml_refresh_token: str = ""
     ml_access_token: str = ""
 
+    # Segredo do webhook de notificações do ML. O ML não assina as notificações,
+    # então a URL pública carrega esse token (caminho secreto) e o backend valida
+    # com comparação constante. Vazio = endpoint recusa tudo (fail-closed).
+    ml_webhook_token: str = ""
+
     sync_trigger_lock_seconds: int = 300
 
     # sync_log watchdog. Runs every N minutes via the scheduler; any sync_log

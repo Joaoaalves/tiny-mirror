@@ -1577,6 +1577,50 @@ class MLPromoResubscribeJobORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_webhook_notifications — notificações push do Mercado Livre (tempo real)
+# ---------------------------------------------------------------------------
+class MLWebhookNotificationORM(Base):
+    __tablename__ = "ml_webhook_notifications"
+    __table_args__ = (
+        Index("ix_ml_webhook_notif_pending", "status", "received_at"),
+        Index("ix_ml_webhook_notif_mlb", "mlb_id"),
+        {
+            "comment": (
+                "Fila de notificações push do ML (tópicos public_offers, "
+                "public_candidates, catalog_item_competition_status, ...). O "
+                "endpoint só grava (ack rápido) e responde 200; um job processa "
+                "depois — re-sincroniza o anúncio afetado. Idempotente por design."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    topic: Mapped[str] = mapped_column(String(60), nullable=False)
+    resource: Mapped[str] = mapped_column(Text, nullable=False)
+    mlb_id: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment="MLB extraído do resource (quando dá)."
+    )
+    ml_user_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    application_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    attempts: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment="Contador de tentativas do PRÓPRIO ML."
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        server_default=text("'pending'"),
+        comment="pending | processed | ignored | error",
+    )
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+# ---------------------------------------------------------------------------
 # fl_stock_corrections_log
 # ---------------------------------------------------------------------------
 class FLStockCorrectionLogORM(Base):
