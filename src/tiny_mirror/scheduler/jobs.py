@@ -869,13 +869,20 @@ async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any = None)
         # so the rows we just regenerated thresholds for get checked
         # against the new values in the same transaction window.
         expire_stats: dict[str, Any] = {}
+        reconcile_stats: dict[str, Any] = {}
         if promo_service is not None:
             expire_stats = await promo_service.expire_stale_decisions(session)
+            # Reconcilia as STARTED de TODOS os anúncios ativos (com ou sem cap):
+            # fecha o ponto cego do generate, que só varre SKUs com cap. Sem isto,
+            # anúncios sem cap com promoção ativa (ex.: SELLER_CAMPAIGN) somem das
+            # Inscritas e aparecem errados como "sem promoção".
+            reconcile_stats = await promo_service.reconcile_started_promos(session)
         logger.info(
             "ML promo recompute job completed",
             **refresh_stats,
             **{k: v for k, v in cap_stats.items() if k != "examples"},
             **{f"expire_{k}": v for k, v in expire_stats.items() if k != "by_reason"},
+            **{f"reconcile_{k}": v for k, v in reconcile_stats.items()},
         )
 
 

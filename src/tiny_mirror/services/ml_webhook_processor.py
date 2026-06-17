@@ -116,18 +116,32 @@ class WebhookProcessor:
                 ).scalar_one_or_none()
             resolved.append({"id": n.id, "kind": kind, "mlb": mlb, "sku": sku})
 
-        # 2a) Ofertas/candidatos → re-sync de promoções por SKU (dedupe).
-        promo_skus = {r["sku"] for r in resolved if r["kind"] == "promo" and r["sku"]}
-        synced_ok: set[str] = set()
+        # 2a) Ofertas/candidatos → reconcilia as STARTED por MLB (dedupe). Isto
+        #     cobre QUALQUER anúncio ativo, com ou sem cap/SKU — é a garantia de
+        #     visibilidade (Inscritas / "sem promoção"). O generate por SKU abaixo
+        #     é complementar (candidatas/Disponíveis dos SKUs COM cap).
+        promo_mlbs = {r["mlb"] for r in resolved if r["kind"] == "promo" and r["mlb"]}
+        reconciled_ok: set[str] = set()
+        for mlb in promo_mlbs:
+            try:
+                await self._svc.reconcile_started_promos(session, only_mlb=mlb)
+                reconciled_ok.add(mlb)
+                stats["skus_synced"] += 1
+            except Exception as exc:  # um MLB ruim não trava os outros
+                logger.error("ml_webhook.reconcile_failed", mlb=mlb, error=str(exc))
+
+        promo_skus = {
+            r["sku"]
+            for r in resolved
+            if r["kind"] == "promo" and r["sku"] and r["mlb"] in reconciled_ok
+        }
         for sku in promo_skus:
             try:
                 await self._svc.generate_pending_decisions(
                     session, only_sku=sku, refresh_active_prices=True
                 )
-                synced_ok.add(sku)
-                stats["skus_synced"] += 1
-            except Exception as exc:  # um SKU ruim não trava os outros
-                logger.error("ml_webhook.resync_failed", sku=sku, error=str(exc))
+            except Exception as exc:  # candidatas são best-effort; started já gravou
+                logger.warning("ml_webhook.resync_candidates_failed", sku=sku, error=str(exc))
 
         # 2b) Buy-box (competition) → refresh de catálogo por MLB (dedupe).
         comp_mlbs = {r["mlb"]: r["sku"] for r in resolved if r["kind"] == "comp" and r["mlb"]}
@@ -146,10 +160,10 @@ class WebhookProcessor:
         unresolved_ids: list[int] = []
         failed_ids: list[int] = []
         for r in resolved:
-            ok = (r["kind"] == "promo" and r["sku"] in synced_ok) or (
+            ok = (r["kind"] == "promo" and r["mlb"] in reconciled_ok) or (
                 r["kind"] == "comp" and r["mlb"] in refreshed_ok
             )
-            key = r["sku"] if r["kind"] == "promo" else r["mlb"]
+            key = r["mlb"]
             if key is None:
                 unresolved_ids.append(r["id"])
             elif ok:

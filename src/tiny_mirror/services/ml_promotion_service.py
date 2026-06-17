@@ -1638,6 +1638,111 @@ class MLPromotionService:
         logger.info("decisions_generated", **stats)
         return stats
 
+    async def reconcile_started_promos(
+        self,
+        session: AsyncSession,
+        *,
+        only_mlb: str | None = None,
+    ) -> dict[str, Any]:
+        """Varre TODOS os anúncios ATIVOS (independente de cap/SKU) e reconcilia
+        as promoções STARTED do ML no espelho.
+
+        Fecha o ponto cego do ``generate_pending_decisions``, que só varre SKUs
+        COM cap — anúncios sem cap (ou sem SKU mapeado) tinham promoção ativa
+        (ex.: SELLER_CAMPAIGN) que nunca virava linha 'started', sumindo das
+        Inscritas e poluindo o "sem promoção". Aqui grava as started (upsert) e
+        expira as que o ML não retorna mais. ``only_mlb`` restringe a um anúncio
+        (usado pelo webhook em tempo real).
+        """
+        from sqlalchemy import text
+
+        from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
+            MLPromoDecisionRepository,
+        )
+
+        decisions = MLPromoDecisionRepository(session)
+        snap_repo = MLCostsSnapshotRepository(session)
+
+        if only_mlb:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT mlb_id, sku FROM ml_listings WHERE mlb_id = :m AND status = 'active'"
+                    ),
+                    {"m": only_mlb},
+                )
+            ).one_or_none()
+            targets: list[tuple[str, str | None]] = [(row.mlb_id, row.sku)] if row else []
+        else:
+            targets = [
+                (r.mlb_id, r.sku)
+                for r in (
+                    await session.execute(
+                        text("SELECT mlb_id, sku FROM ml_listings WHERE status = 'active'")
+                    )
+                ).all()
+            ]
+
+        stats = {
+            "mlbs_scanned": 0,
+            "started_upserted": 0,
+            "started_expired": 0,
+            "errors": 0,
+        }
+        for mlb_id, sku in targets:
+            stats["mlbs_scanned"] += 1
+            try:
+                promos = await self.fetch_eligible_promos(mlb_id)
+            except Exception as exc:  # pragma: no cover — rede
+                stats["errors"] += 1
+                logger.debug("reconcile_started_fetch_failed", mlb_id=mlb_id, error=str(exc))
+                continue
+
+            list_price: float | None = None
+            snap = await snap_repo.get(mlb_id)
+            if snap and snap.list_price:
+                list_price = float(snap.list_price)
+            if list_price is None:
+                for p in promos:
+                    if p.get("original_price"):
+                        list_price = float(p["original_price"])
+                        break
+
+            seen_keys: set[str] = set()
+            for p in promos:
+                if (p.get("status") or "").lower() != "started":
+                    continue
+                price = _to_dec(p.get("price"))
+                if price is None or price <= 0:
+                    continue
+                promo_id = p.get("id")
+                # Mesmo esquema de chave do generate: id quando existe, senão
+                # 'CREATE-started' (seller PRICE_DISCOUNT não tem id).
+                key = (str(promo_id) if promo_id else "CREATE-started")[:80]
+                seen_keys.add(key)
+                await decisions.upsert_started(
+                    mlb_id=mlb_id,
+                    sku=sku or mlb_id,
+                    promo_type=(p.get("type") or "?"),
+                    target_price=price,
+                    promo_id=promo_id,
+                    promo_key=key,
+                    list_price=_to_dec(list_price),
+                    promo_name=p.get("name"),
+                    promo_start_date=_parse_iso_dt(p.get("start_date")),
+                    promo_finish_date=_parse_iso_dt(p.get("finish_date")),
+                    reason=f"{p.get('type')} STARTED (varredura de promoções ativas)",
+                )
+                stats["started_upserted"] += 1
+
+            # Expira started antigas que o ML não retorna mais (campanha encerrada).
+            stats["started_expired"] += await decisions.expire_disappeared_started(
+                mlb_id=mlb_id, seen_promo_keys=seen_keys
+            )
+        await session.commit()
+        logger.info("reconcile_started_done", only_mlb=only_mlb, **stats)
+        return stats
+
     async def expire_stale_decisions(
         self,
         session: AsyncSession,
