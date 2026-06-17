@@ -387,44 +387,90 @@ async def _build_decision_context(
     price_after: float | None = None,
     list_price: float | None = None,
     floor_price: float | None = None,
+    promo_type: str | None = None,
+    source: str | None = None,
 ) -> dict[str, Any]:
-    """Monta um snapshot de contexto no momento da ação para fins de automação.
+    """Snapshot RICO do contexto no momento da ação — alimenta o dataset de
+    automação (contexto → decisão).
 
-    Captura: status do catálogo, preço atual, price_to_win, momentum de
-    vendas e (quando disponíveis) margem e % de desconto calculados com
-    os dados de custo da snapshot. Todos os campos são opcionais — se a
-    query falhar por dados ausentes, o campo fica None e não bloqueia a
-    ação principal.
+    Captura tudo que pesa numa decisão de promoção pra depois aprender a política:
+    buy-box (catálogo/winner/visit_share), margem + custo, desconto, ESTOQUE +
+    cobertura, velocidade de vendas (7/30/90d + momentum), se JÁ havia promoção
+    ativa, logística e status do anúncio. Todos os campos são best-effort: uma
+    query que falha vira None e NUNCA bloqueia a ação principal.
     """
     from tiny_mirror.infrastructure.orm.models import (
         MLCatalogStatusORM,
         MLCostsSnapshotORM,
+        MLListingORM,
+        MLPromoCapORM,
     )
 
     ctx: dict[str, Any] = {
         "mlb_id": mlb_id,
         "sku": sku,
+        "promo_type": promo_type,
+        "source": source,  # 'single' | 'bulk' | etc. — como a ação foi disparada
+        # preço
         "price_before": price_before,
         "price_after": price_after,
         "list_price": list_price,
         "floor_price": floor_price,
+        "discount_pct": None,
+        # margem / custo
+        "margin_pct": None,
+        "margin_value": None,
+        "base_cost": None,
+        "commission_pct": None,
+        "cap_pct": None,
+        # catálogo / buy-box
+        "catalog_listing": None,
         "catalog_status": None,
         "current_price": None,
         "price_to_win": None,
+        "winner_price": None,
+        "visit_share": None,
+        "competitors_sharing_first_place": None,
+        # demanda
         "momentum": None,
-        "margin_pct": None,
-        "discount_pct": None,
+        "sales_7d": None,
+        "sales_30d": None,
+        "sales_90d": None,
+        "avg_daily_sales": None,
+        # estoque
+        "stock_available": None,
+        "coverage_days": None,
+        # anúncio
+        "logistic_type": None,
+        "listing_status": None,
+        "has_active_promo": None,
     }
 
     try:
-        # Catalog buy-box snapshot
+        # Catálogo / buy-box
         cat = await session.get(MLCatalogStatusORM, mlb_id)
         if cat:
+            ctx["catalog_listing"] = cat.catalog_listing
             ctx["catalog_status"] = cat.status
             ctx["current_price"] = float(cat.current_price) if cat.current_price else None
             ctx["price_to_win"] = float(cat.price_to_win) if cat.price_to_win else None
+            ctx["winner_price"] = float(cat.winner_price) if cat.winner_price else None
+            ctx["visit_share"] = cat.visit_share
+            ctx["competitors_sharing_first_place"] = cat.competitors_sharing_first_place
 
-        # Momentum from mv_coverage (materialized view — read-only, fast)
+        # Anúncio: estoque + logística + status
+        listing = await session.get(MLListingORM, mlb_id)
+        if listing:
+            ctx["stock_available"] = listing.available_quantity
+            ctx["logistic_type"] = listing.logistic_type
+            ctx["listing_status"] = listing.status
+
+        # Teto de share do vendedor (cap)
+        cap = await session.get(MLPromoCapORM, mlb_id)
+        if cap and cap.max_seller_share_pct is not None:
+            ctx["cap_pct"] = float(cap.max_seller_share_pct)
+
+        # Demanda: momentum (mv_coverage) + janelas de vendas (ml_sales_daily)
         mom_row = await session.execute(
             text("SELECT momentum_15v30 FROM mv_coverage WHERE sku = :sku LIMIT 1"),
             {"sku": sku},
@@ -433,13 +479,48 @@ async def _build_decision_context(
         if mom is not None:
             ctx["momentum"] = float(mom)
 
-        # Margin calculation from cost snapshot
+        sales = (
+            await session.execute(
+                text(
+                    "SELECT "
+                    "COALESCE(SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - 7), 0) AS d7, "
+                    "COALESCE(SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - 30), 0) AS d30, "
+                    "COALESCE(SUM(qty) FILTER (WHERE sale_date >= CURRENT_DATE - 90), 0) AS d90 "
+                    "FROM ml_sales_daily WHERE mlb_id = :mlb"
+                ),
+                {"mlb": mlb_id},
+            )
+        ).one_or_none()
+        if sales is not None:
+            ctx["sales_7d"] = int(sales.d7 or 0)
+            ctx["sales_30d"] = int(sales.d30 or 0)
+            ctx["sales_90d"] = int(sales.d90 or 0)
+            avg = (sales.d90 or 0) / 90.0
+            ctx["avg_daily_sales"] = round(avg, 3)
+            if avg > 0 and ctx["stock_available"] is not None:
+                ctx["coverage_days"] = round(float(ctx["stock_available"]) / avg, 1)
+
+        # Já tinha promoção ativa? (linhas 'started' não expiradas no espelho)
+        active = await session.execute(
+            text(
+                "SELECT COUNT(*) FROM ml_promo_decisions "
+                "WHERE mlb_id = :mlb AND constraint_used = 'started' "
+                "AND status NOT IN ('expired', 'rejected')"
+            ),
+            {"mlb": mlb_id},
+        )
+        ctx["has_active_promo"] = (active.scalar_one_or_none() or 0) > 0
+
+        # Margem + desconto a partir do custo
         cost = await session.get(MLCostsSnapshotORM, mlb_id)
         ref_price = price_after or price_before or ctx["current_price"]
+        if cost and cost.base_cost is not None:
+            ctx["base_cost"] = float(cost.base_cost)
+        if cost and cost.commission_pct is not None:
+            ctx["commission_pct"] = float(cost.commission_pct)
         if cost and ref_price and cost.base_cost and cost.commission_pct:
             p = float(ref_price)
             commission = p * float(cost.commission_pct) / 100
-            difal = 0.0  # difal_pct not in snapshot; margin may be slightly overstated
             freight = 0.0
             if cost.freight_bands:
                 for band in cost.freight_bands:
@@ -448,10 +529,11 @@ async def _build_decision_context(
                     if p >= b_min and (b_max is None or p <= float(b_max)):
                         freight = float(band.get("cost", 0))
                         break
-            net = p - float(cost.base_cost) - commission - difal - freight
+            net = p - float(cost.base_cost) - commission - freight
+            ctx["margin_value"] = round(net, 2)
             ctx["margin_pct"] = round((net / p) * 100, 2) if p else None
 
-        # Discount % vs list price
+        # Desconto % vs preço de tabela
         lp = list_price or (float(cost.list_price) if cost and cost.list_price else None)
         if lp and ref_price:
             ctx["discount_pct"] = round(((lp - float(ref_price)) / lp) * 100, 2)
@@ -1778,6 +1860,9 @@ class CreatePriceDiscountIn(BaseModel):
     mlb_id: str
     deal_price: Decimal = Field(gt=0)
     decided_by: str | None = None
+    # Como a ação foi disparada (ex.: 'single' | 'bulk') — capturado no contexto
+    # de automação pra distinguir criação individual de criação em massa.
+    source: str | None = None
     # Vigência do desconto — formato LOCAL "YYYY-MM-DDTHH:MM:SS" (o ML usa só a
     # data). Opcional: o serviço usa hoje → +30d quando ausente.
     start_date: str | None = None
@@ -1855,6 +1940,8 @@ async def create_price_discount_direct(
         sku=sku,
         price_after=float(body.deal_price),
         floor_price=float(cap.margin_floor_price) if cap and cap.margin_floor_price else None,
+        promo_type="PRICE_DISCOUNT",
+        source=body.source or "single",
     )
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
@@ -2005,6 +2092,7 @@ class ExitPromoIn(BaseModel):
     promo_type: str | None = None
     promo_id: str | None = None
     decided_by: str | None = None
+    source: str | None = None  # 'single' | 'bulk' — capturado no contexto
 
 
 @router.post("/exit-promotion")
@@ -2113,6 +2201,11 @@ async def exit_promotion_endpoint(
         )
     # Promoção confirmada fora (ou DELETE 404/idempotente) → sucesso.
 
+    # Snapshot de contexto pra automação: o "porquê" da saída (ex.: ganhando o
+    # catálogo, margem baixa, estoque acabando) fica capturado pra aprender.
+    ctx = await _build_decision_context(
+        session, mlb_id=body.mlb_id, sku=sku, promo_type=body.promo_type, source=body.source
+    )
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
         sku=sku,
@@ -2123,6 +2216,7 @@ async def exit_promotion_endpoint(
         ml_response={"exit": result},
         dry_run=False,
         decided_by=body.decided_by,
+        context=ctx,
     )
     # Tira a linha 'started' do espelho imediatamente pra ela sair de 'Inscritas'
     # antes do re-sync diário (a escrita no ML não toca no nosso espelho).
@@ -2200,6 +2294,7 @@ async def activate_smart_endpoint(
                 "sent_body": result.get("sent_body"),
             },
         )
+    ctx = await _build_decision_context(session, mlb_id=body.mlb_id, sku=sku, promo_type=pt)
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
         sku=sku,
@@ -2210,6 +2305,7 @@ async def activate_smart_endpoint(
         ml_response={"enroll": result},
         dry_run=False,
         decided_by=body.decided_by,
+        context=ctx,
     )
     await session.commit()
     _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
@@ -2464,8 +2560,10 @@ async def modify_promotion_endpoint(
         session,
         mlb_id=body.mlb_id,
         sku=sku,
+        price_before=_fnum(body.current_price),
         price_after=float(body.new_price),
         floor_price=float(cap.margin_floor_price) if cap and cap.margin_floor_price else None,
+        promo_type=promo_type,
     )
     action_repo = MLPromoActionRepository(session)
     await action_repo.log(
