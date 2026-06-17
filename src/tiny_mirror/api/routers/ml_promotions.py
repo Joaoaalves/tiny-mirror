@@ -166,6 +166,12 @@ class CapOut(BaseModel):
     listing_title: str | None = None
     listing_thumbnail: str | None = None
     permalink: str | None = None
+    # Estoque por depósito (vindo de stock_deposits via SKU). O front escolhe
+    # qual exibir pelo logistic_type: FLEX → galpão (warehouse_available);
+    # FULFILLMENT → Full (full_available) + a caminho (full_in_transit).
+    warehouse_available: int | None = None
+    full_available: int | None = None
+    full_in_transit: int | None = None
     # Full listing price on ML (item.price). The displayed "preço cheio" —
     # product price comes from ML, not the planilha.
     ml_list_price: Decimal | None = None
@@ -585,6 +591,49 @@ async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tupl
     return apply_flex_calibration(logistic_type, base_comm, base_bands, calib)
 
 
+_FULL_DEPOSIT_NAME = "Full Mercado Livre"
+
+
+async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, dict[str, int]]:
+    """Estoque por SKU separado em galpão vs Full, a partir de ``stock_deposits``
+    (juntado por ``stock.sku``). Para um anúncio FLEX exibimos o galpão (soma dos
+    depósitos não-Full, não-ignorados); para FULFILLMENT exibimos o Full
+    (``available``) + o que está a caminho (``in_transfer``). Uma query só."""
+    skus = list({s for s in skus if s})
+    if not skus:
+        return {}
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT s.sku, "
+                    "COALESCE(SUM(sd.available) FILTER (WHERE sd.deposit_name = :full), 0) "
+                    "  AS full_available, "
+                    "COALESCE(SUM(sd.in_transfer) FILTER (WHERE sd.deposit_name = :full), 0) "
+                    "  AS full_in_transit, "
+                    "COALESCE(SUM(sd.available) FILTER "
+                    "  (WHERE sd.deposit_name <> :full AND NOT sd.ignore), 0) "
+                    "  AS warehouse_available "
+                    "FROM stock s JOIN stock_deposits sd "
+                    "  ON sd.product_tiny_id = s.product_tiny_id "
+                    "WHERE s.sku = ANY(:skus) GROUP BY s.sku"
+                ),
+                {"skus": skus, "full": _FULL_DEPOSIT_NAME},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        r["sku"]: {
+            "full_available": int(r["full_available"]),
+            "full_in_transit": int(r["full_in_transit"]),
+            "warehouse_available": int(r["warehouse_available"]),
+        }
+        for r in rows
+    }
+
+
 async def _enrich_cap(
     session: AsyncSession,
     cap: Any,
@@ -648,6 +697,12 @@ async def _enrich_cap(
         out.has_active_listing = listing.status == "active"
     else:
         out.has_active_listing = False
+
+    st = (await _stock_by_skus(session, [cap.sku])).get(cap.sku)
+    if st is not None:
+        out.warehouse_available = st["warehouse_available"]
+        out.full_available = st["full_available"]
+        out.full_in_transit = st["full_in_transit"]
 
     cat = (
         await session.execute(
@@ -1960,6 +2015,10 @@ class CampaignCandidateOut(BaseModel):
     sku: str | None = None
     title: str | None = None
     thumbnail: str | None = None
+    logistic_type: str | None = None
+    warehouse_available: int | None = None
+    full_available: int | None = None
+    full_in_transit: int | None = None
     original_price: float | None = None
     min_price: float | None = None  # menor preço permitido (maior desconto)
     max_price: float | None = None  # maior preço permitido (menor desconto)
@@ -2122,17 +2181,19 @@ async def list_campaign_candidates(
     cands = await service.list_campaign_candidates(promotion_id, promotion_type)
     mlb_ids = [c["id"] for c in cands if c.get("id")]
     meta: dict[str, Any] = {}
+    stock_by_sku: dict[str, dict[str, int]] = {}
     if mlb_ids:
         rows = (
             await session.execute(
                 text(
-                    "SELECT mlb_id, sku, title, thumbnail FROM ml_listings "
+                    "SELECT mlb_id, sku, title, thumbnail, logistic_type FROM ml_listings "
                     "WHERE mlb_id = ANY(:ids)"
                 ),
                 {"ids": mlb_ids},
             )
         ).mappings()
         meta = {r["mlb_id"]: r for r in rows}
+        stock_by_sku = await _stock_by_skus(session, [m["sku"] for m in meta.values() if m["sku"]])
 
     def _f(v: Any) -> float | None:
         return float(v) if v is not None else None
@@ -2153,12 +2214,18 @@ async def list_campaign_candidates(
         elif hi_raw is not None:
             lo = hi = hi_raw
         m = meta.get(mlb) or {}
+        m_sku = m.get("sku")
+        st = stock_by_sku.get(m_sku) if m_sku else None
         out.append(
             CampaignCandidateOut(
                 mlb_id=mlb,
                 sku=m.get("sku"),
                 title=m.get("title"),
                 thumbnail=m.get("thumbnail"),
+                logistic_type=m.get("logistic_type"),
+                warehouse_available=st["warehouse_available"] if st else None,
+                full_available=st["full_available"] if st else None,
+                full_in_transit=st["full_in_transit"] if st else None,
                 original_price=_f(c.get("original_price")),
                 min_price=lo,
                 max_price=hi,
