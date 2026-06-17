@@ -14,7 +14,7 @@ inofensivo, então duplicatas/reenvios do ML não causam problema.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -49,6 +49,11 @@ def _is_promo_topic(topic: str) -> bool:
     return t in _PROMO_TOPICS or any(k in t for k in _PROMO_KEYWORDS)
 
 
+def _is_competition_topic(topic: str) -> bool:
+    """Buy-box do catálogo (ganhando/perdendo) → refresh de catálogo, não promo."""
+    return "competition" in (topic or "").lower()
+
+
 class WebhookProcessor:
     """Drena ``ml_webhook_notifications`` re-sincronizando os anúncios afetados."""
 
@@ -56,15 +61,17 @@ class WebhookProcessor:
         self,
         *,
         promotion_service: MLPromotionService,
+        catalog_service: Any,
         token_service: Any,
         http_client: Any,
     ) -> None:
         self._svc = promotion_service
+        self._catalog = catalog_service
         self._token = token_service
         self._http = http_client
 
     async def process_pending(
-        self, session: AsyncSession, *, batch_limit: int = 200
+        self, session: AsyncSession, *, batch_limit: int = 200, retention_days: int = 7
     ) -> dict[str, int]:
         pending = list(
             (
@@ -79,23 +86,26 @@ class WebhookProcessor:
         stats = {
             "pending": len(pending),
             "skus_synced": 0,
+            "catalog_refreshed": 0,
             "processed": 0,
             "errors": 0,
             "unresolved": 0,
             "ignored": 0,
         }
         if not pending:
+            stats["deleted_old"] = await self._cleanup(session, retention_days)
             return stats
 
-        # Separa os tópicos de promoção (que re-sincronizam) dos demais (ignorados).
-        promo = [n for n in pending if _is_promo_topic(n.topic)]
         ignored_ids = [n.id for n in pending if not _is_promo_topic(n.topic)]
+        promo = [n for n in pending if _is_promo_topic(n.topic)]
 
-        # 1) Resolve (id da notificação → SKU). Lê tudo do ORM AGORA, antes de
-        #    qualquer commit do generate (que expira os objetos).
-        items: list[tuple[int, str | None]] = []
-        skus: set[str] = set()
+        # 1) PRÉ-RESOLVE tudo (só leituras, sem commit) — captura em dados puros
+        #    pra não tocar nos objetos ORM depois que os commits abaixo os expiram.
+        #    kind: 'comp' (buy-box → refresh de catálogo) | 'promo' (oferta/candidato
+        #    → re-sync de promoções).
+        resolved: list[dict[str, Any]] = []
         for n in promo:
+            kind = "comp" if _is_competition_topic(n.topic) else "promo"
             mlb = n.mlb_id or await self._resolve_mlb(n.resource)
             sku: str | None = None
             if mlb:
@@ -104,14 +114,12 @@ class WebhookProcessor:
                         text("SELECT sku FROM ml_listings WHERE mlb_id = :m"), {"m": mlb}
                     )
                 ).scalar_one_or_none()
-            items.append((n.id, sku))
-            if sku:
-                skus.add(sku)
+            resolved.append({"id": n.id, "kind": kind, "mlb": mlb, "sku": sku})
 
-        # 2) Re-sincroniza cada SKU afetado UMA vez (dedupe). refresh_active_prices
-        #    pra atualizar preço das started já conhecidas também.
+        # 2a) Ofertas/candidatos → re-sync de promoções por SKU (dedupe).
+        promo_skus = {r["sku"] for r in resolved if r["kind"] == "promo" and r["sku"]}
         synced_ok: set[str] = set()
-        for sku in skus:
+        for sku in promo_skus:
             try:
                 await self._svc.generate_pending_decisions(
                     session, only_sku=sku, refresh_active_prices=True
@@ -121,14 +129,38 @@ class WebhookProcessor:
             except Exception as exc:  # um SKU ruim não trava os outros
                 logger.error("ml_webhook.resync_failed", sku=sku, error=str(exc))
 
-        # 3) Marca as notificações pelo desfecho do SEU SKU.
-        processed_ids = [i for i, s in items if s is not None and s in synced_ok]
-        unresolved_ids = [i for i, s in items if s is None]
-        failed_ids = [i for i, s in items if s is not None and s not in synced_ok]
+        # 2b) Buy-box (competition) → refresh de catálogo por MLB (dedupe).
+        comp_mlbs = {r["mlb"]: r["sku"] for r in resolved if r["kind"] == "comp" and r["mlb"]}
+        refreshed_ok: set[str] = set()
+        for mlb, sku in comp_mlbs.items():
+            try:
+                st = await self._catalog.refresh_one(session, mlb, sku)
+                if st is not None:
+                    refreshed_ok.add(mlb)
+                    stats["catalog_refreshed"] += 1
+            except Exception as exc:
+                logger.error("ml_webhook.catalog_refresh_failed", mlb=mlb, error=str(exc))
+
+        # 3) Classifica cada notificação pelo desfecho do seu alvo.
+        processed_ids: list[int] = []
+        unresolved_ids: list[int] = []
+        failed_ids: list[int] = []
+        for r in resolved:
+            ok = (r["kind"] == "promo" and r["sku"] in synced_ok) or (
+                r["kind"] == "comp" and r["mlb"] in refreshed_ok
+            )
+            key = r["sku"] if r["kind"] == "promo" else r["mlb"]
+            if key is None:
+                unresolved_ids.append(r["id"])
+            elif ok:
+                processed_ids.append(r["id"])
+            else:
+                failed_ids.append(r["id"])
+
         now = datetime.now(UTC)
         for ids, st, note in (
             (processed_ids, "processed", None),
-            (failed_ids, "error", "resync falhou"),
+            (failed_ids, "error", "re-sync/refresh falhou"),
             (unresolved_ids, "error", "MLB/SKU não resolvido a partir da notificação"),
             (ignored_ids, "ignored", "tópico não-promo"),
         ):
@@ -143,8 +175,26 @@ class WebhookProcessor:
         stats["errors"] = len(failed_ids)
         stats["unresolved"] = len(unresolved_ids)
         stats["ignored"] = len(ignored_ids)
+        stats["deleted_old"] = await self._cleanup(session, retention_days)
         logger.info("ml_webhook.process_done", **stats)
         return stats
+
+    async def _cleanup(self, session: AsyncSession, retention_days: int) -> int:
+        """Apaga notificações já resolvidas mais velhas que ``retention_days`` —
+        mantém a tabela enxuta (o ML manda MUITA notificação). Nunca toca em
+        pending. Retorna quantas removeu."""
+        if retention_days <= 0:
+            return 0
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        res = await session.execute(
+            text(
+                "DELETE FROM ml_webhook_notifications "
+                "WHERE status <> 'pending' AND received_at < :c"
+            ),
+            {"c": cutoff},
+        )
+        await session.commit()
+        return int(res.rowcount or 0)  # type: ignore[attr-defined]
 
     async def _resolve_mlb(self, resource: str) -> str | None:
         """Quando o resource não traz o MLB no texto (ex.: candidatos), faz um GET

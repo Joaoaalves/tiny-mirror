@@ -978,17 +978,24 @@ async def ml_webhook_process_job(http_client: Any, ml_token_service: Any) -> Non
         logger.debug("ML webhook process skipped: ML token / http not configured")
         return
 
+    from tiny_mirror.services.catalog_status_sync_service import CatalogStatusSyncService
     from tiny_mirror.services.ml_promotion_service import MLPromotionService
     from tiny_mirror.services.ml_webhook_processor import WebhookProcessor
 
     promo_service = MLPromotionService(token_service=ml_token_service, http_client=http_client)
+    catalog_service = CatalogStatusSyncService(
+        token_service=ml_token_service, http_client=http_client
+    )
     processor = WebhookProcessor(
         promotion_service=promo_service,
+        catalog_service=catalog_service,
         token_service=ml_token_service,
         http_client=http_client,
     )
     async with AsyncSessionLocal() as session:
-        stats = await processor.process_pending(session)
+        stats = await processor.process_pending(
+            session, retention_days=settings.ml_webhook_retention_days
+        )
     if stats.get("pending"):
         logger.info("ML webhook process job completed", **stats)
 

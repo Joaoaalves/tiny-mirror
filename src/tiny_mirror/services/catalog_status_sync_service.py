@@ -60,6 +60,44 @@ def _normalise_status(raw: Any) -> str | None:
     return s if s in _KNOWN_STATUSES else "unknown"
 
 
+def _row_from_body(mlb_id: str, sku: str | None, body: dict[str, Any]) -> dict[str, Any]:
+    """Linha de ml_catalog_status a partir do /price_to_win (HTTP 200)."""
+    catalog_product_id = body.get("catalog_product_id")
+    winner = body.get("winner") or {}
+    return {
+        "mlb_id": mlb_id,
+        "sku": sku,
+        "catalog_listing": catalog_product_id is not None,
+        "catalog_product_id": catalog_product_id,
+        "status": _normalise_status(body.get("status")),
+        "visit_share": body.get("visit_share"),
+        "current_price": _to_dec(body.get("current_price")),
+        "price_to_win": _to_dec(body.get("price_to_win")),
+        "winner_item_id": winner.get("item_id"),
+        "winner_price": _to_dec(winner.get("price")),
+        "competitors_sharing_first_place": body.get("competitors_sharing_first_place"),
+        "boosts": body.get("boosts"),
+    }
+
+
+def _not_listed_row(mlb_id: str, sku: str | None) -> dict[str, Any]:
+    """Linha pra anúncio fora de catálogo (HTTP 404 no /price_to_win)."""
+    return {
+        "mlb_id": mlb_id,
+        "sku": sku,
+        "catalog_listing": False,
+        "catalog_product_id": None,
+        "status": "not_listed",
+        "visit_share": None,
+        "current_price": None,
+        "price_to_win": None,
+        "winner_item_id": None,
+        "winner_price": None,
+        "competitors_sharing_first_place": None,
+        "boosts": None,
+    }
+
+
 class CatalogStatusSyncService:
     """Reads /items/{MLB}/price_to_win for every active MLB and upserts
     the resulting row into ``ml_catalog_status``.
@@ -127,46 +165,17 @@ class CatalogStatusSyncService:
         for i, (mlb_id, sku) in enumerate(listings):
             body, http_status = await self._fetch_one(mlb_id)
             if http_status == 200 and body:
-                catalog_product_id = body.get("catalog_product_id")
-                is_catalog = catalog_product_id is not None
-                if is_catalog:
+                row = _row_from_body(mlb_id, sku, body)
+                if row["catalog_listing"]:
                     stats["in_catalog"] += 1
-                norm_status = _normalise_status(body.get("status"))
-                if norm_status in {"winning", "sharing_first_place", "competing", "losing"}:
-                    stats[norm_status] += 1
+                ns = row["status"]
+                if ns in {"winning", "sharing_first_place", "competing", "losing"}:
+                    stats[ns] += 1
                 else:
                     stats["other_status"] += 1
-                winner = body.get("winner") or {}
-                row = {
-                    "mlb_id": mlb_id,
-                    "sku": sku,
-                    "catalog_listing": is_catalog,
-                    "catalog_product_id": catalog_product_id,
-                    "status": norm_status,
-                    "visit_share": body.get("visit_share"),
-                    "current_price": _to_dec(body.get("current_price")),
-                    "price_to_win": _to_dec(body.get("price_to_win")),
-                    "winner_item_id": winner.get("item_id"),
-                    "winner_price": _to_dec(winner.get("price")),
-                    "competitors_sharing_first_place": body.get("competitors_sharing_first_place"),
-                    "boosts": body.get("boosts"),
-                }
             elif http_status == 404:
                 stats["not_listed_404"] += 1
-                row = {
-                    "mlb_id": mlb_id,
-                    "sku": sku,
-                    "catalog_listing": False,
-                    "catalog_product_id": None,
-                    "status": "not_listed",
-                    "visit_share": None,
-                    "current_price": None,
-                    "price_to_win": None,
-                    "winner_item_id": None,
-                    "winner_price": None,
-                    "competitors_sharing_first_place": None,
-                    "boosts": None,
-                }
+                row = _not_listed_row(mlb_id, sku)
             else:
                 stats["errors"] += 1
                 # Don't touch the existing row on transient errors — skip.
@@ -186,3 +195,26 @@ class CatalogStatusSyncService:
         await session.commit()
         logger.info("catalog_status_sync_completed", **stats)
         return stats
+
+    async def refresh_one(self, session: AsyncSession, mlb_id: str, sku: str | None) -> str | None:
+        """Atualiza o status de catálogo de UM anúncio (usado pelo webhook em
+        tempo real, no tópico de competição do buy-box). Faz upsert e commit.
+        Retorna o status ('winning'/'losing'/'competing'/'not_listed'/...) ou
+        None se o ML deu erro transitório (mantém a linha existente)."""
+        body, http_status = await self._fetch_one(mlb_id)
+        if http_status == 200 and body:
+            row = _row_from_body(mlb_id, sku, body)
+        elif http_status == 404:
+            row = _not_listed_row(mlb_id, sku)
+        else:
+            return None
+        update_set = {k: v for k, v in row.items() if k != "mlb_id"}
+        update_set["fetched_at"] = func.now()
+        await session.execute(
+            pg_insert(MLCatalogStatusORM)
+            .values(**row)
+            .on_conflict_do_update(index_elements=["mlb_id"], set_=update_set)
+        )
+        await session.commit()
+        status = row["status"]
+        return status if isinstance(status, str) else None

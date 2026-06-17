@@ -184,6 +184,9 @@ class Settings(BaseSettings):
     # ml_webhook_notifications pendentes e re-sincroniza as promoções dos anúncios
     # afetados → Disponíveis/Inscritas quase em tempo real.
     sync_ml_webhook_process_cron: str = "*/1 * * * *"
+    # Retenção da tabela de notificações: o processador apaga as já resolvidas
+    # mais velhas que isso (o ML manda muita notificação). pending nunca é tocado.
+    ml_webhook_retention_days: int = 7
     ml_promo_resubscribe_poll_interval_seconds: int = 300
     ml_promo_resubscribe_deadline_hours: int = 24
 

@@ -48,7 +48,12 @@ def _processor(http: object) -> WebhookProcessor:
     token = MagicMock()
     token.get_valid_access_token = AsyncMock(return_value="tok")
     token.handle_unauthorized = AsyncMock(return_value="tok2")
-    return WebhookProcessor(promotion_service=MagicMock(), token_service=token, http_client=http)
+    return WebhookProcessor(
+        promotion_service=MagicMock(),
+        catalog_service=MagicMock(),
+        token_service=token,
+        http_client=http,
+    )
 
 
 @pytest.mark.asyncio
