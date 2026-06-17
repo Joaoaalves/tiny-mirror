@@ -1601,18 +1601,32 @@ class MLPromotionService:
                             stats["decisions_active_inserted"] += 1
                     else:
                         stats["decisions_skipped_existing"] += 1
-                        # Linha já existia: a inserção idempotente NÃO atualiza o
-                        # preço. Quando pedido, força o preço da linha 'started'
-                        # a bater com o valor vivo do ML (corrige promos cujo
-                        # preço mudou desde o último generate).
-                        if refresh_active_prices and entry.get("constraint") == "started":
-                            tp = _to_dec(entry.get("target_price"))
-                            if tp is not None:
-                                stats[
-                                    "active_prices_refreshed"
-                                ] += await decisions.update_started_price(
-                                    mlb_id=mlb_id, new_price=tp, promo_id=key_now
-                                )
+                        # Linha já existia mas a inserção idempotente NÃO a atualiza.
+                        # Se o ML diz que está STARTED, RECONCILIA a linha pra
+                        # 'started' com o preço vivo. Cobre dois casos críticos:
+                        #  (a) campanha que o operador APROVOU — ficava com
+                        #      constraint 'suggested_within_interval'/status
+                        #      'approved' e SUMIA das Inscritas (que filtram
+                        #      'started'), mesmo estando ativa no ML;
+                        #  (b) mantém o preço das started em dia com o ML.
+                        tp = _to_dec(entry.get("target_price"))
+                        if entry.get("constraint") == "started" and tp is not None and tp > 0:
+                            await decisions.upsert_started(
+                                mlb_id=mlb_id,
+                                sku=sku,
+                                promo_type=entry.get("promo_type") or "?",
+                                target_price=tp,
+                                promo_id=promo_id,
+                                promo_key=key_now,
+                                list_price=Decimal(str(list_price)),
+                                cap_pct=cap.max_seller_share_pct,
+                                floor_price=cap.margin_floor_price,
+                                promo_name=entry.get("promo_name"),
+                                promo_start_date=start_dt,
+                                promo_finish_date=finish_dt,
+                                reason=entry.get("reason") or "",
+                            )
+                            stats["active_prices_refreshed"] += 1
 
                 # MLB consultado com sucesso: expira as STARTED antigas que o ML
                 # não retorna mais (campanha encerrada). Só roda pra MLBs que
