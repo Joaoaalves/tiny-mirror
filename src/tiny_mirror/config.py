@@ -179,6 +179,11 @@ class Settings(BaseSettings):
     #   - poll_interval_seconds: min gap between re-checks of the SAME job;
     #   - deadline_hours: give up + alert after this long without success.
     sync_ml_promo_resubscribe_cron: str = "*/5 * * * *"
+
+    # Processador das notificações push do ML (webhook fase 1b): a cada minuto, lê
+    # ml_webhook_notifications pendentes e re-sincroniza as promoções dos anúncios
+    # afetados → Disponíveis/Inscritas quase em tempo real.
+    sync_ml_webhook_process_cron: str = "*/1 * * * *"
     ml_promo_resubscribe_poll_interval_seconds: int = 300
     ml_promo_resubscribe_deadline_hours: int = 24
 

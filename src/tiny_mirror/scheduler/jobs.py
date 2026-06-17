@@ -127,6 +127,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_promo_resubscribe": CronTrigger.from_crontab(
                 settings.sync_ml_promo_resubscribe_cron, timezone="UTC"
             ),
+            "ml_webhook_process": CronTrigger.from_crontab(
+                settings.sync_ml_webhook_process_cron, timezone="UTC"
+            ),
         }
     except ValueError as exc:
         logger.critical(
@@ -204,6 +207,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_promo_resubscribe() -> None:
         await ml_promo_resubscribe_job(http_client, app.state.ml_token_service)
+
+    async def _ml_webhook_process() -> None:
+        await ml_webhook_process_job(http_client, app.state.ml_token_service)
 
     scheduler.add_job(
         _token_rotation,
@@ -329,6 +335,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_promo_resubscribe,
         trigger=triggers["ml_promo_resubscribe"],
         id="ml_promo_resubscribe",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_webhook_process,
+        trigger=triggers["ml_webhook_process"],
+        id="ml_webhook_process",
         replace_existing=True,
     )
 
@@ -958,6 +970,29 @@ async def ml_promo_resubscribe_job(http_client: Any, ml_token_service: Any) -> N
         logger.info("ML promo resubscribe job completed", **stats)
 
 
+async def ml_webhook_process_job(http_client: Any, ml_token_service: Any) -> None:
+    """A cada minuto: processa as notificações push do ML pendentes
+    (ml_webhook_notifications), re-sincronizando as promoções dos anúncios
+    afetados — Disponíveis/Inscritas quase em tempo real. No-op sem credenciais."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML webhook process skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.services.ml_promotion_service import MLPromotionService
+    from tiny_mirror.services.ml_webhook_processor import WebhookProcessor
+
+    promo_service = MLPromotionService(token_service=ml_token_service, http_client=http_client)
+    processor = WebhookProcessor(
+        promotion_service=promo_service,
+        token_service=ml_token_service,
+        http_client=http_client,
+    )
+    async with AsyncSessionLocal() as session:
+        stats = await processor.process_pending(session)
+    if stats.get("pending"):
+        logger.info("ML webhook process job completed", **stats)
+
+
 async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> None:
     """Poll ML INBOUND_RECEPTION and mark pending fulfillment transfers as received."""
     from tiny_mirror.services.fulfillment_reception_service import FulfillmentReceptionService
@@ -992,6 +1027,7 @@ __all__ = [
     "ml_listings_sync_job",
     "ml_promo_recompute_job",
     "ml_promo_resubscribe_job",
+    "ml_webhook_process_job",
     "orders_reconciliation_job",
     "orders_sync_job",
     "products_sync_job",
