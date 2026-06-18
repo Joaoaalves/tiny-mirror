@@ -207,11 +207,18 @@ class FulfillmentReceptionService:
                     if inventory_id:
                         inventory_map.setdefault(sku, []).append((inventory_id, 1))
 
-            # Bug-4 fallback: SKUs with no direct FL inventory but kit-FL
-            # parents. Pull parent kit listings + their inventories along
-            # with the per-kit component quantity. Multiplier = comp_per_kit.
-            skus_without_direct = [s for s in sku_list if s not in inventory_map]
-            if skus_without_direct:
+            # Kit-parent inventories (with multiplier = comp_per_kit). Run for
+            # EVERY SKU, not only those without a direct FL inventory: a
+            # kit-component like RTA-GAV6-P is sold standalone (own inventory)
+            # AND inside kits, so a kit shipment inflates the component's Tiny
+            # FL deposit and creates a component transfer whose units physically
+            # land on the PARENT kit's inventory. Checking only the component's
+            # own inventory left those transfers pending forever (759 sent / 33
+            # received on RTA-GAV6-P). We union both inventory sources; per-SKU
+            # FIFO matching caps crediting at the transfer qty, so the distinct
+            # own- vs parent-inventory events never double-credit.
+            skus_with_parents = sku_list
+            if skus_with_parents:
                 from sqlalchemy import text
 
                 parent_rows = (
@@ -237,7 +244,7 @@ class FulfillmentReceptionService:
                               AND ml.status IN ('active', 'paused')
                             """
                         ),
-                        {"sku_list": skus_without_direct},
+                        {"sku_list": skus_with_parents},
                     )
                 ).all()
 
