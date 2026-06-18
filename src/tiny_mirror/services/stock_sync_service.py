@@ -84,6 +84,12 @@ ML_FULL_DEPOSIT_NAME = "Full Mercado Livre"
 # because Tiny did not return a "Full Mercado Livre" deposit at all.
 # Real Tiny deposit IDs are positive — 0 is safe as a sentinel.
 ML_FULL_DEPOSIT_SENTINEL_ID = 0
+# not_available_detail statuses that are units PHYSICALLY AT the CD and becoming
+# available to sell within hours — counted into the effective FL stock
+# (in_transfer). 'transfer' = ML moving units between its own warehouses;
+# 'internalProcess' = receiving/processing a just-arrived batch. EXCLUDES
+# 'withdrawal' (units leaving Full back to the seller — not sellable).
+ML_FULL_EFFECTIVE_STATUSES = frozenset({"transfer", "internalProcess"})
 
 
 class StockSyncService:
@@ -688,8 +694,9 @@ class StockSyncService:
     async def _fl_breakdown_for_sku(self, sku: str) -> tuple[int, int] | None:
         """Return ``(available, in_transfer)`` for a SKU's FL inventories.
 
-        Sums available_quantity and not_available_detail[status=transfer]
-        qty across every fulfillment inventory_id mapped to the SKU.
+        Sums available_quantity and the effective not_available_detail qty
+        (status in {transfer, internalProcess}) across every fulfillment
+        inventory_id mapped to the SKU.
         Returns None when no fulfillment listing exists (treat as "unknown"),
         ``(0, 0)`` when listing(s) exist but resolve to no inventory.
         """
@@ -738,13 +745,13 @@ class StockSyncService:
         for inv_id in inv_ids:
             stock_data = await self._ml.get_inventory_stock(inv_id)
             available += int(stock_data.get("available_quantity") or 0)
-            # not_available_detail is an array of {status, quantity}.
-            # status='transfer' = ML moving units between its own warehouses;
-            # the units are still at FL and become available again within
-            # hours. Other statuses (rare in 2026-05 sample, mostly nil) we
-            # treat as truly unavailable.
+            # not_available_detail is an array of {status, quantity}. We count
+            # the statuses that are still AT the CD and become available within
+            # hours ('transfer' + 'internalProcess' = receiving a just-arrived
+            # batch) into the effective FL stock. 'withdrawal' (leaving Full)
+            # and other terminal statuses are excluded.
             for det in stock_data.get("not_available_detail") or []:
-                if isinstance(det, dict) and det.get("status") == "transfer":
+                if isinstance(det, dict) and det.get("status") in ML_FULL_EFFECTIVE_STATUSES:
                     in_transfer += int(det.get("quantity") or 0)
         return (available, in_transfer)
 
