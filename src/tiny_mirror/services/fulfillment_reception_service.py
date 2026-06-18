@@ -386,8 +386,12 @@ class FulfillmentReceptionService:
               shipped reach FL via the parent kit's MLB inventory.
 
         SKUs with **zero** ml_listings rows AND no FL-listed parent kit are
-        deliberately *not* cancelled here either: still safer to leave
-        them pending for operator review.
+        ALSO cancelled (policy change 2026-06-18): with no FL listing and no
+        FL parent kit a unit has no Full channel to arrive on, so the transfer
+        is phantom and would inflate the reposição coverage forever. The webhook
+        only creates transfers when the SKU has an FL listing at lance time
+        (``fl_rows > 0`` guard), so a no-FL-channel pending row is always stale
+        legacy/test garbage — never a fresh real transfer.
         """
         from sqlalchemy import text
 
@@ -398,9 +402,6 @@ class FulfillmentReceptionService:
                     SELECT ft.id, ft.product_sku
                     FROM fulfillment_transfers ft
                     WHERE ft.status = 'pending'
-                      AND EXISTS (
-                          SELECT 1 FROM ml_listings ml WHERE ml.sku = ft.product_sku
-                      )
                       AND NOT EXISTS (
                           SELECT 1 FROM ml_listings ml
                           WHERE ml.sku = ft.product_sku
