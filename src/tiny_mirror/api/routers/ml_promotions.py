@@ -595,12 +595,14 @@ _FULL_DEPOSIT_NAME = "Full Mercado Livre"
 
 
 async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, dict[str, int]]:
-    """Estoque por SKU separado em galpão vs Full, a partir de ``stock_deposits``
-    (juntado por ``stock.sku``). Para um anúncio FLEX exibimos o galpão (soma dos
-    depósitos não-Full, não-ignorados); para FULFILLMENT exibimos o Full +
-    ``full_in_transit`` = ``pending_full_qty`` (unidades enviadas galpão→Full que
-    o ML ainda não confirmou — MESMA fonte que a reposição usa, pra os dois
-    baterem; NÃO o in_transfer interno do ML). Uma query só."""
+    """Estoque por SKU a partir de ``stock_deposits`` (juntado por ``stock.sku``).
+    Retorna, por SKU:
+      - ``full_in_transfer``: in_transfer do depósito Full (transferência interna
+        do ML; entra no estoque EFETIVO junto com o available do anúncio).
+      - ``pending_full``: ``pending_full_qty`` = unidades enviadas galpão→Full que
+        o ML ainda não confirmou (= "enviados/a caminho", MESMA fonte da reposição).
+      - ``warehouse_available``: galpão (depósitos não-Full, não-ignorados) p/ FLEX.
+    Uma query só."""
     skus = list({s for s in skus if s})
     if not skus:
         return {}
@@ -609,12 +611,12 @@ async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, di
             await session.execute(
                 text(
                     "SELECT s.sku, "
-                    "COALESCE(SUM(sd.available) FILTER (WHERE sd.deposit_name = :full), 0) "
-                    "  AS full_available, "
+                    "COALESCE(SUM(sd.in_transfer) FILTER (WHERE sd.deposit_name = :full), 0) "
+                    "  AS full_in_transfer, "
                     "COALESCE((SELECT SUM(ft.quantity - ft.quantity_received) "
                     "  FROM fulfillment_transfers ft "
                     "  WHERE ft.product_sku = s.sku AND ft.status = 'pending'), 0) "
-                    "  AS full_in_transit, "
+                    "  AS pending_full, "
                     "COALESCE(SUM(sd.available) FILTER "
                     "  (WHERE sd.deposit_name <> :full AND NOT sd.ignore), 0) "
                     "  AS warehouse_available "
@@ -630,8 +632,8 @@ async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, di
     )
     return {
         r["sku"]: {
-            "full_available": int(r["full_available"]),
-            "full_in_transit": int(r["full_in_transit"]),
+            "full_in_transfer": int(r["full_in_transfer"]),
+            "pending_full": int(r["pending_full"]),
             "warehouse_available": int(r["warehouse_available"]),
         }
         for r in rows
@@ -703,15 +705,15 @@ async def _enrich_cap(
         out.has_active_listing = False
 
     st = (await _stock_by_skus(session, [cap.sku])).get(cap.sku)
+    in_transfer = st["full_in_transfer"] if st is not None else 0
     if st is not None:
-        # FLEX → galpão (nosso banco). 'a caminho' = transfer interno do Full (ML
-        # Inventory). Ambos por produto, vindos de stock_deposits.
-        out.warehouse_available = st["warehouse_available"]
-        out.full_in_transit = st["full_in_transit"]
-    # FULL → o estoque REAL do anúncio no ML (ml_listings.available_quantity, por
-    # MLB), NÃO o Full do nosso banco: stock_deposits é por produto Tiny e diverge
-    # muito do anúncio (kits dão 0, depósitos furados inflam).
-    out.full_available = out.available_quantity
+        out.warehouse_available = st["warehouse_available"]  # galpão p/ FLEX
+        out.full_in_transit = st["pending_full"]  # enviados galpão→Full (= reposição)
+    # FULL → estoque EFETIVO = available do anúncio (por MLB, real no ML) + o que o
+    # ML está transferindo internamente (in_transfer, vira vendável em horas). Bate
+    # com o stock_full_ml da reposição. A cobertura no front soma os 'enviados'
+    # (full_in_transit) por cima.
+    out.full_available = (out.available_quantity or 0) + in_transfer
 
     cat = (
         await session.execute(
@@ -2233,10 +2235,10 @@ async def list_campaign_candidates(
                 thumbnail=m.get("thumbnail"),
                 logistic_type=m.get("logistic_type"),
                 warehouse_available=st["warehouse_available"] if st else None,
-                # FULL = estoque real do anúncio no ML (available_quantity), não o
-                # Full do nosso banco (stock_deposits diverge por ser por produto).
-                full_available=m.get("available_quantity"),
-                full_in_transit=st["full_in_transit"] if st else None,
+                # FULL efetivo = available do anúncio + in_transfer interno do ML.
+                full_available=(m.get("available_quantity") or 0)
+                + (st["full_in_transfer"] if st else 0),
+                full_in_transit=st["pending_full"] if st else None,
                 original_price=_f(c.get("original_price")),
                 min_price=lo,
                 max_price=hi,
