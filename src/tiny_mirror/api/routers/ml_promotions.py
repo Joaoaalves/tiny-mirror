@@ -597,8 +597,10 @@ _FULL_DEPOSIT_NAME = "Full Mercado Livre"
 async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, dict[str, int]]:
     """Estoque por SKU separado em galpão vs Full, a partir de ``stock_deposits``
     (juntado por ``stock.sku``). Para um anúncio FLEX exibimos o galpão (soma dos
-    depósitos não-Full, não-ignorados); para FULFILLMENT exibimos o Full
-    (``available``) + o que está a caminho (``in_transfer``). Uma query só."""
+    depósitos não-Full, não-ignorados); para FULFILLMENT exibimos o Full +
+    ``full_in_transit`` = ``pending_full_qty`` (unidades enviadas galpão→Full que
+    o ML ainda não confirmou — MESMA fonte que a reposição usa, pra os dois
+    baterem; NÃO o in_transfer interno do ML). Uma query só."""
     skus = list({s for s in skus if s})
     if not skus:
         return {}
@@ -609,7 +611,9 @@ async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, di
                     "SELECT s.sku, "
                     "COALESCE(SUM(sd.available) FILTER (WHERE sd.deposit_name = :full), 0) "
                     "  AS full_available, "
-                    "COALESCE(SUM(sd.in_transfer) FILTER (WHERE sd.deposit_name = :full), 0) "
+                    "COALESCE((SELECT SUM(ft.quantity - ft.quantity_received) "
+                    "  FROM fulfillment_transfers ft "
+                    "  WHERE ft.product_sku = s.sku AND ft.status = 'pending'), 0) "
                     "  AS full_in_transit, "
                     "COALESCE(SUM(sd.available) FILTER "
                     "  (WHERE sd.deposit_name <> :full AND NOT sd.ignore), 0) "

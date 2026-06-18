@@ -42,10 +42,10 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from tiny_mirror.config import settings
-from tiny_mirror.database import AsyncSessionLocal
+from tiny_mirror.database import AsyncSessionLocal, engine
 from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
 from tiny_mirror.infrastructure.external.mercadolivre_client import MercadoLivreAPIClient
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
@@ -244,6 +244,23 @@ class StockSyncService:
             await SyncLogRepository(session).update_sync_log_complete(
                 sync_log_id, items_processed=processed, items_failed=failed
             )
+
+        # Refresca a mv_coverage AGORA, logo após gravar os depósitos Full. O cron
+        # de sistema que refresca a view roda no MESMO minuto que este sync (*/15)
+        # e costuma ler stock_deposits ANTES da gente terminar de gravar (race),
+        # deixando a reposição até 15 min defasada vs o estoque Full ao vivo.
+        # Refrescar aqui garante a ordenação. CONCURRENTLY não roda em transação →
+        # engine em AUTOCOMMIT. Best-effort: uma falha de refresh não derruba o sync.
+        try:
+            ac_engine = engine.execution_options(isolation_level="AUTOCOMMIT")
+            async with ac_engine.connect() as conn:
+                await conn.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_coverage"))
+                await conn.execute(
+                    text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_coverage_fl_kits")
+                )
+            logger.info("mv_coverage refreshed after FL sync", sync_log_id=sync_log_id)
+        except Exception as exc:
+            logger.warning("mv_coverage refresh after FL sync failed", error=str(exc))
 
         logger.info(
             "ML FL-only stock sync completed",
