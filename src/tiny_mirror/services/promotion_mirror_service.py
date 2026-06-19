@@ -74,10 +74,12 @@ class PromotionMirrorService:
         return n
 
     async def sync_all(self, session: AsyncSession) -> dict[str, int]:
-        """Reconcilia TODOS os anúncios ativos. Reconcile diário de segurança."""
+        """Reconcilia TODOS os anúncios ativos E pausados. Pausado conta porque a
+        promoção pode continuar rodando no ML mesmo com o anúncio pausado, e a UI
+        os mostra no filtro 'Pausados'. Reconcile diário de segurança."""
         rows = (
             await session.execute(
-                text("SELECT mlb_id, sku FROM ml_listings WHERE status = 'active'")
+                text("SELECT mlb_id, sku FROM ml_listings WHERE status IN ('active', 'paused')")
             )
         ).all()
         stats = {"mlbs": 0, "promos": 0, "errors": 0}

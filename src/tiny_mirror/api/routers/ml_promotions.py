@@ -316,6 +316,10 @@ class DecisionOut(BaseModel):
     ml_apply_status_code: int | None = None
     ml_apply_response: str | None = None
     ml_applied_at: datetime | None = None
+    # Co-participação CONDICIONAL (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN): o ML
+    # define o preço dinamicamente; o ``target_price`` é só o piso, NÃO o preço
+    # ativo. O front mostra "preço dinâmico" em vez de fingir um desconto fixo.
+    is_dynamic: bool = False
 
 
 class DecisionDecideIn(BaseModel):
@@ -1534,6 +1538,83 @@ async def list_decisions(
         offset=offset,
     )
     return [DecisionOut.model_validate(r) for r in rows]
+
+
+# Co-participação CONDICIONAL: o ML define o preço dinamicamente (o `price` é só
+# o piso). NÃO mostrar como desconto fixo.
+_DYNAMIC_PROMO_TYPES = frozenset({"SMART", "PRICE_MATCHING", "MARKETPLACE_CAMPAIGN"})
+
+
+@router.get("/promotions/active", response_model=list[DecisionOut])
+async def list_active_promotions(
+    session: AsyncSession = Depends(db_session),
+) -> list[DecisionOut]:
+    """Inscritas (promoções ATIVAS) servidas do espelho AS-IS ``ml_promotions``
+    (Etapa 2). Mesma forma do ``/decisions?constraint_used=started`` — FATO do
+    ML, sem preço inventado. Co-participação condicional (SMART/PRICE_MATCHING)
+    vem marcada ``is_dynamic`` pra UI mostrar 'preço dinâmico' em vez do piso."""
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT p.id, p.mlb_id, p.sku, p.promo_key, p.promotion_id, "
+                    "  p.promotion_type, p.name, p.price, p.original_price, "
+                    "  p.meli_percentage, p.start_date, p.finish_date, p.first_seen_at, "
+                    "  c.max_seller_share_pct AS cap_pct, c.margin_floor_price AS floor_price "
+                    "FROM ml_promotions p "
+                    "LEFT JOIN ml_promo_caps c ON c.mlb_id = p.mlb_id "
+                    "WHERE p.status = 'started' "
+                    "ORDER BY p.sku NULLS LAST, p.mlb_id, p.price"
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    out: list[DecisionOut] = []
+    for r in rows:
+        price = r["price"]
+        orig = r["original_price"]
+        meli = r["meli_percentage"]
+        is_dynamic = r["promotion_type"] in _DYNAMIC_PROMO_TYPES
+        total_pct: Decimal | None = None
+        if price is not None and orig and orig > 0:
+            total_pct = ((orig - price) / orig * Decimal(100)).quantize(Decimal("0.01"))
+        seller_pct = (
+            (total_pct - meli).quantize(Decimal("0.01"))
+            if total_pct is not None and meli is not None
+            else None
+        )
+        out.append(
+            DecisionOut(
+                id=r["id"],
+                mlb_id=r["mlb_id"],
+                sku=r["sku"] or r["mlb_id"],
+                promo_key=r["promo_key"],
+                promo_id=r["promotion_id"],
+                promo_type=r["promotion_type"],
+                promo_name=r["name"],
+                decision_kind="already_active",
+                target_price=price,
+                target_total_pct=total_pct,
+                target_seller_pct=seller_pct,
+                meli_percentage=meli,
+                constraint_used="started",
+                list_price=orig,
+                cap_pct=r["cap_pct"],
+                floor_price=r["floor_price"],
+                reason=("Preço dinâmico — o ML define" if is_dynamic else "Ativa no ML"),
+                status="ignored",
+                promo_start_date=r["start_date"],
+                promo_finish_date=r["finish_date"],
+                created_at=r["first_seen_at"],
+                decided_at=None,
+                decided_by=None,
+                notes=None,
+                is_dynamic=is_dynamic,
+            )
+        )
+    return out
 
 
 class NoPromoOut(BaseModel):
