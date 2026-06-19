@@ -1621,6 +1621,57 @@ class MLWebhookNotificationORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_promotions — espelho AS-IS das promoções do ML (FATO, não decisão)
+# ---------------------------------------------------------------------------
+class MLPromotionORM(Base):
+    __tablename__ = "ml_promotions"
+    __table_args__ = (
+        UniqueConstraint("mlb_id", "promo_key", name="uq_ml_promotions_mlb_promo_key"),
+        Index("ix_ml_promotions_mlb", "mlb_id"),
+        Index("ix_ml_promotions_sku", "sku"),
+        Index("ix_ml_promotions_type_status", "promotion_type", "status"),
+        {
+            "comment": (
+                "Espelho AS-IS das promoções do ML por anúncio. FATO, não decisão "
+                "— o motor cap/piso fica em ml_promo_decisions. Alimentado por "
+                "webhook + reconcile diário + ações de escrita."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    promo_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    promotion_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    promotion_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    sub_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    original_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    suggested_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    min_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    max_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    seller_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 2), nullable=True)
+    meli_percentage: Mapped[Decimal | None] = mapped_column(Numeric(7, 2), nullable=True)
+    offer_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finish_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    stock: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # fl_stock_corrections_log
 # ---------------------------------------------------------------------------
 class FLStockCorrectionLogORM(Base):

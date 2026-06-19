@@ -870,6 +870,7 @@ async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any = None)
         # against the new values in the same transaction window.
         expire_stats: dict[str, Any] = {}
         reconcile_stats: dict[str, Any] = {}
+        mirror_stats: dict[str, int] = {}
         if promo_service is not None:
             expire_stats = await promo_service.expire_stale_decisions(session)
             # Reconcilia as STARTED de TODOS os anúncios ativos (com ou sem cap):
@@ -877,12 +878,17 @@ async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any = None)
             # anúncios sem cap com promoção ativa (ex.: SELLER_CAMPAIGN) somem das
             # Inscritas e aparecem errados como "sem promoção".
             reconcile_stats = await promo_service.reconcile_started_promos(session)
+            # Espelho AS-IS das promoções (FATO) — reconcile diário de segurança.
+            from tiny_mirror.services.promotion_mirror_service import PromotionMirrorService
+
+            mirror_stats = await PromotionMirrorService(promo_service).sync_all(session)
         logger.info(
             "ML promo recompute job completed",
             **refresh_stats,
             **{k: v for k, v in cap_stats.items() if k != "examples"},
             **{f"expire_{k}": v for k, v in expire_stats.items() if k != "by_reason"},
             **{f"reconcile_{k}": v for k, v in reconcile_stats.items()},
+            **{f"mirror_{k}": v for k, v in mirror_stats.items()},
         )
 
 

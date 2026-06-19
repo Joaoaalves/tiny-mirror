@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.infrastructure.orm.models import MLWebhookNotificationORM
 from tiny_mirror.services.ml_promotion_service import ML_API_BASE, MLPromotionService
+from tiny_mirror.services.promotion_mirror_service import PromotionMirrorService
 
 logger = structlog.get_logger(__name__)
 
@@ -122,8 +123,11 @@ class WebhookProcessor:
         #     é complementar (candidatas/Disponíveis dos SKUs COM cap).
         promo_mlbs = {r["mlb"] for r in resolved if r["kind"] == "promo" and r["mlb"]}
         reconciled_ok: set[str] = set()
+        mirror = PromotionMirrorService(self._svc)
         for mlb in promo_mlbs:
             try:
+                # Espelho AS-IS (FATO) — fonte da nova aba de promoções em tempo real.
+                await mirror.sync_mlb(session, mlb)
                 await self._svc.reconcile_started_promos(session, only_mlb=mlb)
                 reconciled_ok.add(mlb)
                 stats["skus_synced"] += 1
