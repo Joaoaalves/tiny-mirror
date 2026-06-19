@@ -1074,6 +1074,23 @@ class MLPromotionService:
             return None
         return resp.json()
 
+    async def fetch_promotion_dates(
+        self, promo_id: str, promo_type: str
+    ) -> tuple[datetime | None, datetime | None]:
+        """Busca (start_date, finish_date) de UMA campanha. O endpoint de
+        elegíveis (``items/{MLB}``) NÃO manda datas pra co-participação
+        (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN); aqui pegamos da própria
+        campanha via ``GET /seller-promotions/promotions/{id}``. Devolve
+        (None, None) se a campanha não responder."""
+        body = await self._ml_get_json(
+            f"{ML_API_BASE}/seller-promotions/promotions/{promo_id}",
+            {"promotion_type": promo_type, "app_version": "v2"},
+            op="fetch_promotion_dates",
+        )
+        if not isinstance(body, dict):
+            return None, None
+        return _parse_iso_dt(body.get("start_date")), _parse_iso_dt(body.get("finish_date"))
+
     async def list_seller_campaigns(self) -> list[dict[str, Any]]:
         """Campanhas em que o vendedor pode INSCREVER anúncios em massa —
         SELLER_CAMPAIGN (campanha do vendedor) e DEAL (oferta do ML). Mesmo

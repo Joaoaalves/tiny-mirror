@@ -1642,6 +1642,11 @@ async def list_available_promotions(
                     "FROM ml_promotions p "
                     "LEFT JOIN ml_promo_caps c ON c.mlb_id = p.mlb_id "
                     "WHERE p.status <> 'started' "
+                    # PRICE_DISCOUNT candidate é só "você PODE criar um desconto" (o
+                    # ML retorna pra quase todo anúncio) — não é promoção que o ML
+                    # oferece, então não polui Disponíveis. Criar desconto tem fluxo
+                    # próprio; PRICE_DISCOUNT já ATIVO (started) aparece em Inscritas.
+                    "AND NOT (p.promotion_type = 'PRICE_DISCOUNT' AND p.status = 'candidate') "
                     "ORDER BY p.sku NULLS LAST, p.mlb_id, p.promotion_type"
                 )
             )

@@ -69,7 +69,7 @@ class PromotionMirrorService:
         """Sincroniza o espelho de UM anúncio: busca eligible no ML e reconcilia
         ``ml_promotions``. Retorna o nº de promos espelhadas (0 limpa o anúncio)."""
         promos = await self._ml.fetch_eligible_promos(mlb_id)
-        n = await self._reconcile_mlb(session, mlb_id, sku, promos)
+        n = await self._reconcile_mlb(session, mlb_id, sku, promos, {})
         await session.commit()
         return n
 
@@ -83,11 +83,16 @@ class PromotionMirrorService:
             )
         ).all()
         stats = {"mlbs": 0, "promos": 0, "errors": 0}
+        # Cache de datas de campanha por promotion_id — campanhas são poucas e
+        # compartilhadas por muitos anúncios, então busca cada uma UMA vez.
+        date_cache: dict[str, tuple[Any, Any]] = {}
         for mlb_id, sku in rows:
             stats["mlbs"] += 1
             try:
                 promos = await self._ml.fetch_eligible_promos(mlb_id)
-                stats["promos"] += await self._reconcile_mlb(session, mlb_id, sku, promos)
+                stats["promos"] += await self._reconcile_mlb(
+                    session, mlb_id, sku, promos, date_cache
+                )
             except Exception as exc:  # pragma: no cover — rede
                 stats["errors"] += 1
                 logger.debug("promotion_mirror_sync_failed", mlb_id=mlb_id, error=str(exc))
@@ -96,7 +101,12 @@ class PromotionMirrorService:
         return stats
 
     async def _reconcile_mlb(
-        self, session: AsyncSession, mlb_id: str, sku: str | None, promos: list[dict[str, Any]]
+        self,
+        session: AsyncSession,
+        mlb_id: str,
+        sku: str | None,
+        promos: list[dict[str, Any]],
+        date_cache: dict[str, tuple[Any, Any]],
     ) -> int:
         """Upsert das promos vistas + DELETE das ausentes (mirror = estado atual
         do ML). NÃO commita (o caller decide o escopo da transação)."""
@@ -110,6 +120,15 @@ class PromotionMirrorService:
         seen: set[str] = set()
         for p in promos:
             row = promo_to_row(mlb_id, sku, p)
+            # Co-participação (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN) não traz
+            # datas no elegível — completa pela campanha (cacheado por promo_id).
+            if row["promotion_id"] and row["start_date"] is None:
+                pid = row["promotion_id"]
+                if pid not in date_cache:
+                    date_cache[pid] = await self._ml.fetch_promotion_dates(
+                        pid, row["promotion_type"]
+                    )
+                row["start_date"], row["finish_date"] = date_cache[pid]
             seen.add(row["promo_key"])
             stmt = (
                 pg_insert(MLPromotionORM)
