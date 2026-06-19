@@ -1617,6 +1617,92 @@ async def list_active_promotions(
     return out
 
 
+@router.get("/promotions/available", response_model=list[DecisionOut])
+async def list_available_promotions(
+    session: AsyncSession = Depends(db_session),
+) -> list[DecisionOut]:
+    """Disponíveis (promoções que o ML OFERECE mas ainda não estão ativas)
+    servidas do espelho AS-IS ``ml_promotions`` (Etapa 3). FATO do ML — mostra
+    LIGHTNING/DEAL/etc. exatamente como o ML lista, sem o motor de decisão
+    esconder/ignorar/inventar. Mesma forma ``DecisionOut`` que a UI já consome.
+
+    ``decision_kind`` direciona a ação na UI: ``ml_managed`` (co-participação,
+    o ML define o preço → botão Ativar) vs ``mirror_offer`` (vendedor escolhe o
+    preço dentro da faixa → botão Entrar)."""
+    rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT p.id, p.mlb_id, p.sku, p.promo_key, p.promotion_id, "
+                    "  p.promotion_type, p.name, p.price, p.original_price, p.suggested_price, "
+                    "  p.min_price, p.max_price, p.meli_percentage, p.start_date, p.finish_date, "
+                    "  p.first_seen_at, c.max_seller_share_pct AS cap_pct, "
+                    "  c.margin_floor_price AS floor_price "
+                    "FROM ml_promotions p "
+                    "LEFT JOIN ml_promo_caps c ON c.mlb_id = p.mlb_id "
+                    "WHERE p.status <> 'started' "
+                    "ORDER BY p.sku NULLS LAST, p.mlb_id, p.promotion_type"
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    out: list[DecisionOut] = []
+    for r in rows:
+        ptype = r["promotion_type"]
+        is_dynamic = ptype in _DYNAMIC_PROMO_TYPES
+        orig = r["original_price"]
+        meli = r["meli_percentage"]
+        # Preço a exibir/inscrever: o ofertado concreto (LIGHTNING traz o preço da
+        # relâmpago em ``price``); senão o sugerido do ML (DEAL/PRICE_DISCOUNT vêm
+        # com price=0); senão o piso da faixa. Co-participação é só piso (dinâmico).
+        target: Decimal | None = next(
+            (v for v in (r["price"], r["suggested_price"], r["min_price"]) if v and v > 0),
+            None,
+        )
+        total_pct: Decimal | None = None
+        if target is not None and orig and orig > 0:
+            total_pct = ((orig - target) / orig * Decimal(100)).quantize(Decimal("0.01"))
+        seller_pct = (
+            (total_pct - meli).quantize(Decimal("0.01"))
+            if total_pct is not None and meli is not None
+            else None
+        )
+        out.append(
+            DecisionOut(
+                id=r["id"],
+                mlb_id=r["mlb_id"],
+                sku=r["sku"] or r["mlb_id"],
+                promo_key=r["promo_key"],
+                promo_id=r["promotion_id"],
+                promo_type=ptype,
+                promo_name=r["name"],
+                decision_kind="ml_managed" if is_dynamic else "mirror_offer",
+                target_price=target,
+                target_total_pct=total_pct,
+                target_seller_pct=seller_pct,
+                meli_percentage=meli,
+                constraint_used="ml_priced" if is_dynamic else "mirror",
+                list_price=orig,
+                cap_pct=r["cap_pct"],
+                floor_price=r["floor_price"],
+                min_price=r["min_price"],
+                max_price=r["max_price"],
+                reason=("Preço dinâmico — o ML define" if is_dynamic else "Disponível no ML"),
+                status="ignored" if is_dynamic else "pending",
+                promo_start_date=r["start_date"],
+                promo_finish_date=r["finish_date"],
+                created_at=r["first_seen_at"],
+                decided_at=None,
+                decided_by=None,
+                notes=None,
+                is_dynamic=is_dynamic,
+            )
+        )
+    return out
+
+
 class NoPromoOut(BaseModel):
     mlb_id: str
     sku: str | None = None
