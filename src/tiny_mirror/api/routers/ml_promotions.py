@@ -46,6 +46,7 @@ from tiny_mirror.services.ml_promotion_service import (
     _parse_iso_dt,
     _to_dec,
 )
+from tiny_mirror.services.promotion_mirror_service import PromotionMirrorService
 
 logger = structlog.get_logger(__name__)
 
@@ -1636,7 +1637,7 @@ async def list_available_promotions(
                     "SELECT p.id, p.mlb_id, p.sku, p.promo_key, p.promotion_id, "
                     "  p.promotion_type, p.name, p.price, p.original_price, p.suggested_price, "
                     "  p.min_price, p.max_price, p.meli_percentage, p.start_date, p.finish_date, "
-                    "  p.first_seen_at, c.max_seller_share_pct AS cap_pct, "
+                    "  p.first_seen_at, p.stock, c.max_seller_share_pct AS cap_pct, "
                     "  c.margin_floor_price AS floor_price "
                     "FROM ml_promotions p "
                     "LEFT JOIN ml_promo_caps c ON c.mlb_id = p.mlb_id "
@@ -1669,6 +1670,11 @@ async def list_available_promotions(
             if total_pct is not None and meli is not None
             else None
         )
+        # LIGHTNING/DOD trazem a faixa de unidades em ``stock`` {min,max} — a UI usa
+        # pra pedir a quantidade reservada na inscrição.
+        st = r["stock"] if isinstance(r["stock"], dict) else {}
+        stock_min = st.get("min")
+        stock_max = st.get("max")
         out.append(
             DecisionOut(
                 id=r["id"],
@@ -1689,6 +1695,8 @@ async def list_available_promotions(
                 floor_price=r["floor_price"],
                 min_price=r["min_price"],
                 max_price=r["max_price"],
+                stock_min=int(stock_min) if stock_min is not None else None,
+                stock_max=int(stock_max) if stock_max is not None else None,
                 reason=("Preço dinâmico — o ML define" if is_dynamic else "Disponível no ML"),
                 status="ignored" if is_dynamic else "pending",
                 promo_start_date=r["start_date"],
@@ -2509,6 +2517,126 @@ async def enroll_campaign_item(
         floor_price=cap.margin_floor_price if cap else None,
         reason=f"inscrito na campanha {body.promotion_id} pelo operador",
     )
+    await session.commit()
+    _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
+    return result
+
+
+class EnrollOfferGenericIn(BaseModel):
+    mlb_id: str
+    promo_type: str  # DEAL | SELLER_CAMPAIGN | DOD | LIGHTNING | PRICE_DISCOUNT
+    promo_id: str | None = None  # ausente p/ DOD e p/ criar PRICE_DISCOUNT
+    deal_price: Decimal = Field(gt=0)
+    stock: int | None = None  # OBRIGATÓRIO p/ LIGHTNING (unidades reservadas)
+    decided_by: str | None = None
+    source: str | None = None
+
+
+@router.post("/promotions/enroll")
+async def enroll_offer_generic(
+    body: EnrollOfferGenericIn,
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Entrar numa oferta do espelho (Disponíveis) — genérico por tipo. Reusa o
+    executor ``apply_decision_to_ml`` (mesmos corpos JÁ validados do approve do
+    motor), então cobre os tipos que o ``enroll-campaign-item`` não cobria:
+    DOD (sem promotion_id) e LIGHTNING (com ``stock`` obrigatório), além de
+    DEAL/SELLER_CAMPAIGN/PRICE_DISCOUNT. Escreve DIRETO no ML."""
+    from types import SimpleNamespace
+
+    from tiny_mirror.infrastructure.orm.models import MLListingORM, MLPromoCapORM
+
+    started = time.monotonic()
+    pt = body.promo_type.upper()
+    cap = await session.get(MLPromoCapORM, body.mlb_id)
+    sku = cap.sku if cap else body.mlb_id
+    _bind_op(
+        "enroll_offer",
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=pt,
+        promo_id=body.promo_id,
+        actor=body.decided_by,
+        apply_mode="live",
+    )
+    logger.info("promo_op.start", deal_price=_fnum(body.deal_price), stock=body.stock)
+
+    if pt == "LIGHTNING" and not body.stock:
+        _done("missing_stock", level="warning")
+        raise HTTPException(status_code=422, detail="LIGHTNING exige 'stock' (unidades).")
+
+    listing = await session.get(MLListingORM, body.mlb_id)
+    if listing is None or listing.status != "active":
+        _done("refused_inactive_listing", level="warning")
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"O anúncio não está ativo no Mercado Livre "
+                f"({listing.status if listing else 'não encontrado'})."
+            ),
+        )
+
+    decision_kind = (
+        "create_price_discount"
+        if (pt == "PRICE_DISCOUNT" and not body.promo_id)
+        else "would_activate"
+    )
+    ns = SimpleNamespace(
+        promo_type=pt,
+        decision_kind=decision_kind,
+        mlb_id=body.mlb_id,
+        sku=sku,
+        target_price=body.deal_price,
+        promo_id=body.promo_id,
+        stock_chosen=body.stock,
+        floor_price=None,
+        list_price=None,
+        meli_percentage=None,
+        target_total_pct=None,
+    )
+    result = await service.apply_decision_to_ml(decision=ns)
+    status = result.get("status")
+    sc = result.get("status_code")
+    if status == "skipped":
+        _done("unsupported_type", level="warning")
+        raise HTTPException(status_code=422, detail=result.get("response"))
+    if status != "ok":
+        _done("ml_rejected", level="warning", ml_status_code=sc)
+        raise HTTPException(
+            status_code=sc if sc and sc < 600 else 502, detail=result.get("response")
+        )
+
+    await MLPromoActionRepository(session).log(
+        sku=sku,
+        mlb_id=body.mlb_id,
+        action="enroll_offer",
+        promo_type=pt,
+        price_after=body.deal_price,
+        reason=f"entrou na promoção {pt} ({body.promo_id or 'sem id'}) pelo operador",
+        ml_response=result,
+        dry_run=False,
+        decided_by=body.decided_by,
+        context=None,
+    )
+    await MLPromoDecisionRepository(session).upsert_started(
+        mlb_id=body.mlb_id,
+        sku=sku,
+        promo_type=pt,
+        target_price=body.deal_price,
+        promo_id=body.promo_id,
+        promo_key=body.promo_id or pt,
+        list_price=None,
+        cap_pct=cap.max_seller_share_pct if cap else None,
+        floor_price=cap.margin_floor_price if cap else None,
+        reason="inscrito pelo operador",
+    )
+    # Espelho na hora: a promo sai de Disponíveis e entra em Inscritas sem esperar
+    # o webhook. Best-effort — o reconcile/webhook conserta se falhar.
+    try:
+        await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
+    except Exception as exc:  # pragma: no cover — rede
+        logger.warning("enroll_offer.mirror_sync_failed", mlb_id=body.mlb_id, error=str(exc))
     await session.commit()
     _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
