@@ -24,6 +24,7 @@ from tiny_mirror.services.fulfillment_reception_service import (
     FulfillmentReceptionService,
     _extract_received_at,
     _extract_received_qty,
+    _extract_transfer_qty,
     _fifo_match_with_chronology,
     _format_ml_datetime,
 )
@@ -1023,3 +1024,161 @@ class TestBug4ParentKitInventoryFallback:
         # see delta_quantity=500.
         call_kwargs = repo_mock.apply_partial_reception.await_args.kwargs
         assert call_kwargs["delta_quantity"] == 5
+
+
+def _fl_stock(transfer_qty: int = 0, available: int = 0, extra: list | None = None) -> dict:
+    """Shape of GET /inventories/{id}/stock/fulfillment."""
+    detail = []
+    if transfer_qty:
+        detail.append({"status": "transfer", "quantity": transfer_qty})
+    if extra:
+        detail.extend(extra)
+    return {
+        "available_quantity": available,
+        "not_available_quantity": sum(d["quantity"] for d in detail),
+        "not_available_detail": detail,
+    }
+
+
+class TestExtractTransferQty:
+    def test_sums_only_transfer_status(self) -> None:
+        stock = _fl_stock(transfer_qty=49, extra=[{"status": "lost", "quantity": 2}])
+        assert _extract_transfer_qty(stock) == 49
+
+    def test_zero_when_no_detail(self) -> None:
+        assert _extract_transfer_qty({"available_quantity": 8, "not_available_detail": []}) == 0
+
+    def test_robust_to_missing_or_bad_shapes(self) -> None:
+        assert _extract_transfer_qty({}) == 0
+        assert _extract_transfer_qty({"not_available_detail": "nope"}) == 0
+        assert _extract_transfer_qty({"not_available_detail": [{"status": "transfer"}]}) == 0
+
+
+def _patch_drain_session(pending_rows: list, inv_rows: list[tuple]):
+    """Mock AsyncSessionLocal for drain_stale_phantoms.
+
+    The drain opens several sessions but they all resolve to one mock; the
+    only ``session.execute`` is the inventory-map UNION, whose ``.all()``
+    must return ``inv_rows`` (base_sku, inventory_id, multiplier).
+    """
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.commit = AsyncMock()
+    inv_result = MagicMock()
+    inv_result.all = MagicMock(return_value=inv_rows)
+    mock_session.execute = AsyncMock(return_value=inv_result)
+
+    repo_mock = AsyncMock()
+    repo_mock.list_all = AsyncMock(return_value=(pending_rows, len(pending_rows)))
+    repo_mock.mark_cancelled = AsyncMock(return_value=MagicMock())
+    return mock_session, repo_mock
+
+
+def _run_drain(service, mock_session, repo_mock):
+    return (
+        patch(
+            "tiny_mirror.services.fulfillment_reception_service.AsyncSessionLocal",
+            return_value=mock_session,
+        ),
+        patch(
+            "tiny_mirror.services.fulfillment_reception_service.FulfillmentTransferRepository",
+            return_value=repo_mock,
+        ),
+    )
+
+
+class TestDrainStalePhantoms:
+    @pytest.mark.asyncio
+    async def test_cancels_stale_phantom_with_no_ml_transfer(self, ml_client: AsyncMock) -> None:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        rows = [_make_transfer_orm(1, "SKU-PH", 100, days_ago=30)]
+        mock_session, repo_mock = _patch_drain_session(rows, [("SKU-PH", "INV-PH", 1)])
+        ml_client.get_inventory_stock = AsyncMock(
+            return_value=_fl_stock(transfer_qty=0, available=5)
+        )
+
+        p1, p2 = _run_drain(service, mock_session, repo_mock)
+        with p1, p2:
+            cancelled = await service.drain_stale_phantoms()
+
+        assert cancelled == 1
+        repo_mock.mark_cancelled.assert_awaited_once()
+        assert repo_mock.mark_cancelled.await_args.args[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_keeps_stale_when_ml_transfer_covers(self, ml_client: AsyncMock) -> None:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        rows = [_make_transfer_orm(2, "SKU-IT", 49, days_ago=30)]
+        mock_session, repo_mock = _patch_drain_session(rows, [("SKU-IT", "INV-IT", 1)])
+        ml_client.get_inventory_stock = AsyncMock(return_value=_fl_stock(transfer_qty=49))
+
+        p1, p2 = _run_drain(service, mock_session, repo_mock)
+        with p1, p2:
+            cancelled = await service.drain_stale_phantoms()
+
+        assert cancelled == 0
+        repo_mock.mark_cancelled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_cancels_only_excess_over_ml_transfer(self, ml_client: AsyncMock) -> None:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        # Two stale rows: 60 (oldest) + 20. ML em-transferência = 20 → keep 20,
+        # cancel the oldest 60 (oldest-first), leaving net 20 ≈ ML.
+        rows = [
+            _make_transfer_orm(10, "SKU-X", 60, days_ago=40),
+            _make_transfer_orm(11, "SKU-X", 20, days_ago=25),
+        ]
+        mock_session, repo_mock = _patch_drain_session(rows, [("SKU-X", "INV-X", 1)])
+        ml_client.get_inventory_stock = AsyncMock(return_value=_fl_stock(transfer_qty=20))
+
+        p1, p2 = _run_drain(service, mock_session, repo_mock)
+        with p1, p2:
+            cancelled = await service.drain_stale_phantoms()
+
+        assert cancelled == 1
+        assert repo_mock.mark_cancelled.await_args.args[0] == 10  # oldest cancelled
+
+    @pytest.mark.asyncio
+    async def test_keeps_rows_inside_grace_window(self, ml_client: AsyncMock) -> None:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        rows = [_make_transfer_orm(3, "SKU-NEW", 100, days_ago=5)]  # < 21d grace
+        mock_session, repo_mock = _patch_drain_session(rows, [("SKU-NEW", "INV-NEW", 1)])
+        ml_client.get_inventory_stock = AsyncMock(return_value=_fl_stock(transfer_qty=0))
+
+        p1, p2 = _run_drain(service, mock_session, repo_mock)
+        with p1, p2:
+            cancelled = await service.drain_stale_phantoms()
+
+        assert cancelled == 0
+        # short-circuits before any ML call (no stale SKUs)
+        ml_client.get_inventory_stock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_skips_sku_on_ml_error(self, ml_client: AsyncMock) -> None:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        rows = [_make_transfer_orm(4, "SKU-ERR", 100, days_ago=30)]
+        mock_session, repo_mock = _patch_drain_session(rows, [("SKU-ERR", "INV-ERR", 1)])
+        ml_client.get_inventory_stock = AsyncMock(side_effect=RuntimeError("ML down"))
+
+        p1, p2 = _run_drain(service, mock_session, repo_mock)
+        with p1, p2:
+            cancelled = await service.drain_stale_phantoms()
+
+        assert cancelled == 0
+        repo_mock.mark_cancelled.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_kit_multiplier_scales_transfer_ceiling(self, ml_client: AsyncMock) -> None:
+        service = FulfillmentReceptionService(ml_client=ml_client)
+        # Component arriving via a 6-unit parent kit: ML shows 5 in transfer on
+        # the parent inventory → 5*6 = 30 component units in transit → keep 30.
+        rows = [_make_transfer_orm(5, "COMP", 30, days_ago=30)]
+        mock_session, repo_mock = _patch_drain_session(rows, [("COMP", "INV-KIT", 6)])
+        ml_client.get_inventory_stock = AsyncMock(return_value=_fl_stock(transfer_qty=5))
+
+        p1, p2 = _run_drain(service, mock_session, repo_mock)
+        with p1, p2:
+            cancelled = await service.drain_stale_phantoms()
+
+        assert cancelled == 0  # 5*6=30 covers the 30 pending

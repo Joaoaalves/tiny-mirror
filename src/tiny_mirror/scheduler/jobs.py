@@ -1021,10 +1021,14 @@ async def fulfillment_reception_scan_job(ml_client: MercadoLivreAPIClient) -> No
     try:
         service = FulfillmentReceptionService(ml_client=ml_client)
         result = await service.scan_and_reconcile()
+        # Drain stale phantoms after crediting commits — only never-materialised
+        # rows remain pending at this point (see drain_stale_phantoms docstring).
+        drained = await service.drain_stale_phantoms()
         logger.info(
             "Fulfillment reception scan job completed",
             skus_scanned=result.skus_scanned,
             transfers_received=result.transfers_received,
+            phantoms_drained=drained,
             errors=len(result.errors),
         )
     except Exception as exc:

@@ -181,6 +181,7 @@ async def scan_reception(request: Request) -> ReceptionScanResponse:
 
     service = FulfillmentReceptionService(ml_client=ml_client)
     result = await service.scan_and_reconcile()
+    result.transfers_cancelled += await service.drain_stale_phantoms()
     return ReceptionScanResponse(
         skus_scanned=result.skus_scanned,
         transfers_received=result.transfers_received,

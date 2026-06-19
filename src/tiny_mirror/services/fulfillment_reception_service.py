@@ -442,6 +442,170 @@ class FulfillmentReceptionService:
             )
             return cancelled
 
+    async def drain_stale_phantoms(self) -> int:
+        """Cancel long-stale pending transfers ML can't account for.
+
+        Invoked by the reception job AFTER ``scan_and_reconcile`` commits, so
+        every genuinely-arrived transfer has already left the pending pool and
+        only never-materialised rows remain to evaluate. Kept separate from
+        ``scan_and_reconcile`` so the crediting path stays pure.
+
+        A genuine galpão→Full send shows up as ML ``transfer`` (em
+        transferência) and then ``available`` within days. ML's API never
+        exposes the seller's "Entrada pendente" plan, so we can't verify that
+        bucket — but a pending row older than ``fl_transfer_stale_days`` whose
+        units ML does NOT currently show as ``transfer`` on the SKU's own OR
+        parent-kit inventories never materialised (derived kit-stock noise or
+        an abandoned inbound). We keep, per SKU:
+
+            keep = ML em-transferência (own + parent inventories, scaled)
+                 + net of rows still inside the grace window
+
+        and cancel whole stale rows oldest-first until net ≤ keep — never
+        below (residual stays ≥ what ML confirms, the safe direction). On any
+        ML fetch error the SKU is skipped (no cancel). Self-heals each run.
+        """
+        from tiny_mirror.config import settings
+
+        grace_days = settings.fl_transfer_stale_days
+        now = datetime.now(UTC)
+        cutoff = now - timedelta(days=grace_days)
+
+        async with AsyncSessionLocal() as session:
+            repo = FulfillmentTransferRepository(session)
+            pending_rows, _ = await repo.list_all(status="pending", limit=500)
+
+        by_sku: dict[str, list[FulfillmentTransferORM]] = {}
+        for row in pending_rows:
+            by_sku.setdefault(row.product_sku, []).append(row)
+
+        stale_skus = sorted(
+            {
+                row.product_sku
+                for row in pending_rows
+                if row.transferred_at.astimezone(UTC) < cutoff
+                and (row.quantity - (row.quantity_received or 0)) > 0
+            }
+        )
+        if not stale_skus:
+            return 0
+
+        inv_map = await self._inventory_map_for(stale_skus)
+
+        cancelled = 0
+        async with AsyncSessionLocal() as session:
+            repo = FulfillmentTransferRepository(session)
+            for sku in stale_skus:
+                rows = sorted(by_sku.get(sku, []), key=lambda t: t.transferred_at)
+                net_total = sum(int(r.quantity) - int(r.quantity_received or 0) for r in rows)
+                recent_net = sum(
+                    int(r.quantity) - int(r.quantity_received or 0)
+                    for r in rows
+                    if r.transferred_at.astimezone(UTC) >= cutoff
+                )
+
+                sources = inv_map.get(sku) or []
+                try:
+                    ml_transfer = 0
+                    for inventory_id, multiplier in sources:
+                        stock = await self._ml.get_inventory_stock(inventory_id)
+                        ml_transfer += _extract_transfer_qty(stock) * multiplier
+                except Exception as exc:
+                    logger.warning(
+                        "Stale-phantom drain: ML inventory fetch failed, skipping SKU",
+                        sku=sku,
+                        error=str(exc),
+                    )
+                    continue
+
+                keep = ml_transfer + recent_net
+                if net_total <= keep:
+                    continue
+
+                for r in rows:
+                    if net_total <= keep:
+                        break
+                    if r.transferred_at.astimezone(UTC) >= cutoff:
+                        continue  # never touch rows inside the grace window
+                    net = int(r.quantity) - int(r.quantity_received or 0)
+                    if net <= 0:
+                        continue
+                    await repo.mark_cancelled(
+                        int(r.id),
+                        reason=(
+                            f"stale phantom drain: >{grace_days}d, ML em-transferência="
+                            f"{ml_transfer}, not materialised"
+                        ),
+                    )
+                    net_total -= net
+                    cancelled += 1
+                    logger.info(
+                        "Stale phantom transfer cancelled",
+                        sku=sku,
+                        transfer_id=int(r.id),
+                        net=net,
+                        transferred_at=r.transferred_at.isoformat(),
+                        ml_transfer=ml_transfer,
+                    )
+            await session.commit()
+
+        if cancelled:
+            logger.info("Stale-phantom drain complete", cancelled=cancelled)
+        return cancelled
+
+    async def _inventory_map_for(self, skus: list[str]) -> dict[str, list[tuple[str, int]]]:
+        """SKU → deduped [(inventory_id, multiplier)] over own FL listings/
+        variations + parent-kit listings/variations (multiplier=comp_per_kit).
+
+        Same coverage as ``scan_and_reconcile``'s inline map, expressed as one
+        UNION query — used by ``_drain_stale_phantoms`` so the em-transferência
+        ceiling is never understated (which would over-cancel).
+        """
+        from sqlalchemy import text
+
+        sql = text(
+            """
+            SELECT ml.sku AS base_sku, ml.inventory_id AS inv, 1 AS mult
+            FROM ml_listings ml
+            WHERE ml.sku = ANY(:skus) AND ml.logistic_type = 'fulfillment'
+              AND ml.has_variations = false AND ml.inventory_id IS NOT NULL
+            UNION ALL
+            SELECT ml.sku, v.inventory_id, 1
+            FROM ml_listings ml
+            JOIN ml_listing_variations v ON v.mlb_id = ml.mlb_id
+            WHERE ml.sku = ANY(:skus) AND ml.logistic_type = 'fulfillment'
+              AND ml.has_variations = true AND v.inventory_id IS NOT NULL
+            UNION ALL
+            SELECT ft.product_sku, ml.inventory_id, kc.quantity
+            FROM (SELECT DISTINCT product_sku, product_tiny_id
+                  FROM fulfillment_transfers WHERE product_sku = ANY(:skus)) ft
+            JOIN product_kit_components kc
+              ON kc.component_product_tiny_id = ft.product_tiny_id
+            JOIN products p_kit ON p_kit.tiny_id = kc.kit_product_tiny_id
+            JOIN ml_listings ml ON ml.sku = p_kit.sku
+            WHERE ml.logistic_type = 'fulfillment' AND ml.status IN ('active','paused')
+              AND ml.has_variations = false AND ml.inventory_id IS NOT NULL
+            UNION ALL
+            SELECT ft.product_sku, v.inventory_id, kc.quantity
+            FROM (SELECT DISTINCT product_sku, product_tiny_id
+                  FROM fulfillment_transfers WHERE product_sku = ANY(:skus)) ft
+            JOIN product_kit_components kc
+              ON kc.component_product_tiny_id = ft.product_tiny_id
+            JOIN products p_kit ON p_kit.tiny_id = kc.kit_product_tiny_id
+            JOIN ml_listings ml ON ml.sku = p_kit.sku
+            JOIN ml_listing_variations v ON v.mlb_id = ml.mlb_id
+            WHERE ml.logistic_type = 'fulfillment' AND ml.status IN ('active','paused')
+              AND ml.has_variations = true AND v.inventory_id IS NOT NULL
+            """
+        )
+        out: dict[str, set[tuple[str, int]]] = {}
+        async with AsyncSessionLocal() as session:
+            rows = (await session.execute(sql, {"skus": skus})).all()
+        for base_sku, inv, mult in rows:
+            if inv:
+                out.setdefault(base_sku, set()).add((inv, max(1, int(mult or 1))))
+        return {sku: sorted(pairs) for sku, pairs in out.items()}
+
     async def _fetch_inbound_events(
         self,
         inventory_sources: list[tuple[str, int]],
@@ -666,6 +830,29 @@ def _extract_received_qty(op: dict[str, Any]) -> int:
                 pass
 
     return 0
+
+
+def _extract_transfer_qty(stock: dict[str, Any]) -> int:
+    """Units in the ``transfer`` (em transferência) bucket of a
+    ``GET /inventories/{id}/stock/fulfillment`` response.
+
+    Shape (verified 2026-06-19):
+      ``{"available_quantity": A, "not_available_quantity": N,
+         "not_available_detail": [{"status": "transfer", "quantity": Q}, ...]}``
+    Only ``status == 'transfer'`` is em-transferência; ``lost``/``damaged``/
+    etc. are not in-transit. ML never reports "Entrada pendente" here.
+    """
+    detail = stock.get("not_available_detail") or []
+    if not isinstance(detail, list):
+        return 0
+    total = 0
+    for d in detail:
+        if isinstance(d, dict) and d.get("status") == "transfer":
+            try:
+                total += int(d.get("quantity") or 0)
+            except (TypeError, ValueError):
+                continue
+    return total
 
 
 def _extract_received_at(op: dict[str, Any]) -> datetime | None:

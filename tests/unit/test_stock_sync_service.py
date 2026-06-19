@@ -562,6 +562,56 @@ async def test_webhook_transfer_creates_pending_on_positive_delta_with_galpao_dr
     assert kwargs["source"] == "tiny_webhook"
 
 
+# Kit guard (2026-06-19): a kit's Tiny "Full Mercado Livre" stock is DERIVED
+# from its components, so a positive FL delta on a kit SKU is never a real
+# galpão→Full send. Creating a transfer here produced the worst phantom
+# overcounts (3U-RTA-GAV4-P 358u, ML-confirmed 0 "a caminho").
+@patch("tiny_mirror.services.stock_sync_service.MLListingRepository")
+@patch("tiny_mirror.services.stock_sync_service.FulfillmentTransferRepository")
+@patch("tiny_mirror.services.stock_sync_service.TinyFLStockSnapshotRepository")
+@patch("tiny_mirror.services.stock_sync_service.AsyncSessionLocal")
+async def test_webhook_transfer_skips_kit_sku_even_with_galpao_drop(
+    mock_session_local: MagicMock,
+    mock_snapshot_repo_cls: MagicMock,
+    mock_transfer_repo_cls: MagicMock,
+    mock_ml_listing_repo_cls: MagicMock,
+    stock_service: StockSyncService,
+) -> None:
+    """type='K' kit with FL +20 corroborated by galpão -20 → still NO transfer
+    (kit Tiny FL stock is derived, not a real physical send)."""
+    mock_session = AsyncMock()
+    mock_session_local.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session_local.return_value.__aexit__ = AsyncMock(return_value=False)
+
+    snapshot_repo = MagicMock()
+    snapshot_repo.get = AsyncMock(return_value=_snap(fl=3, galpao=100))
+    snapshot_repo.upsert = AsyncMock()
+    mock_snapshot_repo_cls.return_value = snapshot_repo
+
+    transfer_repo = MagicMock()
+    transfer_repo.has_recent_pending = AsyncMock(return_value=False)
+    transfer_repo.create = AsyncMock()
+    mock_transfer_repo_cls.return_value = transfer_repo
+
+    ml_listing_repo = MagicMock()
+    ml_listing_repo.sku_logistic_status = AsyncMock(return_value=(1, 1))
+    mock_ml_listing_repo_cls.return_value = ml_listing_repo
+
+    await stock_service._maybe_record_webhook_transfer(
+        product_tiny_id=99,
+        sku="3U-RTA-GAV4-P",
+        new_tiny_fl_qty=23,
+        new_stock_galpao_qty=80,
+        product_data={"type": "K", "prices": {"cost_price": "12.32"}},
+    )
+
+    snapshot_repo.upsert.assert_awaited_once()  # snapshot still advances
+    transfer_repo.create.assert_not_called()  # but no phantom transfer
+    # Bailed before the corroboration/listing checks even ran.
+    ml_listing_repo.sku_logistic_status.assert_not_called()
+    transfer_repo.has_recent_pending.assert_not_awaited()
+
+
 # Bug 1 fix (2026-06-05): on a hot SKU, ML sales can fire on FL between the
 # operator's T entry and the next stock webhook. FL then decrements via N
 # entries while galpão stays put, so fl_delta under-counts the real
