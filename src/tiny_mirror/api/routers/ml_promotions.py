@@ -511,12 +511,11 @@ async def _build_decision_context(
             if avg > 0 and ctx["stock_available"] is not None:
                 ctx["coverage_days"] = round(float(ctx["stock_available"]) / avg, 1)
 
-        # Já tinha promoção ativa? (linhas 'started' não expiradas no espelho)
+        # Já tinha promoção ativa? Fonte = espelho AS-IS ml_promotions (started),
+        # não mais o motor de decisão.
         active = await session.execute(
             text(
-                "SELECT COUNT(*) FROM ml_promo_decisions "
-                "WHERE mlb_id = :mlb AND constraint_used = 'started' "
-                "AND status NOT IN ('expired', 'rejected')"
+                "SELECT COUNT(*) FROM ml_promotions " "WHERE mlb_id = :mlb AND status = 'started'"
             ),
             {"mlb": mlb_id},
         )
@@ -1734,11 +1733,14 @@ async def list_no_decisions(
     limit: int = Query(default=2000, ge=1, le=5000),
     session: AsyncSession = Depends(db_session),
 ) -> list[NoPromoOut]:
-    """Anúncios ATIVOS sem nenhuma promoção rodando E sem oferta disponível —
+    """Anúncios ATIVOS ELEGÍVEIS a promoção, mas sem nenhuma rodando nem oferta —
     'livres' pra criar uma promoção de vendedor. Fonte = espelho AS-IS
-    ``ml_promotions`` (não mais o motor de decisão). Ignora cupons e o
-    PRICE_DISCOUNT candidate (que o ML retorna pra quase todo anúncio — é só
-    'você pode criar', não uma promoção que ele oferece)."""
+    ``ml_promotions`` (não mais o motor de decisão).
+
+    Elegibilidade: o anúncio só entra se o ML retornou o PRICE_DISCOUNT candidate
+    pra ele (sinal de 'você pode criar um desconto'). Anúncio NÃO elegível não tem
+    NENHUMA linha no espelho — não deve aparecer como 'livre'. Ignora cupons (não
+    são promoção de preço)."""
     rows = (
         (
             await session.execute(
@@ -1748,6 +1750,10 @@ async def list_no_decisions(
                     "c.price_to_win, c.current_price "
                     "FROM ml_listings l LEFT JOIN ml_catalog_status c ON c.mlb_id = l.mlb_id "
                     "WHERE l.status = 'active' "
+                    # Elegível: tem o PRICE_DISCOUNT candidate que o ML oferece.
+                    "AND EXISTS (SELECT 1 FROM ml_promotions p WHERE p.mlb_id = l.mlb_id "
+                    "  AND p.promotion_type = 'PRICE_DISCOUNT' AND p.status = 'candidate') "
+                    # Sem nenhuma promoção REAL (ativa ou oferta de campanha).
                     "AND NOT EXISTS (SELECT 1 FROM ml_promotions p WHERE p.mlb_id = l.mlb_id "
                     "  AND p.promotion_type <> 'SELLER_COUPON_CAMPAIGN' "
                     "  AND NOT (p.promotion_type = 'PRICE_DISCOUNT' AND p.status = 'candidate')) "
