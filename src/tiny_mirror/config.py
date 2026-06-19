@@ -261,6 +261,15 @@ class Settings(BaseSettings):
     # to catch obvious cancellations (galpao_delta ≈ 0).
     fl_webhook_galpao_corroboration_ratio: float = 0.8
 
+    # Stale-phantom drain (reception scan). A real galpão→Full send becomes
+    # "Em transferência" then available within days; ML's API never exposes
+    # "Entrada pendente". A pending transfer older than this many days that
+    # ML does NOT currently show as `transfer` (em transferência) on the
+    # SKU's own/parent inventories never materialized — derived-stock noise
+    # or an abandoned inbound — so the scan cancels it, keeping
+    # pending_full_qty faithful to ML's real "a caminho".
+    fl_transfer_stale_days: int = 21
+
     @field_validator("database_url", mode="before")
     @classmethod
     def validate_database_url(cls, v: str) -> str:

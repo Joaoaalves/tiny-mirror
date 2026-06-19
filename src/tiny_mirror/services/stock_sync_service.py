@@ -449,6 +449,27 @@ class StockSyncService:
                 await session.commit()
                 return
 
+            # Kit guard (2026-06-19): a kit's Tiny "Full Mercado Livre" stock
+            # is DERIVED from its components (kits hold no physical stock in
+            # Tiny), so a positive FL delta on a kit SKU is never a real
+            # galpão→Full send — it is the side-effect of a component's FL
+            # stock changing. Creating a transfer here produced the worst
+            # phantom overcounts (3U-RTA-GAV4-P 358u, 6U-RTA-GAV3-P 324u, all
+            # ML-confirmed 0 "a caminho"). The real physical movement, when it
+            # happens, is tracked on the component SKU; kit "a caminho" cannot
+            # be derived reliably from Tiny and is intentionally not tracked.
+            if (product_data or {}).get("type") == "K":
+                logger.info(
+                    "FL positive delta on a kit SKU — skipping (kit Tiny FL "
+                    "stock is derived from components, not a real transfer)",
+                    product_tiny_id=product_tiny_id,
+                    sku=sku,
+                    fl_delta=fl_delta,
+                    new_tiny_fl_qty=new_tiny_fl_qty,
+                )
+                await session.commit()
+                return
+
             # Corroboration rule (2026-05-25): a real galpão→Full transfer
             # drops galpão by ~fl_delta. Sale cancellations and
             # Tiny↔ML reconciliations leave galpão untouched (galpao_delta

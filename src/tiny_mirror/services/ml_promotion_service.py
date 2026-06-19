@@ -1401,7 +1401,16 @@ class MLPromotionService:
             )
 
             # Alerts
-            if decision.floor_violated:
+            # Co-participação (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN): o
+            # current_price é o PISO, não o preço de venda (que o ML define
+            # dinâmico, mais alto). Comparar o piso com o nosso floor gera alerta
+            # FALSO — o anúncio raramente vende no piso. Só alerta em promo de
+            # preço FIXO (DEAL/SELLER_CAMPAIGN/PRICE_DISCOUNT/…), onde o
+            # current_price é mesmo o preço de venda.
+            if (
+                decision.floor_violated
+                and decision.current_promo_type not in CO_PARTICIPATION_TYPES
+            ):
                 await alerts.create(
                     sku=sku,
                     mlb_id=mlb_id,
