@@ -2950,6 +2950,14 @@ async def activate_smart_endpoint(
     result = await service.enroll_offer(
         mlb_id=body.mlb_id, promotion_type=pt, promotion_id=body.promo_id
     )
+    # Sincroniza o espelho deste anúncio com o estado AS-IS do ML — vale pra
+    # QUALQUER desfecho: inscreveu (vai pra Inscritas), já estava ativa, ou a
+    # oferta sumiu (o ML iniciou/retirou). Assim a UI se corrige e o operador
+    # para de ver "Ativar" numa oferta que não é mais candidata. Best-effort.
+    try:
+        await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
+    except Exception as exc:  # pragma: no cover — rede
+        logger.warning("activate_smart.mirror_sync_failed", mlb_id=body.mlb_id, error=str(exc))
     sc = result.get("status_code")
     if sc is None or sc >= 400:
         _done(

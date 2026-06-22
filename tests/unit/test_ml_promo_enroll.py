@@ -100,6 +100,20 @@ async def test_enroll_no_offer_found_does_not_post() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enroll_already_started_is_noop_not_candidate_post() -> None:
+    # O ML já iniciou a campanha (candidate→started) e o espelho ainda mostrava
+    # "Ativar". O fallback antigo pegava o offer 'started' e dava POST → o ML
+    # respondia "Candidate not valid". Agora: no-op de sucesso, SEM POST.
+    http = _http(get_body=SMART_STARTED, post_body={})
+    svc = _service(http)
+    out = await svc.enroll_offer(mlb_id="MLB999", promotion_type="SMART")
+    assert out["status_code"] == 200
+    assert out.get("already_active") is True
+    assert out["sent_body"] is None
+    http.post.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_enroll_surfaces_ml_error() -> None:
     http = _http(get_body=SMART_CANDIDATE, post_body={"message": "policy"}, post_status=403)
     svc = _service(http)

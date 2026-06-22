@@ -860,22 +860,37 @@ class MLPromotionService:
         Devolve ``{status_code, response, sent_body}`` (nunca levanta em erro
         operacional) pro caller persistir o resultado."""
         promos = await self.fetch_eligible_promos(mlb_id)
-        offer = (
-            self._find_offer(promos, promotion_type, status="candidate", promotion_id=promotion_id)
-            or self._find_offer(promos, promotion_type, promotion_id=promotion_id)
-            or self._find_offer(promos, promotion_type)
-        )
-        if offer is None:
+        # Só inscreve um CANDIDATO de verdade. Os fallbacks antigos (qualquer
+        # status) pegavam um offer já 'started' — e inscrever o que já está
+        # inscrito faz o ML responder "Candidate not valid". Isso acontecia quando
+        # o ML auto-inscrevia o SMART (candidate→started) e o espelho ainda
+        # mostrava "Ativar".
+        candidate = self._find_offer(
+            promos, promotion_type, status="candidate", promotion_id=promotion_id
+        ) or self._find_offer(promos, promotion_type, status="candidate")
+        if candidate is None:
+            # Já está ATIVA (started)? Trata como sucesso/no-op em vez de reenviar
+            # (que daria "Candidate not valid").
+            already = self._find_offer(
+                promos, promotion_type, status="started", promotion_id=promotion_id
+            ) or self._find_offer(promos, promotion_type, status="started")
+            if already is not None:
+                return {
+                    "status_code": 200,
+                    "response": {"status": "already_active", "message": "já ativa no ML"},
+                    "sent_body": None,
+                    "already_active": True,
+                }
             return {
                 "status_code": None,
                 "response": (
-                    f"nenhuma oferta {promotion_type} encontrada para {mlb_id} "
-                    "(item não foi convidado, ou a oferta já expirou no ML)"
+                    f"nenhum candidato {promotion_type} para {mlb_id} — a oferta não "
+                    "está mais disponível (o ML já a iniciou/retirou). Atualize a lista."
                 ),
                 "sent_body": None,
             }
-        offer_ref = offer.get("ref_id") or offer.get("offer_id")
-        pid = offer.get("id") or promotion_id
+        offer_ref = candidate.get("ref_id") or candidate.get("offer_id")
+        pid = candidate.get("id") or promotion_id
         body: dict[str, Any] = {"promotion_type": (promotion_type or "").upper()}
         if pid:
             body["promotion_id"] = pid
