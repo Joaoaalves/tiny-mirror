@@ -46,6 +46,7 @@ from tiny_mirror.services.ml_promotion_service import (
     _parse_iso_dt,
     _to_dec,
 )
+from tiny_mirror.services.promo_learning_service import load_samples, recommend
 from tiny_mirror.services.promotion_mirror_service import PromotionMirrorService
 
 logger = structlog.get_logger(__name__)
@@ -1715,6 +1716,69 @@ async def list_available_promotions(
     return out
 
 
+class RecCandidateIn(BaseModel):
+    mlb_id: str
+    sku: str
+    promo_type: str
+    target_price: float | None = None
+
+
+class RecOut(BaseModel):
+    mlb_id: str
+    promo_type: str
+    action: str  # enter | skip | neutral
+    suggested_total_pct: float | None = None
+    confidence: str
+    n_neighbors: int
+    why: str
+
+
+@router.post("/recommendations", response_model=list[RecOut])
+async def recommendations(
+    body: list[RecCandidateIn],
+    session: AsyncSession = Depends(db_session),
+) -> list[RecOut]:
+    """Recomendação por SIMILARIDADE — aprende com as decisões do usuário (Stage 5).
+    Recebe os candidatos VISÍVEIS na tela e devolve, pros que têm vizinhos parecidos
+    o bastante, "entrar a X% / pular" + confiança + porquê. Tipos sem dados o
+    suficiente não voltam (a UI fica calada — sem fingir confiança)."""
+    samples = await load_samples(session)
+    # Pré-filtro: só monta o contexto (caro) pra tipos com massa mínima.
+    from collections import Counter
+
+    from tiny_mirror.services.promo_learning_service import _MIN_NEIGHBORS
+
+    by_type: Counter[str] = Counter(s.promo_type for s in samples)
+    learnable = {t for t, n in by_type.items() if n >= _MIN_NEIGHBORS}
+
+    out: list[RecOut] = []
+    for c in body[:200]:
+        if c.promo_type not in learnable:
+            continue
+        ctx = await _build_decision_context(
+            session,
+            mlb_id=c.mlb_id,
+            sku=c.sku,
+            price_after=c.target_price,
+            promo_type=c.promo_type,
+        )
+        rec = recommend(ctx, c.promo_type, samples)
+        if rec is None:
+            continue
+        out.append(
+            RecOut(
+                mlb_id=c.mlb_id,
+                promo_type=c.promo_type,
+                action=rec.action,
+                suggested_total_pct=rec.suggested_total_pct,
+                confidence=rec.confidence,
+                n_neighbors=rec.n_neighbors,
+                why=rec.why,
+            )
+        )
+    return out
+
+
 class NoPromoOut(BaseModel):
     mlb_id: str
     sku: str | None = None
@@ -2618,6 +2682,16 @@ async def enroll_offer_generic(
             status_code=sc if sc and sc < 600 else 502, detail=result.get("response")
         )
 
+    # Snapshot de features (estoque/catálogo/vendas/margem) → vira exemplo de
+    # treino do recomendador. Best-effort.
+    ctx = await _build_decision_context(
+        session,
+        mlb_id=body.mlb_id,
+        sku=sku,
+        price_after=float(body.deal_price),
+        promo_type=pt,
+        source="promo_enter",
+    )
     await MLPromoActionRepository(session).log(
         sku=sku,
         mlb_id=body.mlb_id,
@@ -2628,7 +2702,7 @@ async def enroll_offer_generic(
         ml_response=result,
         dry_run=False,
         decided_by=body.decided_by,
-        context=None,
+        context=ctx,
     )
     await MLPromoDecisionRepository(session).upsert_started(
         mlb_id=body.mlb_id,
