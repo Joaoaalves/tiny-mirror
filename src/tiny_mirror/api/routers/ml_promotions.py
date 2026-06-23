@@ -552,8 +552,15 @@ async def _build_decision_context(
                 ctx["list_price"] = lp
 
     except Exception:
-        # Never let context capture crash the main operation
-        pass
+        # Never let context capture crash the main operation. CRÍTICO: uma query
+        # best-effort que falha aqui ABORTA a transação no Postgres; sem o rollback,
+        # a sessão fica poluída e a PRÓXIMA operação do caller (ex.: gravar o log da
+        # ação) quebra com "current transaction is aborted" → 500, mesmo quando a
+        # escrita no ML JÁ deu certo. O rollback devolve a sessão utilizável.
+        try:
+            await session.rollback()
+        except Exception:
+            pass
 
     return ctx
 
@@ -2725,13 +2732,19 @@ async def enroll_offer_generic(
         floor_price=cap.margin_floor_price if cap else None,
         reason="inscrito pelo operador",
     )
+    # Commita o IMPORTANTE (log + started) ANTES do sync — assim um sync que falhe
+    # não desfaz a auditoria nem transforma um enroll bem-sucedido em 500.
+    await session.commit()
     # Espelho na hora: a promo sai de Disponíveis e entra em Inscritas sem esperar
     # o webhook. Best-effort — o reconcile/webhook conserta se falhar.
     try:
         await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
     except Exception as exc:  # pragma: no cover — rede
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         logger.warning("enroll_offer.mirror_sync_failed", mlb_id=body.mlb_id, error=str(exc))
-    await session.commit()
     _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
@@ -3040,6 +3053,12 @@ async def activate_smart_endpoint(
     try:
         await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
     except Exception as exc:  # pragma: no cover — rede
+        # Rollback: se o sync abortou a transação, a sessão não pode ficar poluída
+        # pro log abaixo (senão um sync que falha derruba um enroll que DEU CERTO).
+        try:
+            await session.rollback()
+        except Exception:
+            pass
         logger.warning("activate_smart.mirror_sync_failed", mlb_id=body.mlb_id, error=str(exc))
     sc = result.get("status_code")
     if sc is None or sc >= 400:
