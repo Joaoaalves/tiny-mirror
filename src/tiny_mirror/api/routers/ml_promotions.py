@@ -953,6 +953,103 @@ async def refresh_catalog_status_all(
 # ---------------------------------------------------------------------------
 # CAPS RECOMPUTE — derive max_seller_share_pct from costs + 10% margin target
 # ---------------------------------------------------------------------------
+@router.get("/audit")
+async def audit_shown_promotions(
+    sample: int = Query(default=40, description="max phantom rows returned in the sample list"),
+    session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Cross-check EVERY promotion the UI shows against ML LIVE.
+
+    Shown universe = Inscritas (``status='started'``, minus coupons) + Disponíveis
+    (real-campaign ``candidate``/``pending``: DEAL/LIGHTNING/SELLER_CAMPAIGN/DOD/
+    UNHEALTHY_STOCK). For each listing we re-fetch ML's live eligible promos and
+    flag a *phantom* = a mirror row ML no longer returns (``absent``) or whose
+    status diverged (``status_mismatch``). Read-only: no writes, no deletes — it
+    only VERIFIES the mirror sweep is keeping up. Drives the daily phantom-audit
+    cron, which alerts when ``phantom_count > 0``.
+    """
+    import asyncio
+
+    shown_sql = text(
+        """
+        SELECT mlb_id, sku, promotion_type, promotion_id, status
+        FROM ml_promotions
+        WHERE (status='started' AND promotion_type <> 'SELLER_COUPON_CAMPAIGN')
+           OR (status IN ('candidate','pending')
+               AND promotion_type IN
+                   ('DEAL','LIGHTNING','SELLER_CAMPAIGN','DOD','UNHEALTHY_STOCK'))
+        """
+    )
+    rows = (await session.execute(shown_sql)).all()
+    by_mlb: dict[str, list[tuple[Any, Any, Any, Any]]] = {}
+    for mlb, sku, ptype, pid, st in rows:
+        by_mlb.setdefault(mlb, []).append((sku, ptype, pid, st))
+
+    phantoms: list[dict[str, Any]] = []
+    counters = {"checked": 0, "valid": 0, "fetch_errors": 0}
+    sem = asyncio.Semaphore(6)
+
+    def _match(
+        live: list[dict[str, Any]], ptype: str, pid: Any, want_started: bool
+    ) -> tuple[str, Any]:
+        for p in live:
+            if (p.get("type") or "").upper() != ptype:
+                continue
+            if pid and p.get("id") != pid:
+                continue
+            st = (p.get("status") or "").lower()
+            if want_started:
+                return ("ok" if st == "started" else "status_mismatch", st)
+            return ("ok" if st in ("candidate", "pending") else "status_mismatch", st)
+        return ("absent", None)
+
+    async def _check(mlb: str) -> None:
+        async with sem:
+            try:
+                live = await service.fetch_eligible_promos(mlb)
+            except Exception:
+                counters["fetch_errors"] += 1
+                return
+            for sku, ptype, pid, st in by_mlb[mlb]:
+                verdict, livest = _match(live, (ptype or "").upper(), pid, st == "started")
+                counters["checked"] += 1
+                if verdict == "ok":
+                    counters["valid"] += 1
+                else:
+                    phantoms.append(
+                        {
+                            "mlb_id": mlb,
+                            "sku": sku,
+                            "promotion_type": ptype,
+                            "promotion_id": pid,
+                            "mirror_status": st,
+                            "verdict": verdict,
+                            "live_status": livest,
+                        }
+                    )
+
+    await asyncio.gather(*(_check(m) for m in by_mlb))
+    phantoms.sort(key=lambda p: str(p["mlb_id"]))
+    logger.info(
+        "promo audit done",
+        shown=len(rows),
+        anuncios=len(by_mlb),
+        valid=counters["valid"],
+        phantom_count=len(phantoms),
+        fetch_errors=counters["fetch_errors"],
+    )
+    return {
+        "shown": len(rows),
+        "anuncios": len(by_mlb),
+        "checked": counters["checked"],
+        "valid": counters["valid"],
+        "phantom_count": len(phantoms),
+        "fetch_errors": counters["fetch_errors"],
+        "phantoms": phantoms[:sample],
+    }
+
+
 @router.post("/caps/recompute")
 async def recompute_caps(
     refresh_costs_first: bool = Query(
