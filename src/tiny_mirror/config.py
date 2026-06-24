@@ -160,6 +160,13 @@ class Settings(BaseSettings):
     # (04:30) so caps are based on the freshest cost data of the day.
     sync_ml_promo_recompute_cron: str = "0 5 * * *"
 
+    # Sweep FREQUENTE do espelho AS-IS (ml_promotions) — re-sincroniza TODOS os
+    # anúncios (sync_all = upsert visto + DELETE ausente) a cada poucas horas.
+    # Remove promoções que o ML tirou durante o dia (campanha encerrada) antes do
+    # recompute diário, evitando "promoção que não existe" na tela. Leve: só toca
+    # o espelho, não recalcula caps/decisões.
+    sync_ml_promo_mirror_cron: str = "20 */3 * * *"
+
     # Feature flag: when False (default), approving a row in
     # /produtos/promocoes only flips its status in ml_promo_decisions and
     # never touches ML. When True, the future executor (Phase 5) will POST

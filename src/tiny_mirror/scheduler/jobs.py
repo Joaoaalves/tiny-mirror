@@ -117,6 +117,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_promo_recompute": CronTrigger.from_crontab(
                 settings.sync_ml_promo_recompute_cron, timezone="UTC"
             ),
+            "ml_promo_mirror_sweep": CronTrigger.from_crontab(
+                settings.sync_ml_promo_mirror_cron, timezone="UTC"
+            ),
             "ml_catalog_status_sync": CronTrigger.from_crontab(
                 settings.sync_ml_catalog_status_cron, timezone="UTC"
             ),
@@ -195,6 +198,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_promo_recompute() -> None:
         await ml_promo_recompute_job(http_client, app.state.ml_token_service)
+
+    async def _ml_promo_mirror_sweep() -> None:
+        await ml_promo_mirror_sweep_job(http_client, app.state.ml_token_service)
 
     async def _ml_catalog_status_sync() -> None:
         await ml_catalog_status_sync_job(http_client, app.state.ml_token_service)
@@ -317,6 +323,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_promo_recompute,
         trigger=triggers["ml_promo_recompute"],
         id="ml_promo_recompute",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_promo_mirror_sweep,
+        trigger=triggers["ml_promo_mirror_sweep"],
+        id="ml_promo_mirror_sweep",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -825,6 +837,25 @@ async def manual_status_sync_job() -> None:
             logger.error("Manual status sync job failed", error=str(exc))
 
 
+async def ml_promo_mirror_sweep_job(http_client: Any, ml_token_service: Any = None) -> None:
+    """Sweep FREQUENTE do espelho AS-IS (a cada poucas horas): re-sincroniza
+    ml_promotions de TODOS os anúncios (sync_all = upsert do que o ML retorna +
+    DELETE do que sumiu). Tira da tela as promoções que o ML retirou durante o dia
+    (campanha encerrada) ANTES do recompute diário — é o que evita "promoção que
+    não existe". Leve de propósito: NÃO recalcula caps nem decisões, só o espelho.
+    """
+    if http_client is None or ml_token_service is None:
+        logger.debug("ML promo mirror sweep skipped: no http/token")
+        return
+    from tiny_mirror.services.ml_promotion_service import MLPromotionService
+    from tiny_mirror.services.promotion_mirror_service import PromotionMirrorService
+
+    svc = MLPromotionService(token_service=ml_token_service, http_client=http_client)
+    async with AsyncSessionLocal() as session:
+        stats = await PromotionMirrorService(svc).sync_all(session)
+    logger.info("ML promo mirror sweep done", **stats)
+
+
 async def ml_promo_recompute_job(http_client: Any, ml_token_service: Any = None) -> None:
     """Daily: pull the full ml_costs_snapshot from the GAS bulk endpoint
     (one HTTP call instead of N), then recompute ml_promo_caps targeting
@@ -1049,6 +1080,7 @@ __all__ = [
     "fulfillment_reception_scan_job",
     "manual_status_sync_job",
     "ml_listings_sync_job",
+    "ml_promo_mirror_sweep_job",
     "ml_promo_recompute_job",
     "ml_promo_resubscribe_job",
     "ml_webhook_process_job",
