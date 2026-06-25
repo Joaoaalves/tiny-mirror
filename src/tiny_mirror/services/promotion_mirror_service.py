@@ -137,13 +137,19 @@ class PromotionMirrorService:
                     index_elements=["mlb_id", "promo_key"],
                     set_={
                         **{k: row[k] for k in row if k not in ("mlb_id", "promo_key")},
-                        # Inscrição NOSSA (enrolled_at setado) manda no status: o ML
-                        # demora/flapa pra mostrar 'started' no eligible, então NÃO
-                        # deixamos o AS-IS rebaixar p/ 'candidate' o que acabamos de
-                        # inscrever. enrolled_at em si nunca é tocado pelo sync.
+                        # Inscrição NOSSA (enrolled_at setado) manda no status E no
+                        # preço: o ML demora/flapa pra mostrar 'started' no eligible, e
+                        # o eligible do DEAL vem com price=0 — então NÃO deixamos o
+                        # AS-IS rebaixar p/ 'candidate' nem zerar o preço que a gente
+                        # fixou no enroll/modify (era o "R$ 0,00" que ressurgia). O
+                        # enrolled_at em si nunca é tocado pelo sync.
                         "status": case(
                             (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.status),
                             else_=row["status"],
+                        ),
+                        "price": case(
+                            (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.price),
+                            else_=row["price"],
                         ),
                         "last_seen_at": func.now(),
                         "updated_at": func.now(),
