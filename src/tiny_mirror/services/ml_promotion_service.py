@@ -1070,6 +1070,17 @@ class MLPromotionService:
         body = resp.json()
         return body if isinstance(body, list) else []
 
+    async def fetch_item_price(self, mlb_id: str) -> dict[str, Any]:
+        """Preço ATUAL do anúncio no ML (reflete a promo ativa) — ground truth pra
+        confirmar que a tela bate com o ML. Read-only. ``price`` = preço de venda
+        agora (com a promo, se houver); ``base_price`` = cheio."""
+        data = await self._ml_get_json(
+            f"{ML_API_BASE}/items/{mlb_id}",
+            {"attributes": "price,base_price,original_price"},
+            op="item_price",
+        )
+        return data if isinstance(data, dict) else {}
+
     async def _ml_get_json(self, url: str, params: dict[str, Any], *, op: str) -> Any:
         """Autenticated GET with one 401-refresh retry. Returns parsed JSON or
         None on >=400 (logged). Shared by the campaign-listing reads."""

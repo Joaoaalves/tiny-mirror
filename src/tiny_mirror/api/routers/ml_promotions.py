@@ -1050,6 +1050,41 @@ async def audit_shown_promotions(
     }
 
 
+@router.get("/ml-live/{mlb_id}")
+async def ml_live(
+    mlb_id: str,
+    service: MLPromotionService = Depends(_service_dep),
+) -> dict[str, Any]:
+    """Read-only: estado AO VIVO no ML do anúncio — ``item.price`` (preço de venda
+    AGORA, reflete a promo ativa) + ``item.base_price`` (cheio) + promos elegíveis.
+    Serve pra confirmar que o valor da TELA bate com o ML."""
+    try:
+        item = await service.fetch_item_price(mlb_id)
+    except Exception as exc:  # pragma: no cover — rede
+        logger.warning("ml_live.item_failed", mlb_id=mlb_id, error=str(exc))
+        item = {}
+    try:
+        promos_raw = await service.fetch_eligible_promos(mlb_id)
+    except Exception as exc:  # pragma: no cover — rede
+        logger.warning("ml_live.promos_failed", mlb_id=mlb_id, error=str(exc))
+        promos_raw = []
+    return {
+        "mlb_id": mlb_id,
+        "item": item,
+        "promos": [
+            {
+                "type": p.get("type"),
+                "id": p.get("id"),
+                "status": p.get("status"),
+                "ref_id": p.get("ref_id"),
+                "price": p.get("price"),
+                "name": p.get("name"),
+            }
+            for p in promos_raw
+        ],
+    }
+
+
 @router.post("/caps/recompute")
 async def recompute_caps(
     refresh_costs_first: bool = Query(
@@ -3482,6 +3517,18 @@ async def modify_promotion_endpoint(
         promo_id=body.promo_id,
         promo_type=promo_type,
     )
+    # A aba "Inscritas" (/active) lê o ESPELHO ml_promotions, não a tabela de
+    # decisões — então o Alterar tem que escrever o preço novo AQUI também, senão a
+    # tela continua mostrando o valor velho. (price=None só p/ co-participação, que
+    # é "Dinâmico"; aí não mexe no preço.)
+    if body.promo_id and body.new_price is not None:
+        await session.execute(
+            text(
+                "UPDATE ml_promotions SET price=:price, status='started', "
+                "enrolled_at=now(), updated_at=now() WHERE mlb_id=:m AND promotion_id=:p"
+            ),
+            {"m": body.mlb_id, "p": body.promo_id, "price": body.new_price},
+        )
     if resubscribed:
         # Visibilidade no dock: registra a re-inscrição imediata como concluída.
         await MLPromoResubscribeRepository(session).record_completed(
