@@ -1062,11 +1062,14 @@ class MLListingVariationORM(Base):
     __tablename__ = "ml_listing_variations"
     __table_args__ = (
         Index("ix_ml_listing_variations_inventory_id", "inventory_id"),
+        Index("ix_ml_listing_variations_sku", "sku"),
         {
             "comment": (
                 "Per-variation inventory tracking for ML listings that have variations. "
-                "When a listing has variations, item-level inventory_id is null and each "
-                "variation carries its own inventory_id."
+                "When a listing has variations, item-level inventory_id/sku are null and "
+                "each variation carries its own inventory_id, available_quantity and "
+                "seller SKU (the latter fetched from /user-products since the item "
+                "payload omits it for variations)."
             ),
         },
     )
@@ -1079,6 +1082,11 @@ class MLListingVariationORM(Base):
     )
     variation_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, nullable=False)
     inventory_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Seller SKU of this variation. ML omits it from the item/variation
+    # attributes; the sync resolves it via /user-products/{user_product_id}.
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Units available to sell for this variation (item.variations[].available_quantity).
+    available_quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
 
 # ---------------------------------------------------------------------------

@@ -104,14 +104,34 @@ class MLListingSyncService:
 
                 for var in item_variations:
                     var_id = var.get("id")
-                    if var_id:
-                        variations.append(
-                            {
-                                "mlb_id": mlb_id,
-                                "variation_id": int(var_id),
-                                "inventory_id": var.get("inventory_id"),
-                            }
-                        )
+                    if not var_id:
+                        continue
+                    # The per-variation seller SKU is NOT in the item/variation
+                    # attributes — only in /user-products/{user_product_id}.
+                    # Without it, variation children (e.g. the 4 colours of a
+                    # neon folder) are invisible to every sku-keyed query.
+                    var_sku: str | None = None
+                    upid = var.get("user_product_id")
+                    if upid:
+                        try:
+                            user_product = await self._ml.get_user_product(str(upid))
+                            var_sku = _extract_user_product_sku(user_product)
+                        except Exception as exc:
+                            logger.warning(
+                                "user-product fetch failed, variation SKU left null",
+                                mlb_id=mlb_id,
+                                user_product_id=upid,
+                                error=str(exc),
+                            )
+                    variations.append(
+                        {
+                            "mlb_id": mlb_id,
+                            "variation_id": int(var_id),
+                            "inventory_id": var.get("inventory_id"),
+                            "sku": var_sku,
+                            "available_quantity": var.get("available_quantity"),
+                        }
+                    )
 
                 items_processed += 1
 
@@ -155,4 +175,19 @@ def _extract_seller_sku(item: dict[str, Any]) -> str | None:
         if attr.get("id") == "SELLER_SKU":
             value = attr.get("value_name") or ""
             return value if value else None
+    return None
+
+
+def _extract_user_product_sku(user_product: dict[str, Any]) -> str | None:
+    """Extract SELLER_SKU from a ``/user-products`` payload.
+
+    The shape differs from the item attributes: the value lives at
+    ``attributes[id=SELLER_SKU].values[0].name`` (not ``value_name``).
+    """
+    for attr in user_product.get("attributes") or []:
+        if attr.get("id") == "SELLER_SKU":
+            values = attr.get("values") or []
+            if values:
+                name = values[0].get("name") or ""
+                return name or None
     return None

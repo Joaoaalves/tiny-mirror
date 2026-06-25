@@ -11,7 +11,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService, _extract_seller_sku
+from tiny_mirror.services.ml_listing_sync_service import (
+    MLListingSyncService,
+    _extract_seller_sku,
+    _extract_user_product_sku,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -26,6 +30,7 @@ def mock_ml_client() -> AsyncMock:
     client = AsyncMock()
     client.list_all_item_ids = AsyncMock(return_value=([], 0, None))
     client.batch_get_items = AsyncMock(return_value=[])
+    client.get_user_product = AsyncMock(return_value={})
     return client
 
 
@@ -92,6 +97,39 @@ def test_extract_seller_sku_empty_value_returns_none() -> None:
 def test_extract_seller_sku_null_value_name() -> None:
     item = {"attributes": [{"id": "SELLER_SKU", "value_name": None}]}
     assert _extract_seller_sku(item) is None
+
+
+# ---------------------------------------------------------------------------
+# _extract_user_product_sku helper (shape differs: values[0].name)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_user_product_sku_found() -> None:
+    up = {
+        "attributes": [
+            {"id": "SELLER_SKU", "name": "SKU", "values": [{"id": None, "name": "POL-PAST-AM"}]}
+        ]
+    }
+    assert _extract_user_product_sku(up) == "POL-PAST-AM"
+
+
+def test_extract_user_product_sku_missing_attribute() -> None:
+    up = {"attributes": [{"id": "PACKAGE_HEIGHT", "values": [{"name": "2.4 cm"}]}]}
+    assert _extract_user_product_sku(up) is None
+
+
+def test_extract_user_product_sku_empty_values() -> None:
+    up = {"attributes": [{"id": "SELLER_SKU", "values": []}]}
+    assert _extract_user_product_sku(up) is None
+
+
+def test_extract_user_product_sku_empty_name() -> None:
+    up = {"attributes": [{"id": "SELLER_SKU", "values": [{"name": ""}]}]}
+    assert _extract_user_product_sku(up) is None
+
+
+def test_extract_user_product_sku_no_attributes_key() -> None:
+    assert _extract_user_product_sku({}) is None
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +236,80 @@ async def test_run_sync_variation_item(
     assert row["inventory_id"] is None  # null at item level for variation items
 
     assert len(variations_arg) == 2
-    assert {"mlb_id": "MLB222", "variation_id": 111, "inventory_id": "VAR-INV-1"} in variations_arg
-    assert {"mlb_id": "MLB222", "variation_id": 222, "inventory_id": "VAR-INV-2"} in variations_arg
+    # No user_product_id on these variations → sku/available stay null, fetch skipped.
+    assert {
+        "mlb_id": "MLB222",
+        "variation_id": 111,
+        "inventory_id": "VAR-INV-1",
+        "sku": None,
+        "available_quantity": None,
+    } in variations_arg
+    assert {
+        "mlb_id": "MLB222",
+        "variation_id": 222,
+        "inventory_id": "VAR-INV-2",
+        "sku": None,
+        "available_quantity": None,
+    } in variations_arg
+    mock_ml_client.get_user_product.assert_not_awaited()
+
+
+async def test_run_sync_variation_resolves_sku_via_user_product(
+    service: MLListingSyncService,
+    mock_ml_client: AsyncMock,
+) -> None:
+    """A variation with user_product_id has its SKU fetched from /user-products."""
+    variations = [
+        {
+            "id": "111",
+            "inventory_id": "VAR-INV-1",
+            "available_quantity": 18,
+            "user_product_id": "MLBU3204219027",
+        }
+    ]
+    mock_ml_client.list_all_item_ids = AsyncMock(return_value=(["MLB999"], 1, None))
+    mock_ml_client.batch_get_items = AsyncMock(
+        return_value=[_make_item("MLB999", sku=None, inventory_id=None, variations=variations)]
+    )
+    mock_ml_client.get_user_product = AsyncMock(
+        return_value={
+            "attributes": [{"id": "SELLER_SKU", "values": [{"name": "POL-PAST-A45DIVNEON-AZ"}]}]
+        }
+    )
+
+    mock_repo = AsyncMock()
+    mock_sync_log_repo = AsyncMock()
+    mock_session = AsyncMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch(
+            "tiny_mirror.services.ml_listing_sync_service.AsyncSessionLocal",
+            return_value=mock_session,
+        ),
+        patch(
+            "tiny_mirror.services.ml_listing_sync_service.MLListingRepository",
+            return_value=mock_repo,
+        ),
+        patch(
+            "tiny_mirror.services.ml_listing_sync_service.SyncLogRepository",
+            return_value=mock_sync_log_repo,
+        ),
+    ):
+        await service.run_sync(sync_log_id=8)
+
+    _, variations_arg = mock_repo.replace_all.call_args.args
+    assert variations_arg == [
+        {
+            "mlb_id": "MLB999",
+            "variation_id": 111,
+            "inventory_id": "VAR-INV-1",
+            "sku": "POL-PAST-A45DIVNEON-AZ",
+            "available_quantity": 18,
+        }
+    ]
+    mock_ml_client.get_user_product.assert_awaited_once_with("MLBU3204219027")
 
 
 # ---------------------------------------------------------------------------

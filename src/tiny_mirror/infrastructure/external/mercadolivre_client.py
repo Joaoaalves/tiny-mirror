@@ -73,6 +73,16 @@ class MercadoLivreAPIClient:
         """
         return await self._request("GET", f"/items/{mlb_id}")
 
+    async def get_user_product(self, user_product_id: str) -> dict[str, Any]:
+        """Return the user-product detail for a variation's ``user_product_id``.
+
+        Variation listings carry the seller SKU ONLY here — both the item-level
+        and the variation-level ``attributes`` omit ``SELLER_SKU``. Calls
+        ``GET /user-products/{user_product_id}``; the SKU lives at
+        ``attributes[id=SELLER_SKU].values[0].name``.
+        """
+        return await self._request("GET", f"/user-products/{user_product_id}")
+
     async def list_all_item_ids(
         self, *, scroll_id: str | None = None, limit: int = 100
     ) -> tuple[list[str], int, str | None]:
