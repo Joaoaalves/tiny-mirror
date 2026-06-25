@@ -2646,6 +2646,84 @@ async def list_campaign_candidates(
     return out
 
 
+class MigrateCampaignIn(BaseModel):
+    source_promotion_id: str
+    target_promotion_id: str
+    dry_run: bool = True
+    decided_by: str | None = None
+
+
+@router.post("/promotions/migrate-campaign")
+async def migrate_campaign(
+    body: MigrateCampaignIn,
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
+    """Migra TODOS os anúncios inscritos numa campanha SELLER (origem) para outra
+    (destino) NO MESMO PREÇO. NÃO cria campanha — o ML só deixa criar SELLER_CAMPAIGN
+    no painel (ex.: 'Julho da OFFSHOP'); aqui a gente re-inscreve em lote.
+
+    Reusa a fila de re-inscrição (ml_promo_resubscribe_jobs + poller */5min, com
+    rate-limit + retry): enfileira um job por anúncio com promo_id=destino e
+    target_price=preço atual. O poller inscreve cada um quando o item é candidate da
+    campanha destino. Progresso visível no ResubscribeDock.
+
+    dry_run=true (padrão) só CONTA quantos seriam migrados (a UI mostra antes de
+    confirmar); dry_run=false enfileira de verdade."""
+    from datetime import UTC, datetime, timedelta
+
+    from tiny_mirror.config import settings
+
+    rows = (
+        await session.execute(
+            text(
+                "SELECT mlb_id, sku, price FROM ml_promotions "
+                "WHERE promotion_id = :src AND status = 'started' "
+                "AND price IS NOT NULL AND price > 0 ORDER BY mlb_id"
+            ),
+            {"src": body.source_promotion_id},
+        )
+    ).all()
+    if body.dry_run:
+        return {
+            "dry_run": True,
+            "total": len(rows),
+            "source": body.source_promotion_id,
+            "target": body.target_promotion_id,
+        }
+
+    op_id = structlog.contextvars.get_contextvars().get("op_id") or uuid.uuid4().hex[:12]
+    deadline = datetime.now(UTC) + timedelta(hours=settings.ml_promo_resubscribe_deadline_hours)
+    repo = MLPromoResubscribeRepository(session)
+    enqueued = 0
+    for mlb_id, sku, price in rows:
+        await repo.enqueue(
+            mlb_id=mlb_id,
+            sku=sku or mlb_id,
+            promo_type="SELLER_CAMPAIGN",
+            target_price=price,
+            deadline=deadline,
+            promo_id=body.target_promotion_id,
+            op_id=op_id,
+            decided_by=body.decided_by or "migrate-campaign",
+        )
+        enqueued += 1
+    await session.commit()
+    logger.info(
+        "promo.migrate_campaign_enqueued",
+        source=body.source_promotion_id,
+        target=body.target_promotion_id,
+        enqueued=enqueued,
+        op_id=op_id,
+    )
+    return {
+        "dry_run": False,
+        "migration_id": op_id,
+        "enqueued": enqueued,
+        "source": body.source_promotion_id,
+        "target": body.target_promotion_id,
+    }
+
+
 @router.post("/enroll-campaign-item")
 async def enroll_campaign_item(
     body: EnrollCampaignItemIn,
