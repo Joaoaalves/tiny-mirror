@@ -2832,40 +2832,27 @@ async def enroll_offer_generic(
     # Commita o IMPORTANTE (log + started) ANTES do sync — assim um sync que falhe
     # não desfaz a auditoria nem transforma um enroll bem-sucedido em 500.
     await session.commit()
-    # Espelho na hora + AUTORIDADE. O ML deu 201, então ESTAMOS inscritos — e o
-    # nosso banco é quem manda nisso, NÃO o eligible do ML (que demora/flapa e
-    # segue dizendo 'candidate' mesmo depois da inscrição). O sync tenta refletir
-    # (sai de Disponíveis → Inscritas) e DEPOIS marcamos a linha como 'started' +
-    # enrolled_at SEMPRE. A partir daí o sync PRESERVA isso (não rebaixa enquanto
-    # enrolled_at estiver setado), então a promo não some nem reaparece como
-    # "disponível/não-inscrito".
-    import asyncio
-
-    for attempt in range(3):
-        try:
-            await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
-            break
-        except Exception as exc:  # pragma: no cover — rede
-            try:
-                await session.rollback()
-            except Exception:
-                pass
-            logger.warning(
-                "enroll_offer.mirror_sync_failed",
-                mlb_id=body.mlb_id,
-                attempt=attempt + 1,
-                error=str(exc),
-            )
-            if attempt < 2:
-                await asyncio.sleep(1.0)
+    # AUTORIDADE: o ML deu 201, então ESTAMOS inscritos — e o NOSSO banco manda
+    # nisso, não o eligible do ML (que demora/flapa e segue dizendo 'candidate').
     if body.promo_id:
+        # Caso comum (a promo já existia como candidate no espelho): só marca a
+        # linha como started + PREÇO + enrolled_at. NÃO re-sincroniza o anúncio
+        # inteiro — era isso que rebaixava promoções VIZINHAS quando o eligible
+        # flapava e fazia TODAS as ativas SUMIREM da tela. Fixar o preço aqui evita
+        # o "R$ 0,00" (DEAL vem com price=0 no eligible). O sweep horário reconcilia
+        # o resto; enrolled_at protege esta linha de ser rebaixada/apagada.
         try:
+            params: dict[str, Any] = {"m": body.mlb_id, "p": body.promo_id}
+            set_price = ""
+            if body.deal_price is not None:
+                set_price = ", price=:price"
+                params["price"] = body.deal_price
             await session.execute(
                 text(
                     "UPDATE ml_promotions SET status='started', enrolled_at=now(), "
-                    "updated_at=now() WHERE mlb_id=:m AND promotion_id=:p"
+                    f"updated_at=now(){set_price} WHERE mlb_id=:m AND promotion_id=:p"
                 ),
-                {"m": body.mlb_id, "p": body.promo_id},
+                params,
             )
             await session.commit()
             logger.info("enroll_offer.marked_started", mlb_id=body.mlb_id, promo_id=body.promo_id)
@@ -2875,6 +2862,28 @@ async def enroll_offer_generic(
             except Exception:
                 pass
             logger.warning("enroll_offer.mark_started_failed", mlb_id=body.mlb_id, error=str(exc))
+    else:
+        # PRICE_DISCOUNT criado agora (sem promotion_id) → não há linha pra marcar;
+        # precisa do sync pra materializar a nova promo no espelho.
+        import asyncio
+
+        for attempt in range(3):
+            try:
+                await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
+                break
+            except Exception as exc:  # pragma: no cover — rede
+                try:
+                    await session.rollback()
+                except Exception:
+                    pass
+                logger.warning(
+                    "enroll_offer.mirror_sync_failed",
+                    mlb_id=body.mlb_id,
+                    attempt=attempt + 1,
+                    error=str(exc),
+                )
+                if attempt < 2:
+                    await asyncio.sleep(1.0)
     _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
@@ -3039,67 +3048,16 @@ async def exit_promotion_endpoint(
         )
     sc = result.get("status_code")
 
-    # Confere o estado REAL no ML — MAS o eligible ATRASA/FLAPA depois do DELETE:
-    # mostra 'started'/'pending' por alguns segundos mesmo já tendo removido. Uma
-    # leitura só dava falso "não removeu" e barrava o usuário com 409 (foi o erro
-    # relatado: saiu no ML, mas a tela acusou falha). Então fazemos ALGUMAS
-    # leituras: se SAIR do estado inscrito em qualquer uma, é sucesso. Só é falha
-    # real (catálogo pausado) se persistir inscrita em TODAS.
-    import asyncio
-
-    pt = (body.promo_type or "PRICE_DISCOUNT").upper()
-
-    def _still_enrolled(promos: list[dict[str, Any]]) -> bool:
-        for p in promos:
-            if (p.get("type") or "").upper() != pt:
-                continue
-            if body.promo_id and p.get("id") not in (body.promo_id, None):
-                continue
-            st = (p.get("status") or "").lower()
-            ref = str(p.get("ref_id") or "")
-            # inscrita = 'started' OU oferta NOSSA ainda presente (OFFER- =
-            # lightning/co-participação inscrita; CANDIDATE- = só convite, já fora).
-            if st == "started" or ref.startswith("OFFER-"):
-                return True
-        return False
-
-    still_active = True
-    verify_ok = True
-    for attempt in range(4):
-        try:
-            promos = await service.fetch_eligible_promos(body.mlb_id)
-        except Exception as exc:  # pragma: no cover — rede
-            verify_ok = False
-            logger.warning("promo.exit_verify_failed", error=str(exc))
-            break
-        if not _still_enrolled(promos):
-            still_active = False
-            break
-        if attempt < 3:
-            await asyncio.sleep(2.0)
-
-    if still_active and verify_ok:
-        # Persistiu inscrita em todas as leituras → o ML realmente não removeu
-        # (típico de catálogo pausado). NÃO marca como fora no nosso banco.
-        logger.warning("promo.exit_not_effective", ml_status_code=sc)
-        _done(
-            "exit_not_effective",
-            level="warning",
-            ml_status_code=sc,
-            elapsed_ms=round((time.monotonic() - started) * 1000),
-        )
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Não foi possível remover a promoção: o Mercado Livre não a removeu "
-                "(costuma ocorrer em anúncio de CATÁLOGO pausado). Reative o anúncio "
-                "para conseguir removê-la, ou aguarde o término da promoção."
-            ),
-        )
-
-    # Verificação falhou (rede) E o DELETE deu erro real → não dá pra afirmar
-    # sucesso, repassa o erro do ML.
-    if not verify_ok and sc is not None and sc >= 400 and sc != 404:
+    # CONFIA NO DELETE. O eligible do ML ATRASA/FLAPA depois do DELETE (mostra
+    # 'started' por segundos mesmo já tendo removido), e checar por ele dava FALSO
+    # 409 "não removeu" mesmo a saída tendo funcionado no ML (erro relatado: saiu
+    # no ML, tela acusou falha). Sucesso = o DELETE não deu erro real: 200/204, ou
+    # idempotente (404 / "No offers found" = já estava fora). Só erro de verdade
+    # (outro 4xx/5xx) é falha.
+    resp = result.get("response")
+    no_offers = isinstance(resp, dict) and "no offers" in str(resp.get("message", "")).lower()
+    delete_ok = (sc is not None and sc in (200, 201, 204)) or sc == 404 or no_offers
+    if not delete_ok:
         _done(
             "ml_rejected",
             level="warning",
@@ -3107,10 +3065,10 @@ async def exit_promotion_endpoint(
             elapsed_ms=round((time.monotonic() - started) * 1000),
         )
         raise HTTPException(
-            status_code=sc if sc < 600 else 502,
-            detail={"step": "exit", "response": result.get("response")},
+            status_code=sc if sc and sc < 600 else 502,
+            detail={"step": "exit", "response": resp},
         )
-    # Promoção confirmada fora (ou DELETE 404/idempotente) → sucesso.
+    # DELETE aceito pelo ML → sucesso.
 
     # Snapshot de contexto pra automação: o "porquê" da saída (ex.: ganhando o
     # catálogo, margem baixa, estoque acabando) fica capturado pra aprender.
