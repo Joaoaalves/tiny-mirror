@@ -170,6 +170,14 @@ class ResubscribeService:
         started = find_offer_by_status(
             promos, job.promo_type, status="started", promo_id=job.promo_id, strict=strict
         )
+        # Migração p/ campanha FUTURA: um anúncio já inscrito aparece como 'pending'
+        # (agendado) — só vira 'started' quando a campanha começa. Trata 'pending' do
+        # destino EXATO como já-inscrito, senão um re-processo do mesmo job acharia
+        # 'nem started nem candidate' e iria pra 'waiting' → fail (idempotência).
+        if started is None and strict:
+            started = find_offer_by_status(
+                promos, job.promo_type, status="pending", promo_id=job.promo_id, strict=True
+            )
         if started is not None:
             await repo.mark_done(job)
             log.info("promo.resubscribe_already_active")
