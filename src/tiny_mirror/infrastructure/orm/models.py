@@ -1677,6 +1677,12 @@ class MLPromotionORM(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
+    # Marcador AUTORITATIVO: setado quando NÓS inscrevemos a promo (enroll deu 201
+    # no ML). Enquanto preenchido, o sync AS-IS NÃO rebaixa o status='started' nem
+    # apaga a linha — o eligible do ML demora/flapa pra refletir a inscrição, e sem
+    # isto a promo recém-ativada voltava a aparecer como "disponível/não-inscrito".
+    # Limpo no exit (saída da promoção).
+    enrolled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 # ---------------------------------------------------------------------------

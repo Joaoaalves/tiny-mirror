@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from sqlalchemy import delete, func, text
+from sqlalchemy import case, delete, func, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -137,6 +137,14 @@ class PromotionMirrorService:
                     index_elements=["mlb_id", "promo_key"],
                     set_={
                         **{k: row[k] for k in row if k not in ("mlb_id", "promo_key")},
+                        # Inscrição NOSSA (enrolled_at setado) manda no status: o ML
+                        # demora/flapa pra mostrar 'started' no eligible, então NÃO
+                        # deixamos o AS-IS rebaixar p/ 'candidate' o que acabamos de
+                        # inscrever. enrolled_at em si nunca é tocado pelo sync.
+                        "status": case(
+                            (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.status),
+                            else_=row["status"],
+                        ),
                         "last_seen_at": func.now(),
                         "updated_at": func.now(),
                     },
@@ -144,14 +152,23 @@ class PromotionMirrorService:
             )
             await session.execute(stmt)
 
-        # Apaga as promos que o ML não retorna mais para este anúncio.
+        # Apaga as promos que o ML não retorna mais para este anúncio — MENOS as
+        # que NÓS inscrevemos (enrolled_at): o eligible pode flapar e sumir com a
+        # promo por um momento; não queremos perder a inscrição por causa disso. O
+        # exit limpa enrolled_at, aí a limpeza volta a valer.
         if seen:
             await session.execute(
                 delete(MLPromotionORM).where(
                     MLPromotionORM.mlb_id == mlb_id,
                     MLPromotionORM.promo_key.notin_(seen),
+                    MLPromotionORM.enrolled_at.is_(None),
                 )
             )
         else:
-            await session.execute(delete(MLPromotionORM).where(MLPromotionORM.mlb_id == mlb_id))
+            await session.execute(
+                delete(MLPromotionORM).where(
+                    MLPromotionORM.mlb_id == mlb_id,
+                    MLPromotionORM.enrolled_at.is_(None),
+                )
+            )
         return len(seen)

@@ -2832,17 +2832,18 @@ async def enroll_offer_generic(
     # Commita o IMPORTANTE (log + started) ANTES do sync — assim um sync que falhe
     # não desfaz a auditoria nem transforma um enroll bem-sucedido em 500.
     await session.commit()
-    # Espelho na hora: a promo sai de Disponíveis e entra em Inscritas sem esperar
-    # o webhook. Com retry — um GET do ML pode falhar transitoriamente (ml_get_failed)
-    # e, sem isso, a promo recém-ativada ficava 'candidate' no espelho e REAPARECIA em
-    # Disponíveis como se não estivéssemos inscritos, apesar do ML ter dado 201.
+    # Espelho na hora + AUTORIDADE. O ML deu 201, então ESTAMOS inscritos — e o
+    # nosso banco é quem manda nisso, NÃO o eligible do ML (que demora/flapa e
+    # segue dizendo 'candidate' mesmo depois da inscrição). O sync tenta refletir
+    # (sai de Disponíveis → Inscritas) e DEPOIS marcamos a linha como 'started' +
+    # enrolled_at SEMPRE. A partir daí o sync PRESERVA isso (não rebaixa enquanto
+    # enrolled_at estiver setado), então a promo não some nem reaparece como
+    # "disponível/não-inscrito".
     import asyncio
 
-    synced = False
     for attempt in range(3):
         try:
             await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
-            synced = True
             break
         except Exception as exc:  # pragma: no cover — rede
             try:
@@ -2857,30 +2858,23 @@ async def enroll_offer_generic(
             )
             if attempt < 2:
                 await asyncio.sleep(1.0)
-    if not synced and body.promo_id:
-        # Fallback determinístico: o ML deu 201, então ESTAMOS inscritos. Mesmo com o
-        # ML fora, marca a linha do espelho como 'started' pra refletir em Inscritas na
-        # hora (sai de Disponíveis). O sweep/webhook reconcilia o resto depois.
+    if body.promo_id:
         try:
             await session.execute(
                 text(
-                    "UPDATE ml_promotions SET status='started', updated_at=now() "
-                    "WHERE mlb_id=:m AND promotion_id=:p AND status <> 'started'"
+                    "UPDATE ml_promotions SET status='started', enrolled_at=now(), "
+                    "updated_at=now() WHERE mlb_id=:m AND promotion_id=:p"
                 ),
                 {"m": body.mlb_id, "p": body.promo_id},
             )
             await session.commit()
-            logger.info(
-                "enroll_offer.local_started_fallback",
-                mlb_id=body.mlb_id,
-                promo_id=body.promo_id,
-            )
+            logger.info("enroll_offer.marked_started", mlb_id=body.mlb_id, promo_id=body.promo_id)
         except Exception as exc:  # pragma: no cover — rede
             try:
                 await session.rollback()
             except Exception:
                 pass
-            logger.warning("enroll_offer.local_fallback_failed", mlb_id=body.mlb_id, error=str(exc))
+            logger.warning("enroll_offer.mark_started_failed", mlb_id=body.mlb_id, error=str(exc))
     _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
@@ -3045,36 +3039,49 @@ async def exit_promotion_endpoint(
         )
     sc = result.get("status_code")
 
-    # Confere o estado REAL no ML antes de declarar sucesso. O DELETE de promoção
-    # é enganoso em alguns casos (PRICE_DISCOUNT em anúncio de CATÁLOGO pausado):
-    # devolve 200 sem remover nada, ou 400 "No offers found" tanto quando JÁ tinha
-    # saído (idempotente) quanto quando segue ativa. Então a fonte de verdade é a
-    # consulta de elegibilidade, não o status code.
+    # Confere o estado REAL no ML — MAS o eligible ATRASA/FLAPA depois do DELETE:
+    # mostra 'started'/'pending' por alguns segundos mesmo já tendo removido. Uma
+    # leitura só dava falso "não removeu" e barrava o usuário com 409 (foi o erro
+    # relatado: saiu no ML, mas a tela acusou falha). Então fazemos ALGUMAS
+    # leituras: se SAIR do estado inscrito em qualquer uma, é sucesso. Só é falha
+    # real (catálogo pausado) se persistir inscrita em TODAS.
+    import asyncio
+
     pt = (body.promo_type or "PRICE_DISCOUNT").upper()
-    still_active = False
-    verify_ok = True
-    try:
-        promos = await service.fetch_eligible_promos(body.mlb_id)
+
+    def _still_enrolled(promos: list[dict[str, Any]]) -> bool:
         for p in promos:
             if (p.get("type") or "").upper() != pt:
                 continue
-            if (p.get("status") or "").lower() != "started":
-                continue
             if body.promo_id and p.get("id") not in (body.promo_id, None):
                 continue
-            still_active = True
-            break
-    except Exception as exc:  # pragma: no cover — verificação é best-effort
-        verify_ok = False
-        logger.warning("promo.exit_verify_failed", error=str(exc))
+            st = (p.get("status") or "").lower()
+            ref = str(p.get("ref_id") or "")
+            # inscrita = 'started' OU oferta NOSSA ainda presente (OFFER- =
+            # lightning/co-participação inscrita; CANDIDATE- = só convite, já fora).
+            if st == "started" or ref.startswith("OFFER-"):
+                return True
+        return False
 
-    if still_active:
-        # Não saiu. Se o ML deu erro, repassa-o; senão (200 mentiroso) explica.
-        logger.warning(
-            "promo.exit_not_effective",
-            note="DELETE não removeu a promoção — típico de catálogo pausado.",
-            ml_status_code=sc,
-        )
+    still_active = True
+    verify_ok = True
+    for attempt in range(4):
+        try:
+            promos = await service.fetch_eligible_promos(body.mlb_id)
+        except Exception as exc:  # pragma: no cover — rede
+            verify_ok = False
+            logger.warning("promo.exit_verify_failed", error=str(exc))
+            break
+        if not _still_enrolled(promos):
+            still_active = False
+            break
+        if attempt < 3:
+            await asyncio.sleep(2.0)
+
+    if still_active and verify_ok:
+        # Persistiu inscrita em todas as leituras → o ML realmente não removeu
+        # (típico de catálogo pausado). NÃO marca como fora no nosso banco.
+        logger.warning("promo.exit_not_effective", ml_status_code=sc)
         _done(
             "exit_not_effective",
             level="warning",
@@ -3090,8 +3097,8 @@ async def exit_promotion_endpoint(
             ),
         )
 
-    # Não está mais ativa. Se a verificação falhou (rede) E o DELETE deu erro real,
-    # não dá pra afirmar sucesso — repassa o erro do ML.
+    # Verificação falhou (rede) E o DELETE deu erro real → não dá pra afirmar
+    # sucesso, repassa o erro do ML.
     if not verify_ok and sc is not None and sc >= 400 and sc != 404:
         _done(
             "ml_rejected",
@@ -3127,6 +3134,17 @@ async def exit_promotion_endpoint(
     await MLPromoDecisionRepository(session).expire_started(
         mlb_id=body.mlb_id, promo_id=body.promo_id, promo_type=body.promo_type
     )
+    # NOSSO banco passa a mandar: limpa o marcador de inscrição e rebaixa o status
+    # pra a promo sair de Inscritas na hora (sem isso, o enrolled_at preservaria
+    # 'started' no sync e ela ficaria presa em Inscritas mesmo após sair).
+    if body.promo_id:
+        await session.execute(
+            text(
+                "UPDATE ml_promotions SET enrolled_at=NULL, status='candidate', "
+                "updated_at=now() WHERE mlb_id=:m AND promotion_id=:p"
+            ),
+            {"m": body.mlb_id, "p": body.promo_id},
+        )
     await session.commit()
     _done("exited", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
