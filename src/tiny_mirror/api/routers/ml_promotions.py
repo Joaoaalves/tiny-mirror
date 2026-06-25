@@ -3307,13 +3307,16 @@ async def _settle_eligible(
     *,
     started: bool,
     price: float | None = None,
+    require_present: bool = False,
     tries: int = 12,
     sleep_s: float = 3.0,
 ) -> bool:
     """Espera o ML ASSENTAR a promo no estado desejado (``started`` ou fora) e,
-    opcionalmente, no ``price`` alvo. O ML processa enroll/exit/edit de forma
-    ASSÍNCRONA — operar back-to-back sem isto causa ``NOT_FOUND_CANDIDATE_OR_OFFER``
-    (PUT antes do enroll assentar) ou corrida (reentrar antes do exit assentar)."""
+    opcionalmente, no ``price`` alvo. ``require_present=True`` exige que o item
+    esteja LISTADO (ex.: re-sugerido como candidate após um exit, antes de reentrar
+    — senão o reenter dispara com o item ausente e falha). O ML processa enroll/
+    exit/edit de forma ASSÍNCRONA — operar back-to-back sem isto causa
+    ``NOT_FOUND_CANDIDATE_OR_OFFER`` ou corrida (reentrar antes do exit assentar)."""
     import asyncio
 
     for _ in range(tries):
@@ -3323,6 +3326,8 @@ async def _settle_eligible(
         except Exception:  # pragma: no cover — rede
             continue
         match = next((p for p in promos if promo_id and p.get("id") == promo_id), None)
+        if require_present and match is None:
+            continue
         is_started = match is not None and (match.get("status") or "").lower() == "started"
         if is_started != started:
             continue
@@ -3464,10 +3469,15 @@ async def modify_promotion_endpoint(
                 status_code=exit_sc if exit_sc < 600 else 502,
                 detail={"step": "exit", "response": exit_result.get("response")},
             )
-        # ESPERA o exit ASSENTAR no ML antes de reentrar. O ML é assíncrono — se a
-        # gente reentra back-to-back, o reenter é ULTRAPASSADO pela saída (corrida) e
-        # o anúncio fica no preço ANTIGO. Aguardar a oferta sair primeiro evita isso.
-        await _settle_eligible(service, body.mlb_id, body.promo_id, started=False)
+        # ESPERA o exit ASSENTAR e o item ser RE-SUGERIDO como candidate antes de
+        # reentrar. O ML é assíncrono: reentrar back-to-back é ultrapassado pela saída
+        # (corrida → preço antigo), e reentrar com o item ainda AUSENTE (o ML não
+        # re-sugeriu a oferta ainda) falha. require_present espera o candidate voltar.
+        # (Campanha gerida pelo ML pode demorar a re-sugerir → cai na fila de
+        # re-inscrição abaixo, que é o fallback já existente.)
+        await _settle_eligible(
+            service, body.mlb_id, body.promo_id, started=False, require_present=True, tries=15
+        )
         # Reentra: PRICE_DISCOUNT (sem campanha) cria desconto de vendedor;
         # campanha reentra com o promotion_id (POST = nova inscrição).
         if promo_type == "PRICE_DISCOUNT" or body.promo_id is None:
