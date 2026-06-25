@@ -2833,15 +2833,54 @@ async def enroll_offer_generic(
     # não desfaz a auditoria nem transforma um enroll bem-sucedido em 500.
     await session.commit()
     # Espelho na hora: a promo sai de Disponíveis e entra em Inscritas sem esperar
-    # o webhook. Best-effort — o reconcile/webhook conserta se falhar.
-    try:
-        await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
-    except Exception as exc:  # pragma: no cover — rede
+    # o webhook. Com retry — um GET do ML pode falhar transitoriamente (ml_get_failed)
+    # e, sem isso, a promo recém-ativada ficava 'candidate' no espelho e REAPARECIA em
+    # Disponíveis como se não estivéssemos inscritos, apesar do ML ter dado 201.
+    import asyncio
+
+    synced = False
+    for attempt in range(3):
         try:
-            await session.rollback()
-        except Exception:
-            pass
-        logger.warning("enroll_offer.mirror_sync_failed", mlb_id=body.mlb_id, error=str(exc))
+            await PromotionMirrorService(service).sync_mlb(session, body.mlb_id, sku)
+            synced = True
+            break
+        except Exception as exc:  # pragma: no cover — rede
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "enroll_offer.mirror_sync_failed",
+                mlb_id=body.mlb_id,
+                attempt=attempt + 1,
+                error=str(exc),
+            )
+            if attempt < 2:
+                await asyncio.sleep(1.0)
+    if not synced and body.promo_id:
+        # Fallback determinístico: o ML deu 201, então ESTAMOS inscritos. Mesmo com o
+        # ML fora, marca a linha do espelho como 'started' pra refletir em Inscritas na
+        # hora (sai de Disponíveis). O sweep/webhook reconcilia o resto depois.
+        try:
+            await session.execute(
+                text(
+                    "UPDATE ml_promotions SET status='started', updated_at=now() "
+                    "WHERE mlb_id=:m AND promotion_id=:p AND status <> 'started'"
+                ),
+                {"m": body.mlb_id, "p": body.promo_id},
+            )
+            await session.commit()
+            logger.info(
+                "enroll_offer.local_started_fallback",
+                mlb_id=body.mlb_id,
+                promo_id=body.promo_id,
+            )
+        except Exception as exc:  # pragma: no cover — rede
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning("enroll_offer.local_fallback_failed", mlb_id=body.mlb_id, error=str(exc))
     _done("enrolled", ml_status_code=sc, elapsed_ms=round((time.monotonic() - started) * 1000))
     return result
 
