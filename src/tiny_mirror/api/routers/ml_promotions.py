@@ -3082,13 +3082,6 @@ async def exit_promotion_endpoint(
             mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
         )
     sc = result.get("status_code")
-
-    # CONFIA NO DELETE. O eligible do ML ATRASA/FLAPA depois do DELETE (mostra
-    # 'started' por segundos mesmo já tendo removido), e checar por ele dava FALSO
-    # 409 "não removeu" mesmo a saída tendo funcionado no ML (erro relatado: saiu
-    # no ML, tela acusou falha). Sucesso = o DELETE não deu erro real: 200/204, ou
-    # idempotente (404 / "No offers found" = já estava fora). Só erro de verdade
-    # (outro 4xx/5xx) é falha.
     resp = result.get("response")
     no_offers = isinstance(resp, dict) and "no offers" in str(resp.get("message", "")).lower()
     delete_ok = (sc is not None and sc in (200, 201, 204)) or sc == 404 or no_offers
@@ -3103,7 +3096,64 @@ async def exit_promotion_endpoint(
             status_code=sc if sc and sc < 600 else 502,
             detail={"step": "exit", "response": resp},
         )
-    # DELETE aceito pelo ML → sucesso.
+
+    # GARANTE A SAÍDA DE VERDADE. O ML processa enroll/exit de forma ASSÍNCRONA: um
+    # exit logo após um enroll pode ser ULTRAPASSADO (o ML aplica o enroll por
+    # último) e o anúncio acaba INSCRITO de novo, mesmo o DELETE tendo dado 200 —
+    # aí a tela diz "fora" e o ML fica "dentro" (bug relatado: "desinscrever rápido
+    # não funciona"). Então confirmamos lendo o ML e RE-DELETAMOS se reaparecer
+    # inscrito (DELETE é idempotente), até 3 leituras SEGUIDAS confirmarem que saiu
+    # (estabilidade que ultrapassa o enroll atrasado). Flap por lag → re-deletar é
+    # inofensivo. Backstop: o sweep horário reconcilia se algo escapar.
+    import asyncio
+
+    pt = (body.promo_type or "PRICE_DISCOUNT").upper()
+
+    def _still_in(promos: list[dict[str, Any]]) -> bool:
+        for p in promos:
+            if (p.get("type") or "").upper() != pt:
+                continue
+            if body.promo_id and p.get("id") not in (body.promo_id, None):
+                continue
+            st = (p.get("status") or "").lower()
+            if st == "started" or str(p.get("ref_id") or "").startswith("OFFER-"):
+                return True
+        return False
+
+    clean = 0
+    removed = False
+    for _ in range(8):
+        await asyncio.sleep(2.0)
+        try:
+            promos = await service.fetch_eligible_promos(body.mlb_id)
+        except Exception:  # pragma: no cover — rede
+            continue
+        if _still_in(promos):
+            clean = 0
+            await service.exit_promotion(
+                mlb_id=body.mlb_id, promotion_type=body.promo_type, promotion_id=body.promo_id
+            )
+        else:
+            clean += 1
+            if clean >= 3:
+                removed = True
+                break
+    if not removed:
+        logger.warning("promo.exit_not_effective", mlb_id=body.mlb_id, ml_status_code=sc)
+        _done(
+            "exit_not_effective",
+            level="warning",
+            ml_status_code=sc,
+            elapsed_ms=round((time.monotonic() - started) * 1000),
+        )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Não foi possível remover a promoção: o Mercado Livre segue mostrando "
+                "o anúncio inscrito após várias tentativas. Tente de novo em instantes."
+            ),
+        )
+    # Saída CONFIRMADA no ML (3 leituras seguidas) → sucesso.
 
     # Snapshot de contexto pra automação: o "porquê" da saída (ex.: ganhando o
     # catálogo, margem baixa, estoque acabando) fica capturado pra aprender.
