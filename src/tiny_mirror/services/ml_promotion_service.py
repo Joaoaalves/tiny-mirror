@@ -1150,12 +1150,16 @@ class MLPromotionService:
         ⚠ Esse endpoint pagina por CURSOR (``paging.searchAfter``), NÃO por offset —
         passar ``offset`` é ignorado e o ML devolve sempre a 1ª página, então um loop
         por offset só via os primeiros 50 (repetidos) e subcontava feio. Agora segue o
-        cursor ``search_after`` até a página vir vazia ou o cursor repetir/sumir."""
+        cursor ``search_after`` até a página vir vazia ou o cursor repetir/sumir.
+
+        Dedup por id; ``paging.total`` é INFLADO e não confiável (candidate dá 402 p/
+        ~61 reais), então NÃO paramos por total — paramos quando uma página não traz
+        nada NOVO. E retry por página: uma falha transitória de UMA página não pode
+        truncar a lista toda (era o bug de às vezes vir 150 pending em vez de 303)."""
         url = f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items"
-        out: list[dict[str, Any]] = []
+        by_id: dict[str, dict[str, Any]] = {}
         search_after: str | None = None
-        seen_cursors: set[str] = set()
-        for _ in range(400):  # hard stop ~20k itens
+        for _ in range(500):  # hard stop
             params: dict[str, Any] = {
                 "promotion_type": promotion_type,
                 "status": status,
@@ -1164,16 +1168,34 @@ class MLPromotionService:
             }
             if search_after:
                 params["search_after"] = search_after
-            body = await self._ml_get_json(url, params, op="list_campaign_candidates")
+            body: Any = None
+            for attempt in range(4):  # retry transitório da MESMA página
+                try:
+                    body = await self._ml_get_json(url, params, op="list_campaign_candidates")
+                except Exception:
+                    body = None
+                if isinstance(body, dict):
+                    break
+                await asyncio.sleep(0.4 * (attempt + 1))
             if not isinstance(body, dict):
+                logger.warning(
+                    "promo.campaign_items_page_failed",
+                    promotion_id=promotion_id,
+                    status=status,
+                    got=len(by_id),
+                )
                 break
-            page = body.get("results") or []
-            out.extend(r for r in page if isinstance(r, dict))
-            search_after = (body.get("paging") or {}).get("searchAfter")
-            if not page or not search_after or search_after in seen_cursors:
+            new = 0
+            for r in body.get("results") or []:
+                rid = r.get("id") if isinstance(r, dict) else None
+                if rid and rid not in by_id:
+                    by_id[rid] = r
+                    new += 1
+            nxt = (body.get("paging") or {}).get("searchAfter")
+            if new == 0 or not nxt or nxt == search_after:
                 break
-            seen_cursors.add(search_after)
-        return out
+            search_after = nxt
+        return list(by_id.values())
 
     async def fetch_catalog_competitors(self, catalog_product_id: str) -> list[dict[str, Any]]:
         """Lista os anúncios concorrentes de um produto de catálogo, com preços.
