@@ -11,6 +11,7 @@ Surfaces 4 groups:
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -37,6 +38,7 @@ from tiny_mirror.infrastructure.repositories.ml_promo_repository import (
     MLPromoDecisionRepository,
     MLPromoResubscribeRepository,
 )
+from tiny_mirror.redis_client import get_redis
 from tiny_mirror.services import feature_flags
 from tiny_mirror.services.ml_promotion_service import (
     CO_PARTICIPATION_TYPES,
@@ -2646,6 +2648,55 @@ async def list_campaign_candidates(
     return out
 
 
+# Mantém referência forte às migrações em voo (asyncio.create_task pode ser
+# coletado pelo GC se ninguém guardar a Task).
+_migration_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _run_campaign_migration(
+    op_id: str,
+    target: str,
+    items: list[tuple[str, float]],
+    service: MLPromotionService,
+) -> None:
+    """Inscreve os anúncios candidatos na campanha destino — DIRETO e CONCORRENTE
+    (sem fila throttled). Cada inscrição é um POST /seller-promotions/items/{MLB}.
+    Progresso em Redis ``migrate:{op_id}`` (campos total/done/failed/status)."""
+    redis = get_redis()
+    key = f"migrate:{op_id}"
+    sem = asyncio.Semaphore(8)
+
+    async def _one(mlb_id: str, price: float) -> None:
+        async with sem:
+            ok = False
+            try:
+                r = await service.modify_promotion(
+                    mlb_id=mlb_id,
+                    deal_price=price,
+                    promotion_id=target,
+                    promotion_type="SELLER_CAMPAIGN",
+                )
+                sc = r.get("status_code")
+                ok = sc is None or int(sc) < 400
+                if not ok:
+                    logger.warning(
+                        "promo.migrate_item_failed",
+                        mlb_id=mlb_id,
+                        ml_status_code=sc,
+                        response=str(r.get("response"))[:200],
+                    )
+            except Exception as exc:  # uma falha não derruba a migração
+                logger.warning("promo.migrate_item_error", mlb_id=mlb_id, error=str(exc))
+            await redis.hincrby(key, "done" if ok else "failed", 1)  # type: ignore[misc]
+
+    try:
+        await asyncio.gather(*[_one(m, p) for m, p in items])
+    finally:
+        await redis.hset(key, "status", "done")  # type: ignore[misc]
+        await redis.expire(key, 7200)
+    logger.info("promo.migrate_campaign_done", op_id=op_id, target=target, count=len(items))
+
+
 class MigrateCampaignIn(BaseModel):
     source_promotion_id: str
     target_promotion_id: str
@@ -2657,74 +2708,105 @@ class MigrateCampaignIn(BaseModel):
 async def migrate_campaign(
     body: MigrateCampaignIn,
     session: AsyncSession = Depends(db_session),
+    service: MLPromotionService = Depends(_service_dep),
 ) -> dict[str, Any]:
-    """Migra TODOS os anúncios inscritos numa campanha SELLER (origem) para outra
-    (destino) NO MESMO PREÇO. NÃO cria campanha — o ML só deixa criar SELLER_CAMPAIGN
-    no painel (ex.: 'Julho da OFFSHOP'); aqui a gente re-inscreve em lote.
+    """Migra os anúncios de uma campanha SELLER (origem) para outra (destino) NO
+    MESMO PREÇO. NÃO cria campanha — o ML só deixa criar SELLER_CAMPAIGN no painel.
 
-    Reusa a fila de re-inscrição (ml_promo_resubscribe_jobs + poller */5min, com
-    rate-limit + retry): enfileira um job por anúncio com promo_id=destino e
-    target_price=preço atual. O poller inscreve cada um quando o item é candidate da
-    campanha destino. Progresso visível no ResubscribeDock.
+    Migrável = anúncio que é CANDIDATO do destino E tem preço inscrito na origem
+    (espelho). Os que já estão pending/started no destino contam como FEITOS. Inscreve
+    DIRETO e CONCORRENTE (sem fila throttled): cada um é um POST imediato. Progresso em
+    ``migrate:{op_id}`` no Redis — faça poll em GET migrate-campaign/{migration_id}.
 
-    dry_run=true (padrão) só CONTA quantos seriam migrados (a UI mostra antes de
-    confirmar); dry_run=false enfileira de verdade."""
-    from datetime import UTC, datetime, timedelta
-
-    from tiny_mirror.config import settings
-
+    dry_run=true (padrão) só conta {total, done, to_migrate}; dry_run=false inscreve."""
     rows = (
         await session.execute(
             text(
-                "SELECT mlb_id, sku, price FROM ml_promotions "
-                "WHERE promotion_id = :src AND status = 'started' "
-                "AND price IS NOT NULL AND price > 0 ORDER BY mlb_id"
+                "SELECT mlb_id, price FROM ml_promotions WHERE promotion_id = :src "
+                "AND status = 'started' AND price IS NOT NULL AND price > 0"
             ),
             {"src": body.source_promotion_id},
         )
     ).all()
+    src_price = {r[0]: float(r[1]) for r in rows}
+
+    # Destino: candidatos (a inscrever) + pending (já feitos). Paginação por cursor.
+    cand = await service.list_campaign_candidates(
+        body.target_promotion_id, "SELLER_CAMPAIGN", status="candidate"
+    )
+    pend = await service.list_campaign_candidates(
+        body.target_promotion_id, "SELLER_CAMPAIGN", status="pending"
+    )
+    cand_ids = {str(c["id"]) for c in cand if c.get("id")}
+    pend_ids = {str(p["id"]) for p in pend if p.get("id")}
+    to_migrate = [(m, src_price[m]) for m in cand_ids if m in src_price]
+    already = len(pend_ids & set(src_price))
+    total = already + len(to_migrate)
+
     if body.dry_run:
         return {
             "dry_run": True,
-            "total": len(rows),
+            "total": total,
+            "done": already,
+            "to_migrate": len(to_migrate),
+            "no_source_price": len(cand_ids - set(src_price)),
             "source": body.source_promotion_id,
             "target": body.target_promotion_id,
         }
 
     op_id = structlog.contextvars.get_contextvars().get("op_id") or uuid.uuid4().hex[:12]
-    deadline = datetime.now(UTC) + timedelta(hours=settings.ml_promo_resubscribe_deadline_hours)
-    repo = MLPromoResubscribeRepository(session)
-    enqueued = 0
-    for mlb_id, sku, price in rows:
-        await repo.enqueue(
-            mlb_id=mlb_id,
-            sku=sku or mlb_id,
-            promo_type="SELLER_CAMPAIGN",
-            target_price=price,
-            deadline=deadline,
-            promo_id=body.target_promotion_id,
-            op_id=op_id,
-            decided_by=body.decided_by or "migrate-campaign",
-            # Casa SÓ o promo_id EXATO do destino: sem isto o check de "já ativo"
-            # casava com a campanha de ORIGEM (started, mesmo tipo) e marcava done
-            # sem inscrever de fato.
-            strict_promo_id=True,
-        )
-        enqueued += 1
-    await session.commit()
+    redis = get_redis()
+    key = f"migrate:{op_id}"
+    await redis.hset(  # type: ignore[misc]
+        key,
+        mapping={
+            "total": total,
+            "done": already,
+            "failed": 0,
+            "status": "running",
+            "target": body.target_promotion_id,
+        },
+    )
+    await redis.expire(key, 7200)
+    task = asyncio.create_task(
+        _run_campaign_migration(op_id, body.target_promotion_id, to_migrate, service)
+    )
+    _migration_tasks.add(task)
+    task.add_done_callback(_migration_tasks.discard)
     logger.info(
-        "promo.migrate_campaign_enqueued",
+        "promo.migrate_campaign_started",
         source=body.source_promotion_id,
         target=body.target_promotion_id,
-        enqueued=enqueued,
+        total=total,
+        already=already,
+        to_migrate=len(to_migrate),
+        decided_by=body.decided_by,
         op_id=op_id,
     )
     return {
         "dry_run": False,
         "migration_id": op_id,
-        "enqueued": enqueued,
-        "source": body.source_promotion_id,
-        "target": body.target_promotion_id,
+        "total": total,
+        "done": already,
+        "to_migrate": len(to_migrate),
+    }
+
+
+@router.get("/promotions/migrate-campaign/{op_id}")
+async def migrate_campaign_status(op_id: str) -> dict[str, Any]:
+    """Progresso de uma migração em voo (Redis ``migrate:{op_id}``)."""
+    data = await get_redis().hgetall(f"migrate:{op_id}")  # type: ignore[misc]
+    if not data:
+        return {"found": False}
+    total = int(data.get("total", 0) or 0)
+    done = int(data.get("done", 0) or 0)
+    return {
+        "found": True,
+        "total": total,
+        "done": done,
+        "failed": int(data.get("failed", 0) or 0),
+        "status": data.get("status", "running"),
+        "pct": round(100 * done / total) if total else 100,
     }
 
 
