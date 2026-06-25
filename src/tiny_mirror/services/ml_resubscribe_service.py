@@ -51,10 +51,16 @@ def find_offer_by_status(
     *,
     status: str,
     promo_id: str | None = None,
+    strict: bool = False,
 ) -> dict[str, Any] | None:
     """First eligible-promos item matching ``type`` + ``status`` (case-insensitive).
-    When ``promo_id`` is given, an exact id match is preferred but a same-type
-    match still wins if the ML re-issued the offer under a new id."""
+    When ``promo_id`` is given, an exact id match is preferred but a same-type match
+    still wins if the ML re-issued the offer under a new id (re-subscribe).
+
+    ``strict=True`` disables that fallback — só casa o id EXATO. Necessário na
+    MIGRAÇÃO de campanha: origem e destino são SELLER_CAMPAIGN DIFERENTES; sem strict,
+    o check de "já ativo no destino" casava com a campanha de ORIGEM (started) e
+    marcava 'already_active' sem inscrever de fato no destino."""
     pt = _norm(promo_type)
     st = (status or "").strip().lower()
     fallback: dict[str, Any] | None = None
@@ -67,7 +73,7 @@ def find_offer_by_status(
             return p
         if fallback is None:
             fallback = p
-    return fallback
+    return None if strict else fallback
 
 
 class ResubscribeService:
@@ -160,8 +166,9 @@ class ResubscribeService:
         promos = await self._svc.fetch_eligible_promos(job.mlb_id)
 
         # Already re-enrolled (a prior tick won, or the operator redid it).
+        strict = bool(getattr(job, "strict_promo_id", False))
         started = find_offer_by_status(
-            promos, job.promo_type, status="started", promo_id=job.promo_id
+            promos, job.promo_type, status="started", promo_id=job.promo_id, strict=strict
         )
         if started is not None:
             await repo.mark_done(job)
@@ -169,7 +176,7 @@ class ResubscribeService:
             return "already_active"
 
         candidate = find_offer_by_status(
-            promos, job.promo_type, status="candidate", promo_id=job.promo_id
+            promos, job.promo_type, status="candidate", promo_id=job.promo_id, strict=strict
         )
         if candidate is None:
             await repo.bump_attempt(

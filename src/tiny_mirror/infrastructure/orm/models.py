@@ -1544,6 +1544,16 @@ class MLPromoResubscribeJobORM(Base):
         nullable=False,
         comment="Preço (deal_price) para reentrar quando a oferta reaparecer.",
     )
+    strict_promo_id: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=(
+            "Migração de campanha: casa SÓ o promo_id EXATO (sem fallback de "
+            "mesmo-tipo). Senão o check de 'já ativo no destino' casava com a "
+            "campanha de ORIGEM (started) e marcava done sem inscrever."
+        ),
+    )
     status: Mapped[str] = mapped_column(
         String(20),
         nullable=False,

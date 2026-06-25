@@ -919,6 +919,7 @@ class MLPromoResubscribeRepository:
         decided_by: str | None = None,
         last_error: str | None = None,
         last_status_code: int | None = None,
+        strict_promo_id: bool = False,
     ) -> MLPromoResubscribeJobORM:
         """Create (or reset) the pending re-subscribe job for this
         (mlb_id, promo_type). A partial unique index allows at most one
@@ -946,6 +947,7 @@ class MLPromoResubscribeRepository:
             existing.decided_by = decided_by
             existing.last_error = last_error
             existing.last_status_code = last_status_code
+            existing.strict_promo_id = strict_promo_id
             existing.resolved_at = None
             await self._session.flush()
             return existing
@@ -962,6 +964,7 @@ class MLPromoResubscribeRepository:
             decided_by=decided_by,
             last_error=last_error,
             last_status_code=last_status_code,
+            strict_promo_id=strict_promo_id,
         )
         self._session.add(row)
         await self._session.flush()

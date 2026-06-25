@@ -2705,6 +2705,10 @@ async def migrate_campaign(
             promo_id=body.target_promotion_id,
             op_id=op_id,
             decided_by=body.decided_by or "migrate-campaign",
+            # Casa SÓ o promo_id EXATO do destino: sem isto o check de "já ativo"
+            # casava com a campanha de ORIGEM (started, mesmo tipo) e marcava done
+            # sem inscrever de fato.
+            strict_promo_id=True,
         )
         enqueued += 1
     await session.commit()
