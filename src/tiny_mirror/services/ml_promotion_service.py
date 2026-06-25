@@ -1143,33 +1143,36 @@ class MLPromotionService:
         self, promotion_id: str, promotion_type: str, *, status: str = "candidate"
     ) -> list[dict[str, Any]]:
         """Itens de uma campanha por status (``candidate`` = elegíveis a entrar,
-        ``started`` = já inscritos). Pagina até esgotar (ML retorna ``paging``).
-        Cada candidato traz ``original_price``, ``min_discounted_price``,
-        ``max_discounted_price`` e ``suggested_discounted_price``."""
+        ``pending`` = inscritos/programados, ``started`` = ativos). Cada item traz
+        ``original_price``, ``min_discounted_price``, ``max_discounted_price`` e
+        ``suggested_discounted_price``.
+
+        ⚠ Esse endpoint pagina por CURSOR (``paging.searchAfter``), NÃO por offset —
+        passar ``offset`` é ignorado e o ML devolve sempre a 1ª página, então um loop
+        por offset só via os primeiros 50 (repetidos) e subcontava feio. Agora segue o
+        cursor ``search_after`` até a página vir vazia ou o cursor repetir/sumir."""
         url = f"{ML_API_BASE}/seller-promotions/promotions/{promotion_id}/items"
         out: list[dict[str, Any]] = []
-        offset = 0
-        for _ in range(40):  # hard stop ~2000 itens
-            body = await self._ml_get_json(
-                url,
-                {
-                    "promotion_type": promotion_type,
-                    "status": status,
-                    "app_version": "v2",
-                    "limit": 50,
-                    "offset": offset,
-                },
-                op="list_campaign_candidates",
-            )
+        search_after: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(400):  # hard stop ~20k itens
+            params: dict[str, Any] = {
+                "promotion_type": promotion_type,
+                "status": status,
+                "app_version": "v2",
+                "limit": 50,
+            }
+            if search_after:
+                params["search_after"] = search_after
+            body = await self._ml_get_json(url, params, op="list_campaign_candidates")
             if not isinstance(body, dict):
                 break
             page = body.get("results") or []
             out.extend(r for r in page if isinstance(r, dict))
-            paging = body.get("paging") or {}
-            total = int(paging.get("total") or 0)
-            offset += 50
-            if offset >= total or not page:
+            search_after = (body.get("paging") or {}).get("searchAfter")
+            if not page or not search_after or search_after in seen_cursors:
                 break
+            seen_cursors.add(search_after)
         return out
 
     async def fetch_catalog_competitors(self, catalog_product_id: str) -> list[dict[str, Any]]:
