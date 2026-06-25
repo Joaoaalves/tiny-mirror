@@ -3300,6 +3300,40 @@ class ModifyPromoIn(BaseModel):
     decided_by: str | None = None
 
 
+async def _settle_eligible(
+    service: MLPromotionService,
+    mlb_id: str,
+    promo_id: str | None,
+    *,
+    started: bool,
+    price: float | None = None,
+    tries: int = 12,
+    sleep_s: float = 3.0,
+) -> bool:
+    """Espera o ML ASSENTAR a promo no estado desejado (``started`` ou fora) e,
+    opcionalmente, no ``price`` alvo. O ML processa enroll/exit/edit de forma
+    ASSÍNCRONA — operar back-to-back sem isto causa ``NOT_FOUND_CANDIDATE_OR_OFFER``
+    (PUT antes do enroll assentar) ou corrida (reentrar antes do exit assentar)."""
+    import asyncio
+
+    for _ in range(tries):
+        await asyncio.sleep(sleep_s)
+        try:
+            promos = await service.fetch_eligible_promos(mlb_id)
+        except Exception:  # pragma: no cover — rede
+            continue
+        match = next((p for p in promos if promo_id and p.get("id") == promo_id), None)
+        is_started = match is not None and (match.get("status") or "").lower() == "started"
+        if is_started != started:
+            continue
+        if price is not None:
+            pp = match.get("price") if match is not None else None
+            if not (pp and abs(float(pp) - price) < 0.02):
+                continue
+        return True
+    return False
+
+
 @router.post("/modify-promotion")
 async def modify_promotion_endpoint(
     body: ModifyPromoIn,
@@ -3370,6 +3404,9 @@ async def modify_promotion_endpoint(
 
     if inplace_edit:
         # DEAL/SELLER_CAMPAIGN baixando/igual: edita IN-PLACE (PUT), sem sair.
+        # Garante que a oferta JÁ assentou no ML (senão o PUT dá NOT_FOUND, porque o
+        # ML ainda vê o item como 'candidate', não 'started').
+        await _settle_eligible(service, body.mlb_id, body.promo_id, started=True, tries=6)
         result = await service.edit_promotion_price(
             mlb_id=body.mlb_id,
             deal_price=float(body.new_price),
@@ -3377,6 +3414,16 @@ async def modify_promotion_endpoint(
             promotion_type=promo_type,
         )
         sc = result.get("status_code")
+        # Ainda assentando (NOT_FOUND) → espera mais e retenta uma vez.
+        if sc == 400 and "NOT_FOUND" in str(result.get("response")):
+            await _settle_eligible(service, body.mlb_id, body.promo_id, started=True)
+            result = await service.edit_promotion_price(
+                mlb_id=body.mlb_id,
+                deal_price=float(body.new_price),
+                promotion_id=body.promo_id,
+                promotion_type=promo_type,
+            )
+            sc = result.get("status_code")
         if sc is not None and sc >= 400:
             _done(
                 "ml_rejected",
@@ -3389,6 +3436,11 @@ async def modify_promotion_endpoint(
                 status_code=sc if sc < 600 else 502,
                 detail={"step": "modify", "response": result.get("response")},
             )
+        # Confirma que o ML assentou no NOVO preço (best-effort — o espelho é
+        # autoritativo p/ a tela; isto só dá tempo do ML refletir).
+        await _settle_eligible(
+            service, body.mlb_id, body.promo_id, started=True, price=float(body.new_price)
+        )
         action = "modify_promotion"
         reason = "alterar promoção inscrita: baixou o preço in-place"
         ml_response: dict[str, Any] = result
@@ -3412,6 +3464,10 @@ async def modify_promotion_endpoint(
                 status_code=exit_sc if exit_sc < 600 else 502,
                 detail={"step": "exit", "response": exit_result.get("response")},
             )
+        # ESPERA o exit ASSENTAR no ML antes de reentrar. O ML é assíncrono — se a
+        # gente reentra back-to-back, o reenter é ULTRAPASSADO pela saída (corrida) e
+        # o anúncio fica no preço ANTIGO. Aguardar a oferta sair primeiro evita isso.
+        await _settle_eligible(service, body.mlb_id, body.promo_id, started=False)
         # Reentra: PRICE_DISCOUNT (sem campanha) cria desconto de vendedor;
         # campanha reentra com o promotion_id (POST = nova inscrição).
         if promo_type == "PRICE_DISCOUNT" or body.promo_id is None:
