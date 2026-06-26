@@ -1782,7 +1782,9 @@ async def list_active_promotions(
                     "  c.max_seller_share_pct AS cap_pct, c.margin_floor_price AS floor_price "
                     "FROM ml_promotions p "
                     "LEFT JOIN ml_promo_caps c ON c.mlb_id = p.mlb_id "
-                    "WHERE p.status = 'started' "
+                    # 'pending' = inscrito e PROGRAMADO (campanha futura, ex.: Julho antes
+                    # de 01/07). É INSCRIÇÃO, não "disponível" — entra aqui junto de started.
+                    "WHERE p.status IN ('started', 'pending') "
                     "ORDER BY p.sku NULLS LAST, p.mlb_id, p.price"
                 )
             )
@@ -1859,7 +1861,10 @@ async def list_available_promotions(
                     "  c.margin_floor_price AS floor_price "
                     "FROM ml_promotions p "
                     "LEFT JOIN ml_promo_caps c ON c.mlb_id = p.mlb_id "
-                    "WHERE p.status <> 'started' "
+                    # 'started' E 'pending' = INSCRITO (pending = programado, campanha
+                    # futura). Disponível é só 'candidate'. Sem isto, a Julho programada
+                    # aparecia errada em Disponíveis em vez de Inscritas.
+                    "WHERE p.status NOT IN ('started', 'pending') "
                     # PRICE_DISCOUNT candidate é só "você PODE criar um desconto" (o
                     # ML retorna pra quase todo anúncio) — não é promoção que o ML
                     # oferece, então não polui Disponíveis. Criar desconto tem fluxo
