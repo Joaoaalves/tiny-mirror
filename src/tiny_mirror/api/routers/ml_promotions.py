@@ -1937,14 +1937,11 @@ async def list_available_promotions(
                     # próprio; PRICE_DISCOUNT já ATIVO (started) aparece em Inscritas.
                     "AND NOT (p.promotion_type = 'PRICE_DISCOUNT' AND p.status = 'candidate') "
                     # Co-participação (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN/BANK)
-                    # CANDIDATE = CONVITE perpétuo que o ML estende a quase todo
-                    # anúncio: o ML define o preço e auto-gerencia (auto-inicia). Não
-                    # é promoção acionável de verdade — clicar "Ativar" dá "Candidate
-                    # not valid". Some das Disponíveis; quando ATIVA (started) aparece
-                    # nas Inscritas normalmente.
-                    "AND NOT (p.promotion_type IN "
-                    "  ('SMART','PRICE_MATCHING','MARKETPLACE_CAMPAIGN','BANK') "
-                    "  AND p.status = 'candidate') "
+                    # candidate = convite que o ML estende a quase todo anúncio (o ML
+                    # auto-gerencia o preço/início). O usuário PEDIU pra mostrar mesmo
+                    # assim (transparência total — "Aumente suas vendas" etc.), então
+                    # NÃO escondemos mais. Vão como decision_kind='ml_managed' (a UI já
+                    # rotula "o ML define o preço").
                     "ORDER BY p.sku NULLS LAST, p.mlb_id, p.promotion_type"
                 )
             )
