@@ -2665,29 +2665,34 @@ async def _run_campaign_migration(
     Progresso em Redis ``migrate:{op_id}`` (campos total/done/failed/status)."""
     redis = get_redis()
     key = f"migrate:{op_id}"
-    sem = asyncio.Semaphore(8)
+    # Concorrência menor reduz o "No candidates found for item" — erro TRANSITÓRIO do
+    # ML (lista o item como candidato mas, sob carga/concorrência ou antes de assentar,
+    # não acha o candidato no enroll). NÃO é preço (item em-faixa também falhava).
+    sem = asyncio.Semaphore(4)
 
     async def _one(mlb_id: str, price: float) -> None:
         async with sem:
             ok = False
-            try:
-                r = await service.modify_promotion(
-                    mlb_id=mlb_id,
-                    deal_price=price,
-                    promotion_id=target,
-                    promotion_type="SELLER_CAMPAIGN",
-                )
-                sc = r.get("status_code")
-                ok = sc is None or int(sc) < 400
-                if not ok:
-                    logger.warning(
-                        "promo.migrate_item_failed",
+            detail: str | None = None
+            for attempt in range(3):  # retry: deixa o ML assentar o candidato
+                try:
+                    r = await service.modify_promotion(
                         mlb_id=mlb_id,
-                        ml_status_code=sc,
-                        response=str(r.get("response"))[:200],
+                        deal_price=price,
+                        promotion_id=target,
+                        promotion_type="SELLER_CAMPAIGN",
                     )
-            except Exception as exc:  # uma falha não derruba a migração
-                logger.warning("promo.migrate_item_error", mlb_id=mlb_id, error=str(exc))
+                    sc = r.get("status_code")
+                    ok = sc is None or int(sc) < 400
+                    detail = None if ok else str(r.get("response"))[:200]
+                except Exception as exc:  # uma falha não derruba a migração
+                    ok = False
+                    detail = str(exc)[:200]
+                if ok:
+                    break
+                await asyncio.sleep(1.5 * (attempt + 1))  # backoff
+            if not ok:
+                logger.warning("promo.migrate_item_failed", mlb_id=mlb_id, detail=detail)
             if ok:
                 # Marca a linha do espelho como started+enrolled_at (igual ao enroll
                 # único): o ML deixa o anúncio 'pending' (campanha futura), e a UI trata
