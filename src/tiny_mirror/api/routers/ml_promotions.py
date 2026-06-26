@@ -153,7 +153,8 @@ class CapOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     mlb_id: str
     sku: str
-    max_seller_share_pct: Decimal
+    # None = anúncio SEM cap configurado (capless). A UI trata como "sem limite".
+    max_seller_share_pct: Decimal | None
     margin_floor_price: Decimal | None
     auto_apply: bool
     has_active_promo: bool = False
@@ -759,15 +760,61 @@ async def list_caps(
             ),
         ),
     ] = False,
+    include_capless: Annotated[
+        bool,
+        Query(
+            description=(
+                "Also synthesize entries for active/paused listings with NO cap row, so "
+                "EVERY listing carries metadata/status/margin. The promoções board sets "
+                "this; the caps-management tab leaves it off."
+            ),
+        ),
+    ] = False,
     limit: int = Query(default=200, ge=1, le=2000),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(db_session),
 ) -> list[CapOut]:
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    from tiny_mirror.infrastructure.orm.models import MLListingORM
+
     repo = MLPromoCapRepository(session)
     rows, _ = await repo.list_all(only_auto=only_auto, limit=limit, offset=offset)
     enriched = [await _enrich_cap(session, r) for r in rows]
     if not include_orphans:
         enriched = [c for c in enriched if c.has_active_listing]
+    if include_capless:
+        # /caps é ancorado em ml_promo_caps; anúncio SEM linha de cap nunca aparece →
+        # no front fica sem foto/título/selo-pausado/margem. Sintetiza um cap VAZIO
+        # (cap/piso nulos) pra cada anúncio active/paused sem cap e reusa o mesmo
+        # enriquecimento (metadata de ml_listings, custo/margem do snapshot por MLB).
+        have = {c.mlb_id for c in enriched}
+        statuses = ("active", "paused") if include_orphans else ("active",)
+        listings = (
+            (await session.execute(select(MLListingORM).where(MLListingORM.status.in_(statuses))))
+            .scalars()
+            .all()
+        )
+        now = datetime.now(UTC)
+        for lst in listings:
+            if lst.mlb_id in have:
+                continue
+            synth = CapOut(
+                mlb_id=lst.mlb_id,
+                sku=lst.sku or lst.mlb_id,
+                max_seller_share_pct=None,
+                margin_floor_price=None,
+                auto_apply=False,
+                freight_band_opt=False,
+                skip_when_winning=False,
+                excluded_promo_types=[],
+                notes=None,
+                updated_by=None,
+                updated_at=now,
+            )
+            enriched.append(await _enrich_cap(session, synth))
     return enriched
 
 
