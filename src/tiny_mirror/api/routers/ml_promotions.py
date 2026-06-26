@@ -2949,9 +2949,11 @@ async def migrate_campaign(
     skipped_linked = len(linked_trad)
     missing = [m for m in missing if m not in linked_trad]
 
-    # Classifica cada faltante UM A UM no eligible do item: candidato SEM SMART ativo =
-    # migrável; com SMART ativo = bloqueado (o ML não empilha SELLER_CAMPAIGN sobre
-    # co-participação ativa); senão = já inscrito (lag) ou o ML não oferece o candidato.
+    # Classifica cada faltante UM A UM no eligible do item. SMART ATIVO **não**
+    # bloqueia migração (verificado: 150 anúncios estão no Julho COM SMART started).
+    # O que realmente recusa é o candidato-FANTASMA: o ML lista status=candidate mas
+    # sem faixa de preço (min/max/sugg todos None, price=0) → o enroll dá "No
+    # candidates found for item". Esses ficam de fora (voltam quando o ML der faixa).
     target_id = body.target_promotion_id
     sem = asyncio.Semaphore(10)
 
@@ -2961,13 +2963,16 @@ async def migrate_campaign(
         jul = next((p for p in promos if p.get("id") == target_id), None)
         if not jul or jul.get("status") != "candidate":
             return None
-        if any(p.get("type") == "SMART" and p.get("status") == "started" for p in promos):
-            return ("blocked", 0.0)
+        if not any(
+            jul.get(k)
+            for k in ("min_discounted_price", "max_discounted_price", "suggested_discounted_price")
+        ):
+            return ("no_range", 0.0)
         return ("ok", src_price[mlb])
 
     pairs = list(zip(missing, await asyncio.gather(*[_classify(m) for m in missing]), strict=False))
     to_migrate = [(m, r[1]) for m, r in pairs if r and r[0] == "ok"]
-    blocked_n = sum(1 for _, r in pairs if r and r[0] == "blocked")
+    no_range_n = sum(1 for _, r in pairs if r and r[0] == "no_range")
     total = already + len(to_migrate)
 
     if body.dry_run:
@@ -2976,7 +2981,7 @@ async def migrate_campaign(
             "total": total,
             "done": already,
             "to_migrate": len(to_migrate),
-            "blocked_smart": blocked_n,
+            "no_range": no_range_n,
             "no_source_price": no_price,
             "skipped_linked": skipped_linked,
             "source": body.source_promotion_id,
