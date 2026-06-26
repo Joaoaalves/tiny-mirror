@@ -1688,6 +1688,82 @@ async def list_decisions(
 _DYNAMIC_PROMO_TYPES = frozenset({"SMART", "PRICE_MATCHING", "MARKETPLACE_CAMPAIGN"})
 
 
+@router.get("/board")
+async def promotions_board(
+    session: AsyncSession = Depends(db_session),
+    include_paused: bool = True,
+) -> list[dict[str, Any]]:
+    """FONTE DA VERDADE das promoções, DESACOPLADA do sistema de decisões.
+
+    Cada anúncio do catálogo (``ml_listings``) com TODAS as suas promoções atuais do
+    espelho (``ml_promotions``) — o estado REAL do ML por anúncio: o que está ``started``
+    (inscrito), ``candidate`` (disponível p/ entrar), com preço/faixa/datas/co-participação.
+    Não passa por ``ml_promo_decisions``: um anúncio aparece mesmo sem decisão nenhuma. As
+    ações (enroll / exit / modify) atuam direto no espelho. O front monta a tela disto."""
+
+    def _f(v: Any) -> float | None:
+        return float(v) if v is not None else None
+
+    statuses = ["active", "paused"] if include_paused else ["active"]
+    result = await session.execute(
+        text(
+            "SELECT l.mlb_id, l.sku, l.title, l.thumbnail, l.permalink, "
+            "  l.status AS listing_status, l.available_quantity, l.price AS list_price, "
+            "  p.promo_key, p.promotion_id, p.promotion_type, p.status AS promo_status, "
+            "  p.name AS promo_name, p.price AS promo_price, p.original_price, "
+            "  p.suggested_price, p.min_price, p.max_price, p.meli_percentage, "
+            "  p.seller_percentage, p.start_date, p.finish_date, p.enrolled_at, "
+            "  c.max_seller_share_pct AS cap_pct, c.margin_floor_price AS floor_price "
+            "FROM ml_listings l "
+            "LEFT JOIN ml_promotions p ON p.mlb_id = l.mlb_id "
+            "LEFT JOIN ml_promo_caps c ON c.mlb_id = l.mlb_id "
+            "WHERE l.status = ANY(:st) "
+            "ORDER BY l.sku NULLS LAST, l.mlb_id, p.promotion_type"
+        ),
+        {"st": statuses},
+    )
+    board: dict[str, dict[str, Any]] = {}
+    for r in result.mappings():
+        mlb = r["mlb_id"]
+        item = board.get(mlb)
+        if item is None:
+            item = {
+                "mlb_id": mlb,
+                "sku": r["sku"],
+                "title": r["title"],
+                "thumbnail": r["thumbnail"],
+                "permalink": r["permalink"],
+                "listing_status": r["listing_status"],
+                "available_quantity": r["available_quantity"],
+                "list_price": _f(r["list_price"]),
+                "cap_pct": _f(r["cap_pct"]),
+                "floor_price": _f(r["floor_price"]),
+                "promos": [],
+            }
+            board[mlb] = item
+        if r["promo_key"]:
+            item["promos"].append(
+                {
+                    "promo_key": r["promo_key"],
+                    "promotion_id": r["promotion_id"],
+                    "promotion_type": r["promotion_type"],
+                    "status": r["promo_status"],
+                    "name": r["promo_name"],
+                    "price": _f(r["promo_price"]),
+                    "original_price": _f(r["original_price"]),
+                    "suggested_price": _f(r["suggested_price"]),
+                    "min_price": _f(r["min_price"]),
+                    "max_price": _f(r["max_price"]),
+                    "meli_percentage": _f(r["meli_percentage"]),
+                    "seller_percentage": _f(r["seller_percentage"]),
+                    "start_date": r["start_date"].isoformat() if r["start_date"] else None,
+                    "finish_date": r["finish_date"].isoformat() if r["finish_date"] else None,
+                    "enrolled": r["enrolled_at"] is not None,
+                }
+            )
+    return list(board.values())
+
+
 @router.get("/promotions/active", response_model=list[DecisionOut])
 async def list_active_promotions(
     session: AsyncSession = Depends(db_session),
