@@ -143,13 +143,29 @@ class PromotionMirrorService:
                         # AS-IS rebaixar p/ 'candidate' nem zerar o preço que a gente
                         # fixou no enroll/modify (era o "R$ 0,00" que ressurgia). O
                         # enrolled_at em si nunca é tocado pelo sync.
-                        "status": case(
-                            (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.status),
-                            else_=row["status"],
+                        # Inscrição nossa (enrolled_at): resiste só ao DOWNGRADE p/
+                        # 'candidate' (lag do eligible). Se o ML retorna started/pending
+                        # (ambos = inscrito; pending = programado p/ campanha futura), usa
+                        # o do ML — senão um 'started' travado escondia o 'pending'.
+                        "status": (
+                            row["status"]
+                            if row["status"] in ("started", "pending")
+                            else case(
+                                (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.status),
+                                else_=row["status"],
+                            )
                         ),
-                        "price": case(
-                            (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.price),
-                            else_=row["price"],
+                        # Idem preço: o eligible do DEAL/pending logo após o enroll vem 0,
+                        # então preserva o nosso SÓ nesse caso. Se o ML traz preço REAL
+                        # (>0), usa ele — senão um 0 fixado por engano ficava preso pra
+                        # sempre (era o "Julho mostrando R$ 0,00").
+                        "price": (
+                            row["price"]
+                            if (row["price"] is not None and row["price"] != 0)
+                            else case(
+                                (MLPromotionORM.enrolled_at.isnot(None), MLPromotionORM.price),
+                                else_=row["price"],
+                            )
                         ),
                         "last_seen_at": func.now(),
                         "updated_at": func.now(),
