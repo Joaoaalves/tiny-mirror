@@ -678,31 +678,50 @@ async def _enrich_cap(
     if snap is not None:
         out.list_price = snap.list_price
         out.base_cost = snap.base_cost
-        # Flex listings: override the (wrong) spreadsheet commission + generic
-        # freight bands with the per-MLB calibration. Fulfillment is unchanged.
-        eff_commission_pct, eff_freight_bands = await _effective_fees(session, cap.mlb_id, snap)
-        out.commission_pct = eff_commission_pct
-        out.freight_bands = eff_freight_bands
         out.sheet_promo_price = snap.sheet_promo_price
 
-        floor_price = cap.margin_floor_price or snap.sheet_promo_price
-        if (
-            floor_price is not None
-            and snap.base_cost is not None
-            and eff_commission_pct is not None
-            and eff_freight_bands
-        ):
-            try:
-                breakdown = margin_at_price(
-                    price=floor_price,
-                    base_cost=snap.base_cost,
-                    commission_pct=eff_commission_pct,
-                    freight_bands=eff_freight_bands,
-                )
-                out.margin_at_floor_value = breakdown.margin_value
-                out.margin_at_floor_pct = breakdown.margin_pct
-            except PricingDataError:
-                pass
+    # Flex listings: override the (wrong) spreadsheet commission + generic freight
+    # bands with the per-MLB calibration. Fulfillment is unchanged. Roda mesmo sem
+    # snapshot (snap=None) — a calibração Flex independe do custo da planilha.
+    eff_commission_pct, eff_freight_bands = await _effective_fees(session, cap.mlb_id, snap)
+    out.commission_pct = eff_commission_pct
+    out.freight_bands = eff_freight_bands
+
+    # Fallback de custo: quando a PLANILHA não tem (snapshot vazio/ausente), usa o
+    # custo do Tiny (products.prices.cost_price) — senão a margem fica "—". Na prática
+    # o custo do Tiny vem da mesma planilha, então tende a bater.
+    if out.base_cost is None:
+        tiny_cost = (
+            await session.execute(
+                text(
+                    "SELECT NULLIF(prices->>'cost_price', '')::numeric FROM products "
+                    "WHERE sku = :sku AND NULLIF(prices->>'cost_price', '') IS NOT NULL "
+                    "LIMIT 1"
+                ),
+                {"sku": cap.sku},
+            )
+        ).scalar_one_or_none()
+        if tiny_cost is not None:
+            out.base_cost = Decimal(str(tiny_cost))
+
+    floor_price = cap.margin_floor_price or (snap.sheet_promo_price if snap is not None else None)
+    if (
+        floor_price is not None
+        and out.base_cost is not None
+        and eff_commission_pct is not None
+        and eff_freight_bands
+    ):
+        try:
+            breakdown = margin_at_price(
+                price=floor_price,
+                base_cost=out.base_cost,
+                commission_pct=eff_commission_pct,
+                freight_bands=eff_freight_bands,
+            )
+            out.margin_at_floor_value = breakdown.margin_value
+            out.margin_at_floor_pct = breakdown.margin_pct
+        except PricingDataError:
+            pass
 
     listing = (
         await session.execute(select(MLListingORM).where(MLListingORM.mlb_id == cap.mlb_id))
