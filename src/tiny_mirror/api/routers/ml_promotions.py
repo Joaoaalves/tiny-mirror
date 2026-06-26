@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.api.dependencies import db_session
 from tiny_mirror.config import settings
+from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.repositories.ml_listing_repository import (
     MLListingRepository,
 )
@@ -2687,6 +2688,24 @@ async def _run_campaign_migration(
                     )
             except Exception as exc:  # uma falha não derruba a migração
                 logger.warning("promo.migrate_item_error", mlb_id=mlb_id, error=str(exc))
+            if ok:
+                # Marca a linha do espelho como started+enrolled_at (igual ao enroll
+                # único): o ML deixa o anúncio 'pending' (campanha futura), e a UI trata
+                # 'pending' como Disponíveis ("Entrar"). Sem isto, o anúncio migrado
+                # continuava aparecendo como "Entrar". enrolled_at protege do sync.
+                try:
+                    async with AsyncSessionLocal() as s:
+                        await s.execute(
+                            text(
+                                "UPDATE ml_promotions SET status='started', enrolled_at=now(), "
+                                "price=:price, updated_at=now() "
+                                "WHERE mlb_id=:m AND promotion_id=:t"
+                            ),
+                            {"price": price, "m": mlb_id, "t": target},
+                        )
+                        await s.commit()
+                except Exception as exc:  # falha no espelho não invalida o enroll no ML
+                    logger.warning("promo.migrate_mirror_failed", mlb_id=mlb_id, error=str(exc))
             await redis.hincrby(key, "done" if ok else "failed", 1)  # type: ignore[misc]
 
     try:
@@ -2740,7 +2759,8 @@ async def migrate_campaign(
     cand_ids = {str(c["id"]) for c in cand if c.get("id")}
     pend_ids = {str(p["id"]) for p in pend if p.get("id")}
     to_migrate = [(m, src_price[m]) for m in cand_ids if m in src_price]
-    already = len(pend_ids & set(src_price))
+    already_ids = pend_ids & set(src_price)
+    already = len(already_ids)
     total = already + len(to_migrate)
 
     if body.dry_run:
@@ -2753,6 +2773,19 @@ async def migrate_campaign(
             "source": body.source_promotion_id,
             "target": body.target_promotion_id,
         }
+
+    # Os que JÁ estão inscritos no destino aparecem 'pending' no ML → a UI os mostra
+    # como "Entrar". Reconcilia o espelho deles para started+enrolled_at agora, pra
+    # saírem de Disponíveis e irem pra Inscritas (os novos são tratados no bg task).
+    if already_ids:
+        await session.execute(
+            text(
+                "UPDATE ml_promotions SET status='started', enrolled_at=now(), updated_at=now() "
+                "WHERE promotion_id=:t AND mlb_id = ANY(:ids) AND status <> 'started'"
+            ),
+            {"t": body.target_promotion_id, "ids": list(already_ids)},
+        )
+        await session.commit()
 
     op_id = structlog.contextvars.get_contextvars().get("op_id") or uuid.uuid4().hex[:12]
     redis = get_redis()
