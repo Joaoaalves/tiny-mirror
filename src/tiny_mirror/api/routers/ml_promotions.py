@@ -2927,6 +2927,26 @@ async def migrate_campaign(
     missing = [m for m in not_enrolled if m in src_price]
     no_price = len(not_enrolled - set(src_price))
 
+    # Tradicionais VINCULADOS a um catálogo: a promo é gerida no CATÁLOGO e o tradicional
+    # segue sozinho — inscrever o tradicional direto falha/é redundante. Pula-os (mesmo
+    # dedup do front); só o catálogo migra. Era o caso do MLB4716453498 (tradicional do
+    # par com MLB3952397869) que "falhava".
+    linked_trad: set[str] = set()
+    if missing:
+        res = await session.execute(
+            text(
+                "SELECT l.mlb_id FROM ml_listings l "
+                "JOIN ml_catalog_status cs ON cs.mlb_id = l.mlb_id AND cs.catalog_listing = false "
+                "WHERE l.mlb_id = ANY(:m) AND EXISTS ("
+                "  SELECT 1 FROM unnest(l.linked_mlb_ids) lk "
+                "  JOIN ml_catalog_status cs2 ON cs2.mlb_id = lk AND cs2.catalog_listing = true)"
+            ),
+            {"m": missing},
+        )
+        linked_trad = {row[0] for row in res}
+    skipped_linked = len(linked_trad)
+    missing = [m for m in missing if m not in linked_trad]
+
     # Classifica cada faltante UM A UM no eligible do item: candidato SEM SMART ativo =
     # migrável; com SMART ativo = bloqueado (o ML não empilha SELLER_CAMPAIGN sobre
     # co-participação ativa); senão = já inscrito (lag) ou o ML não oferece o candidato.
@@ -2956,6 +2976,7 @@ async def migrate_campaign(
             "to_migrate": len(to_migrate),
             "blocked_smart": blocked_n,
             "no_source_price": no_price,
+            "skipped_linked": skipped_linked,
             "source": body.source_promotion_id,
             "target": body.target_promotion_id,
         }
