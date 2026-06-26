@@ -1851,6 +1851,9 @@ async def list_active_promotions(
                     # 'pending' = inscrito e PROGRAMADO (campanha futura, ex.: Julho antes
                     # de 01/07). É INSCRIÇÃO, não "disponível" — entra aqui junto de started.
                     "WHERE p.status IN ('started', 'pending') "
+                    # BANK = desconto CUMULATIVO (empilha sobre os outros) — o operador
+                    # não gerencia, então não mostramos nunca (nem aqui nem em Disponíveis).
+                    "AND p.promotion_type <> 'BANK' "
                     "ORDER BY p.sku NULLS LAST, p.mlb_id, p.price"
                 )
             )
@@ -1936,12 +1939,15 @@ async def list_available_promotions(
                     # oferece, então não polui Disponíveis. Criar desconto tem fluxo
                     # próprio; PRICE_DISCOUNT já ATIVO (started) aparece em Inscritas.
                     "AND NOT (p.promotion_type = 'PRICE_DISCOUNT' AND p.status = 'candidate') "
-                    # Co-participação (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN/BANK)
+                    # BANK = desconto CUMULATIVO (empilha sobre os outros) — o operador
+                    # não gerencia, então nunca mostramos (idem em Inscritas).
+                    "AND p.promotion_type <> 'BANK' "
+                    # Co-participação (SMART/PRICE_MATCHING/MARKETPLACE_CAMPAIGN)
                     # candidate = convite que o ML estende a quase todo anúncio (o ML
                     # auto-gerencia o preço/início). O usuário PEDIU pra mostrar mesmo
                     # assim (transparência total — "Aumente suas vendas" etc.), então
                     # NÃO escondemos mais. Vão como decision_kind='ml_managed' (a UI já
-                    # rotula "o ML define o preço").
+                    # rotula "o ML define o preço"). BANK é a exceção (cumulativo, acima).
                     "ORDER BY p.sku NULLS LAST, p.mlb_id, p.promotion_type"
                 )
             )
