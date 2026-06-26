@@ -2754,35 +2754,51 @@ async def migrate_campaign(
     ).all()
     src_price = {r[0]: float(r[1]) for r in rows}
 
-    # Destino: candidatos (a inscrever) + pending (já feitos). Paginação por cursor.
-    cand = await service.list_campaign_candidates(
-        body.target_promotion_id, "SELLER_CAMPAIGN", status="candidate"
-    )
-    pend = await service.list_campaign_candidates(
-        body.target_promotion_id, "SELLER_CAMPAIGN", status="pending"
-    )
-    cand_ids = {str(c["id"]) for c in cand if c.get("id")}
-    pend_ids = {str(p["id"]) for p in pend if p.get("id")}
-    to_migrate_all = [(m, src_price[m]) for m in cand_ids if m in src_price]
-
-    # Bloqueia quem está numa promoção SMART ATIVA (co-participação do ML): o ML não
-    # deixa empilhar uma SELLER_CAMPAIGN por cima e devolve "No candidates found for
-    # item" no enroll (verificado — os únicos que recusam têm SMART started). Voltam a
-    # ser migráveis quando o SMART acabar. Espelho tem o dado, então é só uma query.
-    blocked: set[str] = set()
-    if to_migrate_all:
-        res = await session.execute(
-            text(
-                "SELECT DISTINCT mlb_id FROM ml_promotions "
-                "WHERE mlb_id = ANY(:m) AND promotion_type = 'SMART' AND status = 'started'"
-            ),
-            {"m": [m for m, _ in to_migrate_all]},
+    # Ancorar no ORIGEM ATIVO (started no Junho), NÃO na lista de candidatos do destino:
+    # essa lista vem INCOMPLETA do ML (subconta os migráveis) e o espelho super-conta os
+    # inscritos — só o item-a-item bate. Universo = ativos no Junho que ainda NÃO estão
+    # inscritos no Julho; cada faltante é classificado no eligible do PRÓPRIO item.
+    jun_started = {
+        str(c["id"])
+        for c in await service.list_campaign_candidates(
+            body.source_promotion_id, "SELLER_CAMPAIGN", status="started"
         )
-        blocked = {row[0] for row in res}
-    to_migrate = [(m, p) for m, p in to_migrate_all if m not in blocked]
-
-    already_ids = pend_ids & set(src_price)
+        if c.get("id")
+    }
+    jul_enrolled: set[str] = set()
+    for _st in ("pending", "started"):
+        jul_enrolled |= {
+            str(c["id"])
+            for c in await service.list_campaign_candidates(
+                body.target_promotion_id, "SELLER_CAMPAIGN", status=_st
+            )
+            if c.get("id")
+        }
+    already_ids = jul_enrolled & set(src_price)
     already = len(already_ids)
+    not_enrolled = jun_started - jul_enrolled
+    missing = [m for m in not_enrolled if m in src_price]
+    no_price = len(not_enrolled - set(src_price))
+
+    # Classifica cada faltante UM A UM no eligible do item: candidato SEM SMART ativo =
+    # migrável; com SMART ativo = bloqueado (o ML não empilha SELLER_CAMPAIGN sobre
+    # co-participação ativa); senão = já inscrito (lag) ou o ML não oferece o candidato.
+    target_id = body.target_promotion_id
+    sem = asyncio.Semaphore(10)
+
+    async def _classify(mlb: str) -> tuple[str, float] | None:
+        async with sem:
+            promos = await service.fetch_eligible_promos(mlb)
+        jul = next((p for p in promos if p.get("id") == target_id), None)
+        if not jul or jul.get("status") != "candidate":
+            return None
+        if any(p.get("type") == "SMART" and p.get("status") == "started" for p in promos):
+            return ("blocked", 0.0)
+        return ("ok", src_price[mlb])
+
+    pairs = list(zip(missing, await asyncio.gather(*[_classify(m) for m in missing]), strict=False))
+    to_migrate = [(m, r[1]) for m, r in pairs if r and r[0] == "ok"]
+    blocked_n = sum(1 for _, r in pairs if r and r[0] == "blocked")
     total = already + len(to_migrate)
 
     if body.dry_run:
@@ -2791,8 +2807,8 @@ async def migrate_campaign(
             "total": total,
             "done": already,
             "to_migrate": len(to_migrate),
-            "blocked_smart": len(blocked),
-            "no_source_price": len(cand_ids - set(src_price)),
+            "blocked_smart": blocked_n,
+            "no_source_price": no_price,
             "source": body.source_promotion_id,
             "target": body.target_promotion_id,
         }
