@@ -2937,9 +2937,11 @@ async def migrate_campaign(
             text(
                 "SELECT l.mlb_id FROM ml_listings l "
                 "JOIN ml_catalog_status cs ON cs.mlb_id = l.mlb_id AND cs.catalog_listing = false "
-                "WHERE l.mlb_id = ANY(:m) AND EXISTS ("
-                "  SELECT 1 FROM unnest(l.linked_mlb_ids) lk "
-                "  JOIN ml_catalog_status cs2 ON cs2.mlb_id = lk AND cs2.catalog_listing = true)"
+                "WHERE l.mlb_id = ANY(:m) "
+                "AND jsonb_typeof(l.linked_mlb_ids) = 'array' "
+                "AND EXISTS ("
+                "  SELECT 1 FROM ml_catalog_status cs2 WHERE cs2.catalog_listing = true "
+                "  AND cs2.mlb_id IN (SELECT jsonb_array_elements_text(l.linked_mlb_ids)))"
             ),
             {"m": missing},
         )
