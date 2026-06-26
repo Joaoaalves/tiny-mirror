@@ -2763,7 +2763,24 @@ async def migrate_campaign(
     )
     cand_ids = {str(c["id"]) for c in cand if c.get("id")}
     pend_ids = {str(p["id"]) for p in pend if p.get("id")}
-    to_migrate = [(m, src_price[m]) for m in cand_ids if m in src_price]
+    to_migrate_all = [(m, src_price[m]) for m in cand_ids if m in src_price]
+
+    # Bloqueia quem está numa promoção SMART ATIVA (co-participação do ML): o ML não
+    # deixa empilhar uma SELLER_CAMPAIGN por cima e devolve "No candidates found for
+    # item" no enroll (verificado — os únicos que recusam têm SMART started). Voltam a
+    # ser migráveis quando o SMART acabar. Espelho tem o dado, então é só uma query.
+    blocked: set[str] = set()
+    if to_migrate_all:
+        res = await session.execute(
+            text(
+                "SELECT DISTINCT mlb_id FROM ml_promotions "
+                "WHERE mlb_id = ANY(:m) AND promotion_type = 'SMART' AND status = 'started'"
+            ),
+            {"m": [m for m, _ in to_migrate_all]},
+        )
+        blocked = {row[0] for row in res}
+    to_migrate = [(m, p) for m, p in to_migrate_all if m not in blocked]
+
     already_ids = pend_ids & set(src_price)
     already = len(already_ids)
     total = already + len(to_migrate)
@@ -2774,6 +2791,7 @@ async def migrate_campaign(
             "total": total,
             "done": already,
             "to_migrate": len(to_migrate),
+            "blocked_smart": len(blocked),
             "no_source_price": len(cand_ids - set(src_price)),
             "source": body.source_promotion_id,
             "target": body.target_promotion_id,
