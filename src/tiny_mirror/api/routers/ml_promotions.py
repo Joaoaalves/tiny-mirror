@@ -2986,9 +2986,8 @@ async def migrate_campaign(
     target_id = body.target_promotion_id
     sem = asyncio.Semaphore(10)
 
-    async def _classify(mlb: str) -> tuple[str, float] | None:
-        async with sem:
-            promos = await service.fetch_eligible_promos(mlb)
+    def _snapshot(promos: list[dict[str, Any]], price: float) -> str | None:
+        """Classifica UMA leitura do eligible: ok / out_of_range / no_range / None."""
         tgt = next((p for p in promos if p.get("id") == target_id), None)
         if not tgt or tgt.get("status") != "candidate":
             return None
@@ -2996,19 +2995,33 @@ async def migrate_campaign(
         hi = tgt.get("max_discounted_price")
         sg = tgt.get("suggested_discounted_price")
         if lo is None and hi is None and sg is None:
-            return ("no_range", 0.0)
-        # Mantém o preço da ORIGEM (mesmo processo). Se ele NÃO couber na faixa do
-        # destino (um DEAL de liquidação tem teto bem mais baixo que o cheio), o enroll
-        # falharia — então conta como out_of_range em vez de fingir que migra.
-        price = src_price[mlb]
+            return "no_range"
+        # Mantém o preço da ORIGEM (mesmo processo). Fora da faixa do destino (um DEAL
+        # de liquidação tem teto bem mais baixo) → out_of_range em vez de fingir migrar.
         if (lo is not None and price < float(lo)) or (hi is not None and price > float(hi)):
-            return ("out_of_range", price)
-        return ("ok", price)
+            return "out_of_range"
+        return "ok"
+
+    async def _classify(mlb: str) -> tuple[str, float] | None:
+        price = src_price[mlb]
+        async with sem:
+            c1 = _snapshot(await service.fetch_eligible_promos(mlb), price)
+        if c1 != "ok":
+            return (c1, 0.0) if c1 in ("no_range", "out_of_range") else None
+        # Parece migrável — mas o eligible do ML PISCA (eventual-consistent) p/ as
+        # borderline: aparece candidate num read e some no seguinte. Confirma num 2º
+        # read ~1,5s depois; só conta "ok" se firmar nos DOIS. Quem pisca = 'unstable'
+        # (não infla "a migrar", que ficava balançando 13/11/9/8 sem nunca zerar).
+        await asyncio.sleep(1.5)
+        async with sem:
+            c2 = _snapshot(await service.fetch_eligible_promos(mlb), price)
+        return ("ok", price) if c2 == "ok" else ("unstable", 0.0)
 
     pairs = list(zip(missing, await asyncio.gather(*[_classify(m) for m in missing]), strict=False))
     to_migrate = [(m, r[1]) for m, r in pairs if r and r[0] == "ok"]
     no_range_n = sum(1 for _, r in pairs if r and r[0] == "no_range")
     out_of_range_n = sum(1 for _, r in pairs if r and r[0] == "out_of_range")
+    unstable_n = sum(1 for _, r in pairs if r and r[0] == "unstable")
     total = already + len(to_migrate)
 
     if body.dry_run:
@@ -3019,6 +3032,7 @@ async def migrate_campaign(
             "to_migrate": len(to_migrate),
             "no_range": no_range_n,
             "out_of_range": out_of_range_n,
+            "unstable": unstable_n,
             "no_source_price": no_price,
             "skipped_linked": skipped_linked,
             "source_type": source_type,
