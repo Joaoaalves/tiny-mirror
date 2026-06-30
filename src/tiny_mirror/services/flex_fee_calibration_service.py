@@ -19,6 +19,7 @@ Runs weekly from the scheduler; also exposed via POST /ml-promotions/calibrate-f
 
 from __future__ import annotations
 
+import asyncio
 import statistics as st
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -38,6 +39,7 @@ from tiny_mirror.infrastructure.orm.models import (
 logger = structlog.get_logger(__name__)
 
 _API = "https://api.mercadolibre.com"
+_REP_ZIP = "01310100"  # Av. Paulista, SP — CEP representativo p/ estimar frete dos sem-venda
 _PAGE = 50
 _VALID = {"paid", "shipped", "delivered", "partially_paid"}
 
@@ -62,6 +64,22 @@ class FlexFeeCalibrationService:
         if r.status_code >= 400:
             return None
         return r.json()
+
+    async def _seller_freight_estimate(self, mlb: str) -> float | None:
+        """Frete REAL do vendedor da opção GRÁTIS no CEP representativo (SP), via
+        ``/items/{mlb}/shipping_options`` (``list_cost`` da opção com ``cost==0``). Pros
+        anúncios SEM venda no período — substitui a média global de fallback, que
+        subestimava (ex.: 6,01 vs 14,45 real do ML). ``None`` se não houver opção grátis
+        (anúncio sem frete grátis → vendedor não paga frete; mantém o fallback global)."""
+        d = await self._get(f"{_API}/items/{mlb}/shipping_options", {"zip_code": _REP_ZIP})
+        if not isinstance(d, dict):
+            return None
+        free = [
+            o.get("list_cost")
+            for o in (d.get("options") or [])
+            if (o.get("cost") or 0) == 0 and o.get("list_cost") is not None
+        ]
+        return round(min(float(x) for x in free), 2) if free else None
 
     async def _orders_for_day(self, day: date) -> list[dict[str, Any]]:
         """Return raw order-item rows for one day: mlb, qty, unit_price, sale_fee, shipping_id."""
@@ -217,19 +235,34 @@ class FlexFeeCalibrationService:
         # they don't silently fall back to the wrong fulfillment-style bands.
         # real_comm_pct stays NULL (no data) → override keeps snapshot commission.
         covered = {v["mlb_id"] for v in values}
-        n_fallback = 0
-        for mlb in logi:
-            if mlb in covered or status.get(mlb) != "active" or not is_flex(mlb):
-                continue
-            n_fallback += 1
+        fallback_mlbs = [
+            mlb
+            for mlb in logi
+            if mlb not in covered and status.get(mlb) == "active" and is_flex(mlb)
+        ]
+        # Sem venda no período: em vez da média global (que SUBESTIMA — ex.: 6,01 vs
+        # 14,45 real), busca o frete REAL da opção grátis no CEP representativo (SP) via
+        # /items/{mlb}/shipping_options. Falha/sem-grátis → cai pra média global. Os COM
+        # venda continuam no frete real dos próprios envios (acima).
+        _fsem = asyncio.Semaphore(8)
+
+        async def _est(mlb: str) -> tuple[str, float | None]:
+            async with _fsem:
+                return mlb, await self._seller_freight_estimate(mlb)
+
+        real_fr = dict(await asyncio.gather(*[_est(m) for m in fallback_mlbs]))
+        n_fallback = len(fallback_mlbs)
+        n_real = sum(1 for v in real_fr.values() if v is not None)
+        for mlb in fallback_mlbs:
+            rf = real_fr.get(mlb)
             values.append(
                 {
                     "mlb_id": mlb,
                     "sku": sku_by_mlb.get(mlb),
                     "n_sales": 0,
                     "real_comm_pct": None,
-                    "freight_per_unit_lt79": fb_lt,
-                    "freight_per_unit_ge79": fb_ge,
+                    "freight_per_unit_lt79": rf if rf is not None else fb_lt,
+                    "freight_per_unit_ge79": rf if rf is not None else fb_ge,
                     "payback_per_unit_lt79": 0.0,
                     "payback_per_unit_ge79": 0.0,
                     "n_freight_lt79": 0,
@@ -249,6 +282,7 @@ class FlexFeeCalibrationService:
             "days": days,
             "flex_mlbs_with_sales": len(by),
             "flex_mlbs_fallback": n_fallback,
+            "fallback_from_ml_endpoint": n_real,
             "rows_written": len(values),
             "shipments_fetched": n_ship,
             "fallback_freight_lt79": fb_lt,
