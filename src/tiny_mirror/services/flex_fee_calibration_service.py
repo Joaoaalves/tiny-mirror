@@ -66,20 +66,21 @@ class FlexFeeCalibrationService:
         return r.json()
 
     async def _seller_freight_estimate(self, mlb: str) -> float | None:
-        """Frete REAL do vendedor da opção GRÁTIS no CEP representativo (SP), via
-        ``/items/{mlb}/shipping_options`` (``list_cost`` da opção com ``cost==0``). Pros
-        anúncios SEM venda no período — substitui a média global de fallback, que
-        subestimava (ex.: 6,01 vs 14,45 real do ML). ``None`` se não houver opção grátis
-        (anúncio sem frete grátis → vendedor não paga frete; mantém o fallback global)."""
+        """Frete do vendedor pela opção GRÁTIS no CEP representativo (SP), IGUAL ao
+        Mercado Turbo: ``GET /items/{mlb}/shipping_options`` → MAIOR ``list_cost`` entre as
+        opções com ``cost==0`` (a entrega padrão a domicílio; o ML pode listar uma agência
+        mais barata, mas a referência usa a cheia). Ex.: MLB6447789292 → 14,45 (= Turbo).
+        Retorna ``0.0`` se o anúncio não tem frete grátis no CEP (vendedor não paga frete);
+        ``None`` só em FALHA de API (o caller cai pra média global)."""
         d = await self._get(f"{_API}/items/{mlb}/shipping_options", {"zip_code": _REP_ZIP})
-        if not isinstance(d, dict):
+        if not isinstance(d, dict) or "options" not in d:
             return None
         free = [
-            o.get("list_cost")
+            float(o.get("list_cost"))
             for o in (d.get("options") or [])
             if (o.get("cost") or 0) == 0 and o.get("list_cost") is not None
         ]
-        return round(min(float(x) for x in free), 2) if free else None
+        return round(max(free), 2) if free else 0.0
 
     async def _orders_for_day(self, day: date) -> list[dict[str, Any]]:
         """Return raw order-item rows for one day: mlb, qty, unit_price, sale_fee, shipping_id."""
@@ -171,98 +172,39 @@ class FlexFeeCalibrationService:
             )
             d["rates"].append(r["sale_fee"] / r["price"] * 100)
 
-        # --- freight: fetch shipment costs, >=79 first then <79 (capped) ----
-        seen_ship: dict[str, dict[str, Any] | None] = {}
-        sid_price: dict[str, float] = {}
-        for r in order_rows:
-            sid = r["shipping_id"]
-            if sid:
-                sid_price[sid] = max(sid_price.get(sid, 0.0), r["price"])
-        ordered_sids = sorted(sid_price, key=lambda s: 0 if sid_price[s] >= 79 else 1)
-        glob_lt: list[float] = []
-        glob_ge: list[float] = []
-        n_ship = 0
-        for sid in ordered_sids:
-            if n_ship >= max_shipments:
-                break
-            c = await self._get(f"{_API}/shipments/{sid}/costs")
-            n_ship += 1
-            if c is None:
-                seen_ship[sid] = None
-                continue
-            snd = (c.get("senders") or [{}])[0]
-            seen_ship[sid] = {
-                "cost": float(snd.get("cost") or 0),
-                "save": float(snd.get("save") or 0),
-            }
-        for r in order_rows:
-            sc = seen_ship.get(r["shipping_id"])
-            if not sc:
-                continue
-            per_cost = sc["cost"] / r["qty"]
-            per_save = sc["save"] / r["qty"]
-            d = by[r["mlb"]]
-            if r["price"] >= 79:
-                d["fr_ge"].append(per_cost)
-                d["pb_ge"].append(per_save)
-                glob_ge.append(per_cost)
-            else:
-                d["fr_lt"].append(per_cost)
-                d["pb_lt"].append(per_save)
-                glob_lt.append(per_cost)
-
-        fb_lt = round(st.mean(glob_lt), 2) if glob_lt else 0.0
-        fb_ge = round(st.mean(glob_ge), 2) if glob_ge else 0.0
-
-        # --- assemble per-MLB rows (+ all active Flex with fallback) --------
-        values: list[dict[str, Any]] = []
-        for mlb, d in by.items():
-            values.append(
-                {
-                    "mlb_id": mlb,
-                    "sku": sku_by_mlb.get(mlb),
-                    "n_sales": len(d["rates"]),
-                    "real_comm_pct": round(st.median(d["rates"]), 2) if d["rates"] else None,
-                    "freight_per_unit_lt79": round(st.mean(d["fr_lt"]), 2) if d["fr_lt"] else fb_lt,
-                    "freight_per_unit_ge79": round(st.mean(d["fr_ge"]), 2) if d["fr_ge"] else fb_ge,
-                    "payback_per_unit_lt79": round(st.mean(d["pb_lt"]), 2) if d["pb_lt"] else 0.0,
-                    "payback_per_unit_ge79": round(st.mean(d["pb_ge"]), 2) if d["pb_ge"] else 0.0,
-                    "n_freight_lt79": len(d["fr_lt"]),
-                    "n_freight_ge79": len(d["fr_ge"]),
-                }
-            )
-        # Active Flex listings with no sales in window → global fallback row so
-        # they don't silently fall back to the wrong fulfillment-style bands.
-        # real_comm_pct stays NULL (no data) → override keeps snapshot commission.
-        covered = {v["mlb_id"] for v in values}
-        fallback_mlbs = [
-            mlb
-            for mlb in logi
-            if mlb not in covered and status.get(mlb) == "active" and is_flex(mlb)
-        ]
-        # Sem venda no período: em vez da média global (que SUBESTIMA — ex.: 6,01 vs
-        # 14,45 real), busca o frete REAL da opção grátis no CEP representativo (SP) via
-        # /items/{mlb}/shipping_options. Falha/sem-grátis → cai pra média global. Os COM
-        # venda continuam no frete real dos próprios envios (acima).
+        # --- FRETE: padronizado no shipping_options do ML (igual ao Mercado Turbo) pra
+        # TODOS os anúncios Flex ativos — não mais o frete-por-envio. A cota do ML é o que
+        # o Turbo usa (pode superestimar vs o cobrado real, mas o operador quer bater com a
+        # ferramenta). A comissão segue do real das vendas (real_comm_pct).
+        active_flex = [mlb for mlb in logi if status.get(mlb) == "active" and is_flex(mlb)]
         _fsem = asyncio.Semaphore(8)
 
         async def _est(mlb: str) -> tuple[str, float | None]:
             async with _fsem:
                 return mlb, await self._seller_freight_estimate(mlb)
 
-        real_fr = dict(await asyncio.gather(*[_est(m) for m in fallback_mlbs]))
-        n_fallback = len(fallback_mlbs)
-        n_real = sum(1 for v in real_fr.values() if v is not None)
-        for mlb in fallback_mlbs:
-            rf = real_fr.get(mlb)
+        freight_by = dict(await asyncio.gather(*[_est(m) for m in active_flex]))
+        ok_vals = [v for v in freight_by.values() if v is not None]
+        fb_freight = round(st.mean(ok_vals), 2) if ok_vals else 0.0  # falha de API → média
+        n_freight_api = len(ok_vals)
+
+        # --- assemble: 1 linha por anúncio Flex ATIVO — frete do shipping_options pra
+        # todos (igual ao Turbo); comissão real das vendas quando houver. A cota do frete
+        # independe do preço, então vale pras duas faixas (lt79/ge79). payback=0 (a cota já
+        # é o bruto que o vendedor paga; o subsídio do ML é o da promo, via meli_banca).
+        values: list[dict[str, Any]] = []
+        for mlb in active_flex:
+            fr = freight_by.get(mlb)
+            fr = fr if fr is not None else fb_freight
+            rates = by.get(mlb, {}).get("rates", [])
             values.append(
                 {
                     "mlb_id": mlb,
                     "sku": sku_by_mlb.get(mlb),
-                    "n_sales": 0,
-                    "real_comm_pct": None,
-                    "freight_per_unit_lt79": rf if rf is not None else fb_lt,
-                    "freight_per_unit_ge79": rf if rf is not None else fb_ge,
+                    "n_sales": len(rates),
+                    "real_comm_pct": round(st.median(rates), 2) if rates else None,
+                    "freight_per_unit_lt79": fr,
+                    "freight_per_unit_ge79": fr,
                     "payback_per_unit_lt79": 0.0,
                     "payback_per_unit_ge79": 0.0,
                     "n_freight_lt79": 0,
@@ -280,13 +222,11 @@ class FlexFeeCalibrationService:
 
         stats = {
             "days": days,
+            "active_flex_listings": len(active_flex),
             "flex_mlbs_with_sales": len(by),
-            "flex_mlbs_fallback": n_fallback,
-            "fallback_from_ml_endpoint": n_real,
+            "freight_from_ml_endpoint": n_freight_api,
+            "freight_api_fallback_mean": fb_freight,
             "rows_written": len(values),
-            "shipments_fetched": n_ship,
-            "fallback_freight_lt79": fb_lt,
-            "fallback_freight_ge79": fb_ge,
         }
         logger.info("flex_fee_calibration done", **stats)
         return stats
