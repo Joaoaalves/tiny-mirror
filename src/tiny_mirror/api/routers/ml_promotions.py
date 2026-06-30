@@ -12,6 +12,7 @@ Surfaces 4 groups:
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -2809,6 +2810,7 @@ async def _run_campaign_migration(
     target: str,
     items: list[tuple[str, float]],
     service: MLPromotionService,
+    target_type: str = "SELLER_CAMPAIGN",
 ) -> None:
     """Inscreve os anúncios candidatos na campanha destino — DIRETO e CONCORRENTE
     (sem fila throttled). Cada inscrição é um POST /seller-promotions/items/{MLB}.
@@ -2830,11 +2832,15 @@ async def _run_campaign_migration(
                         mlb_id=mlb_id,
                         deal_price=price,
                         promotion_id=target,
-                        promotion_type="SELLER_CAMPAIGN",
+                        promotion_type=target_type,
                     )
                     sc = r.get("status_code")
                     ok = sc is None or int(sc) < 400
-                    detail = None if ok else str(r.get("response"))[:200]
+                    if ok:
+                        detail = None
+                    else:
+                        resp = r.get("response")
+                        detail = str(resp.get("message") if isinstance(resp, dict) else resp)[:200]
                 except Exception as exc:  # uma falha não derruba a migração
                     ok = False
                     detail = str(exc)[:200]
@@ -2843,6 +2849,14 @@ async def _run_campaign_migration(
                 await asyncio.sleep(1.5 * (attempt + 1))  # backoff
             if not ok:
                 logger.warning("promo.migrate_item_failed", mlb_id=mlb_id, detail=detail)
+                try:  # guarda o erro pro card de erros do modal (enriquecido no status)
+                    await redis.rpush(  # type: ignore[misc]
+                        f"{key}:errors",
+                        json.dumps({"mlb_id": mlb_id, "reason": detail or "erro desconhecido"}),
+                    )
+                    await redis.expire(f"{key}:errors", 7200)
+                except Exception:  # erro no Redis não invalida a migração
+                    pass
             if ok:
                 # Marca a linha do espelho como started+enrolled_at (igual ao enroll
                 # único): o ML deixa o anúncio 'pending' (campanha futura), e a UI trata
@@ -2893,40 +2907,52 @@ async def migrate_campaign(
     ``migrate:{op_id}`` no Redis — faça poll em GET migrate-campaign/{migration_id}.
 
     dry_run=true (padrão) só conta {total, done, to_migrate}; dry_run=false inscreve."""
+    # Tipos das campanhas (origem/destino): o enroll e a listagem de itens precisam do
+    # promotion_type certo. Suporta SELLER_CAMPAIGN→SELLER_CAMPAIGN e SELLER_CAMPAIGN→DEAL
+    # (ex.: Julho → "Liquida Full - Outlet").
+    camp_types = {c.get("id"): c.get("type") for c in await service.list_seller_campaigns()}
+    source_type = camp_types.get(body.source_promotion_id) or "SELLER_CAMPAIGN"
+    target_type = camp_types.get(body.target_promotion_id) or "SELLER_CAMPAIGN"
+
     rows = (
         await session.execute(
             text(
+                # origem inscrita = started OU pending (pending = campanha programada,
+                # ex.: Julho antes de 01/07) — sem o pending, migrar A PARTIR do Julho
+                # pegaria preço nenhum.
                 "SELECT mlb_id, price FROM ml_promotions WHERE promotion_id = :src "
-                "AND status = 'started' AND price IS NOT NULL AND price > 0"
+                "AND status IN ('started', 'pending') AND price IS NOT NULL AND price > 0"
             ),
             {"src": body.source_promotion_id},
         )
     ).all()
     src_price = {r[0]: float(r[1]) for r in rows}
 
-    # Ancorar no ORIGEM ATIVO (started no Junho), NÃO na lista de candidatos do destino:
-    # essa lista vem INCOMPLETA do ML (subconta os migráveis) e o espelho super-conta os
-    # inscritos — só o item-a-item bate. Universo = ativos no Junho que ainda NÃO estão
-    # inscritos no Julho; cada faltante é classificado no eligible do PRÓPRIO item.
-    jun_started = {
-        str(c["id"])
-        for c in await service.list_campaign_candidates(
-            body.source_promotion_id, "SELLER_CAMPAIGN", status="started"
-        )
-        if c.get("id")
-    }
-    jul_enrolled: set[str] = set()
-    for _st in ("pending", "started"):
-        jul_enrolled |= {
+    # Ancorar nos INSCRITOS DA ORIGEM (started OU pending), NÃO na lista de candidatos do
+    # destino: essa lista vem INCOMPLETA do ML (subconta os migráveis) e o espelho
+    # super-conta os inscritos — só o item-a-item bate. Universo = inscritos na origem que
+    # ainda NÃO estão no destino; cada faltante é classificado no eligible do PRÓPRIO item.
+    src_enrolled: set[str] = set()
+    for _st in ("started", "pending"):
+        src_enrolled |= {
             str(c["id"])
             for c in await service.list_campaign_candidates(
-                body.target_promotion_id, "SELLER_CAMPAIGN", status=_st
+                body.source_promotion_id, source_type, status=_st
             )
             if c.get("id")
         }
-    already_ids = jul_enrolled & set(src_price)
+    tgt_enrolled: set[str] = set()
+    for _st in ("pending", "started"):
+        tgt_enrolled |= {
+            str(c["id"])
+            for c in await service.list_campaign_candidates(
+                body.target_promotion_id, target_type, status=_st
+            )
+            if c.get("id")
+        }
+    already_ids = tgt_enrolled & set(src_price)
     already = len(already_ids)
-    not_enrolled = jun_started - jul_enrolled
+    not_enrolled = src_enrolled - tgt_enrolled
     missing = [m for m in not_enrolled if m in src_price]
     no_price = len(not_enrolled - set(src_price))
 
@@ -2963,19 +2989,26 @@ async def migrate_campaign(
     async def _classify(mlb: str) -> tuple[str, float] | None:
         async with sem:
             promos = await service.fetch_eligible_promos(mlb)
-        jul = next((p for p in promos if p.get("id") == target_id), None)
-        if not jul or jul.get("status") != "candidate":
+        tgt = next((p for p in promos if p.get("id") == target_id), None)
+        if not tgt or tgt.get("status") != "candidate":
             return None
-        if not any(
-            jul.get(k)
-            for k in ("min_discounted_price", "max_discounted_price", "suggested_discounted_price")
-        ):
+        lo = tgt.get("min_discounted_price")
+        hi = tgt.get("max_discounted_price")
+        sg = tgt.get("suggested_discounted_price")
+        if lo is None and hi is None and sg is None:
             return ("no_range", 0.0)
-        return ("ok", src_price[mlb])
+        # Mantém o preço da ORIGEM (mesmo processo). Se ele NÃO couber na faixa do
+        # destino (um DEAL de liquidação tem teto bem mais baixo que o cheio), o enroll
+        # falharia — então conta como out_of_range em vez de fingir que migra.
+        price = src_price[mlb]
+        if (lo is not None and price < float(lo)) or (hi is not None and price > float(hi)):
+            return ("out_of_range", price)
+        return ("ok", price)
 
     pairs = list(zip(missing, await asyncio.gather(*[_classify(m) for m in missing]), strict=False))
     to_migrate = [(m, r[1]) for m, r in pairs if r and r[0] == "ok"]
     no_range_n = sum(1 for _, r in pairs if r and r[0] == "no_range")
+    out_of_range_n = sum(1 for _, r in pairs if r and r[0] == "out_of_range")
     total = already + len(to_migrate)
 
     if body.dry_run:
@@ -2985,8 +3018,11 @@ async def migrate_campaign(
             "done": already,
             "to_migrate": len(to_migrate),
             "no_range": no_range_n,
+            "out_of_range": out_of_range_n,
             "no_source_price": no_price,
             "skipped_linked": skipped_linked,
+            "source_type": source_type,
+            "target_type": target_type,
             "source": body.source_promotion_id,
             "target": body.target_promotion_id,
         }
@@ -3019,7 +3055,7 @@ async def migrate_campaign(
     )
     await redis.expire(key, 7200)
     task = asyncio.create_task(
-        _run_campaign_migration(op_id, body.target_promotion_id, to_migrate, service)
+        _run_campaign_migration(op_id, body.target_promotion_id, to_migrate, service, target_type)
     )
     _migration_tasks.add(task)
     task.add_done_callback(_migration_tasks.discard)
@@ -3043,13 +3079,52 @@ async def migrate_campaign(
 
 
 @router.get("/promotions/migrate-campaign/{op_id}")
-async def migrate_campaign_status(op_id: str) -> dict[str, Any]:
-    """Progresso de uma migração em voo (Redis ``migrate:{op_id}``)."""
-    data = await get_redis().hgetall(f"migrate:{op_id}")  # type: ignore[misc]
+async def migrate_campaign_status(
+    op_id: str,
+    session: AsyncSession = Depends(db_session),
+) -> dict[str, Any]:
+    """Progresso de uma migração em voo (Redis ``migrate:{op_id}``) + a lista de ERROS
+    por item (mlb/sku/título/foto/motivo), pro modal mostrar em cards navegáveis."""
+    from sqlalchemy import select
+
+    from tiny_mirror.infrastructure.orm.models import MLListingORM
+
+    redis = get_redis()
+    data = await redis.hgetall(f"migrate:{op_id}")  # type: ignore[misc]
     if not data:
         return {"found": False}
     total = int(data.get("total", 0) or 0)
     done = int(data.get("done", 0) or 0)
+
+    # Erros guardados pelo bg task ({mlb_id, reason}) — enriquece com sku/título/foto
+    # do ml_listings pra montar o cardzinho. Podem ser centenas; o modal pagina 1 a 1.
+    errors: list[dict[str, Any]] = []
+    raw = await redis.lrange(f"migrate:{op_id}:errors", 0, -1)  # type: ignore[misc]
+    if raw:
+        parsed = [json.loads(e) for e in raw]
+        rows = (
+            await session.execute(
+                select(
+                    MLListingORM.mlb_id,
+                    MLListingORM.sku,
+                    MLListingORM.title,
+                    MLListingORM.thumbnail,
+                ).where(MLListingORM.mlb_id.in_([p["mlb_id"] for p in parsed]))
+            )
+        ).all()
+        meta = {r[0]: (r[1], r[2], r[3]) for r in rows}
+        for p in parsed:
+            sku, title, thumb = meta.get(p["mlb_id"], (None, None, None))
+            errors.append(
+                {
+                    "mlb_id": p["mlb_id"],
+                    "reason": p.get("reason"),
+                    "sku": sku,
+                    "title": title,
+                    "thumbnail": thumb,
+                }
+            )
+
     return {
         "found": True,
         "total": total,
@@ -3057,6 +3132,7 @@ async def migrate_campaign_status(op_id: str) -> dict[str, Any]:
         "failed": int(data.get("failed", 0) or 0),
         "status": data.get("status", "running"),
         "pct": round(100 * done / total) if total else 100,
+        "errors": errors,
     }
 
 
