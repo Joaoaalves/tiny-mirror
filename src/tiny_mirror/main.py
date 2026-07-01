@@ -19,6 +19,7 @@ from tiny_mirror.api.error_handlers import register_error_handlers
 from tiny_mirror.api.middleware import RequestIdMiddleware, RequestLoggingMiddleware
 from tiny_mirror.api.routers.fulfillment import router as fulfillment_router
 from tiny_mirror.api.routers.health import router as health_router
+from tiny_mirror.api.routers.ml_fl_tracking import router as ml_fl_tracking_router
 from tiny_mirror.api.routers.ml_promotions import router as ml_promotions_router
 from tiny_mirror.api.routers.orders import router as orders_router
 from tiny_mirror.api.routers.products import router as products_router
@@ -225,6 +226,12 @@ def create_app() -> FastAPI:
         ml_promotions_router,
         prefix="/ml-promotions",
         tags=["ML Promotions"],
+        dependencies=protected,
+    )
+    app.include_router(
+        ml_fl_tracking_router,
+        prefix="/ml-fl-tracking",
+        tags=["Estoque Full"],
         dependencies=protected,
     )
 

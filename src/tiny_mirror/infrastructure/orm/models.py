@@ -1109,6 +1109,9 @@ class MLSalesDailyORM(Base):
     sale_date: Mapped[date] = mapped_column(Date, primary_key=True)
     sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
     qty: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    revenue: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, server_default=text("0")
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1829,5 +1832,145 @@ class MLFlexFeeCalibrationORM(Base):
     n_freight_lt79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     n_freight_ge79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_fl_tracking  (Estoque Full — acompanhamento de anúncios FULFILLMENT)
+# ---------------------------------------------------------------------------
+class MLFlTrackingORM(Base):
+    """Um anúncio FULFILLMENT que o operador decidiu acompanhar.
+
+    Nasce quando o usuário clica "acompanhar" na aba Novos: capturamos um
+    snapshot do estado no momento da transição (estoque FL, galpão, ritmo de
+    vendas, % de promoção) para comparar depois. ``status`` caminha
+    ``tracking`` -> ``finalized``. Índice parcial único garante no máximo um
+    acompanhamento ativo por MLB; linhas ``finalized`` acumulam como histórico
+    e permitem re-acompanhar o mesmo anúncio mais tarde.
+    """
+
+    __tablename__ = "ml_fl_tracking"
+    __table_args__ = (
+        Index(
+            "uq_ml_fl_tracking_active_mlb",
+            "mlb_id",
+            unique=True,
+            postgresql_where=text("status = 'tracking'"),
+        ),
+        Index("ix_ml_fl_tracking_status", "status"),
+        CheckConstraint(
+            "status IN ('tracking', 'finalized')",
+            name="status",
+        ),
+        {
+            "comment": (
+                "Estoque Full: anúncios fulfillment em acompanhamento/finalizados, "
+                "com snapshot inicial e final do estado do anúncio."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, server_default=text("'tracking'")
+    )
+
+    # Snapshot inicial (momento do "acompanhar")
+    moved_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    moved_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    initial_stock_full: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initial_stock_galpao: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initial_daily_rate_30d: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    initial_promo_pct: Mapped[Decimal | None] = mapped_column(Numeric(7, 2), nullable=True)
+    initial_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Linha completa (métricas + curva ABC + status) no momento do acompanhar.",
+    )
+
+    # Snapshot final (momento do "finalizar")
+    finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finalized_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    final_stock_full: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    final_daily_rate_30d: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    final_promo_pct: Mapped[Decimal | None] = mapped_column(Numeric(7, 2), nullable=True)
+    final_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_fl_tracking_events  (timeline "última alteração" + anotações)
+# ---------------------------------------------------------------------------
+class MLFlTrackingEventORM(Base):
+    """Evento na linha do tempo de um acompanhamento.
+
+    Alimenta as colunas "última alteração", "resultado após a última alteração"
+    (usa a data do evento mais recente) e "anotação". ``event_type``:
+    ``annotation`` (nota livre do operador), ``promo_change`` (mudança de
+    promoção observada), ``status_change`` (acompanhar/finalizar).
+    """
+
+    __tablename__ = "ml_fl_tracking_events"
+    __table_args__ = (
+        Index("ix_ml_fl_tracking_events_tracking", "tracking_id"),
+        CheckConstraint(
+            "event_type IN ('annotation', 'promo_change', 'status_change')",
+            name="event_type",
+        ),
+        {"comment": "Estoque Full: linha do tempo de eventos/anotações por acompanhamento."},
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tracking_id: Mapped[int] = mapped_column(
+        BigInteger,
+        ForeignKey("ml_fl_tracking.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    author: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
+# ml_fl_dismissals  (ignorar temporário vs remover permanente na aba Novos)
+# ---------------------------------------------------------------------------
+class MLFlDismissalORM(Base):
+    """Anúncios ocultados da aba Novos.
+
+    ``kind='ignore'`` some até ``until`` (janela de N dias) e reaparece.
+    ``kind='remove'`` é permanente (``until`` NULL). Uma linha por MLB (upsert).
+    """
+
+    __tablename__ = "ml_fl_dismissals"
+    __table_args__ = (
+        Index("ix_ml_fl_dismissals_kind", "kind"),
+        CheckConstraint("kind IN ('ignore', 'remove')", name="kind"),
+        {
+            "comment": "Estoque Full: dismissals da aba Novos (ignore temporário / remove permanente)."
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

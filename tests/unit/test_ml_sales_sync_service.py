@@ -26,13 +26,16 @@ def _response(status_code: int, body: dict[str, Any] | None = None) -> MagicMock
     return resp
 
 
-def _order(mlb: str, qty: int, sku: str = "SKU-1") -> dict[str, Any]:
+def _order(
+    mlb: str, qty: int, sku: str = "SKU-1", unit_price: float | None = None
+) -> dict[str, Any]:
+    item: dict[str, Any] = {"item": {"id": mlb, "seller_sku": sku}, "quantity": qty}
+    if unit_price is not None:
+        item["unit_price"] = unit_price
     return {
         "status": "paid",
         "date_created": "2026-06-10T10:00:00.000-00:00",
-        "order_items": [
-            {"item": {"id": mlb, "seller_sku": sku}, "quantity": qty},
-        ],
+        "order_items": [item],
     }
 
 
@@ -90,6 +93,53 @@ async def test_fetch_day_missing_paging_keeps_fetching_until_empty_page(
     assert http.get.await_count == 3
     assert agg[("MLB1", date(2026, 6, 10))]["qty"] == 1
     assert agg[("MLB2", date(2026, 6, 10))]["qty"] == 3
+
+
+async def test_fetch_day_aggregates_revenue_from_unit_price(
+    token_service: MagicMock,
+) -> None:
+    """Revenue = sum of unit_price * quantity across the day's order_items."""
+    http = AsyncMock()
+    http.get = AsyncMock(
+        side_effect=[
+            _response(
+                200,
+                {
+                    "results": [
+                        _order("MLB1", 2, unit_price=49.90),
+                        _order("MLB1", 1, unit_price=49.90),
+                        _order("MLB2", 3, unit_price=10.00),
+                    ],
+                    "paging": {"total": 3},
+                },
+            ),
+        ]
+    )
+    service = MLSalesSyncService(token_service, http, "12345")
+
+    agg = await service._fetch_day(date(2026, 6, 10))
+
+    assert agg[("MLB1", date(2026, 6, 10))]["qty"] == 3
+    assert agg[("MLB1", date(2026, 6, 10))]["revenue"] == pytest.approx(149.70)
+    assert agg[("MLB2", date(2026, 6, 10))]["revenue"] == pytest.approx(30.00)
+
+
+async def test_fetch_day_missing_unit_price_defaults_revenue_zero(
+    token_service: MagicMock,
+) -> None:
+    """An order_item without unit_price must not crash — revenue contributes 0."""
+    http = AsyncMock()
+    http.get = AsyncMock(
+        side_effect=[
+            _response(200, {"results": [_order("MLB1", 2)], "paging": {"total": 1}}),
+        ]
+    )
+    service = MLSalesSyncService(token_service, http, "12345")
+
+    agg = await service._fetch_day(date(2026, 6, 10))
+
+    assert agg[("MLB1", date(2026, 6, 10))]["qty"] == 2
+    assert agg[("MLB1", date(2026, 6, 10))]["revenue"] == 0.0
 
 
 async def test_fetch_day_stops_at_paging_total(token_service: MagicMock) -> None:

@@ -80,9 +80,16 @@ class MLSalesSyncService:
                     qty = int(it.get("quantity") or 0)
                     if qty <= 0:
                         continue
+                    # unit_price = preço efetivamente cobrado por unidade (já com
+                    # a promo aplicada). Receita da linha = unit_price * quantity.
+                    try:
+                        unit_price = float(it.get("unit_price") or 0)
+                    except (TypeError, ValueError):
+                        unit_price = 0.0
                     key = (mlb, odate)
-                    cur = agg.setdefault(key, {"qty": 0, "sku": None})
+                    cur = agg.setdefault(key, {"qty": 0, "sku": None, "revenue": 0.0})
                     cur["qty"] += qty
+                    cur["revenue"] += unit_price * qty
                     if not cur["sku"]:
                         cur["sku"] = item.get("seller_sku")
             if not results:
@@ -113,13 +120,20 @@ class MLSalesSyncService:
                 logger.warning("ml_sales day failed", day=day.isoformat(), error=str(exc))
                 continue
             for key, v in agg.items():
-                cur = total_agg.setdefault(key, {"qty": 0, "sku": None})
+                cur = total_agg.setdefault(key, {"qty": 0, "sku": None, "revenue": 0.0})
                 cur["qty"] += v["qty"]
+                cur["revenue"] += v.get("revenue", 0.0)
                 if not cur["sku"]:
                     cur["sku"] = v["sku"]
             days_done += 1
         rows: list[dict[str, Any]] = [
-            {"mlb_id": mlb, "sale_date": odate, "sku": v["sku"], "qty": v["qty"]}
+            {
+                "mlb_id": mlb,
+                "sale_date": odate,
+                "sku": v["sku"],
+                "qty": v["qty"],
+                "revenue": round(v["revenue"], 2),
+            }
             for (mlb, odate), v in total_agg.items()
             if odate >= start
         ]
@@ -138,7 +152,11 @@ class MLSalesSyncService:
                     stmt = pg_insert(MLSalesDailyORM).values(chunk)
                     stmt = stmt.on_conflict_do_update(
                         index_elements=["mlb_id", "sale_date"],
-                        set_={"qty": stmt.excluded.qty, "sku": stmt.excluded.sku},
+                        set_={
+                            "qty": stmt.excluded.qty,
+                            "sku": stmt.excluded.sku,
+                            "revenue": stmt.excluded.revenue,
+                        },
                     )
                     await session.execute(stmt)
             await session.commit()

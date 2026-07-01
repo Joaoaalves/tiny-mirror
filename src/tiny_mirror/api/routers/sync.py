@@ -8,7 +8,16 @@ from typing import Annotated, Any, Literal
 
 import redis.asyncio as redis
 import structlog
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Body,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -322,6 +331,45 @@ async def sync_ml_listings(
         },
     )
     return SyncTriggerResponse(message="ML listings sync triggered", sync_log_id=sync_log_id)
+
+
+class MlSalesSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    days: int = Field(default=90, ge=1, le=365)
+
+
+@router.post("/ml-sales", status_code=status.HTTP_202_ACCEPTED)
+async def sync_ml_sales(
+    request: Request,
+    background: BackgroundTasks,
+    body: MlSalesSyncRequest = Body(default_factory=MlSalesSyncRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``ml_sales_daily`` (qty + revenue por anúncio) da ML Orders API
+    para os últimos ``days`` dias. Read-only quanto ao ML (só GET /orders/search),
+    grava só no nosso espelho. Roda em background (o backfill de 90d é longo);
+    re-executável. Necessário 1x após o deploy pra a Curva ABC ter receita histórica.
+    """
+    await _acquire_sync_lock(redis_client, "ml_sales")
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    http_client = getattr(request.app.state, "http_client", None)
+    if ml_token_service is None or http_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML credentials not configured",
+        )
+
+    from tiny_mirror.services.ml_sales_sync_service import MLSalesSyncService
+
+    service = MLSalesSyncService(
+        token_service=ml_token_service,
+        http_client=http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+    background.add_task(service.backfill, days=body.days)
+    logger.info("ML sales backfill triggered", days=body.days)
+    return {"message": f"ML sales backfill triggered (days={body.days})", "days": body.days}
 
 
 @router.post(

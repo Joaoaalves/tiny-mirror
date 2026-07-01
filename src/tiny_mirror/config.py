@@ -227,6 +227,10 @@ class Settings(BaseSettings):
     sync_ml_sales_cron: str = "0 4 * * *"
     sync_ml_sales_window_days: int = 7
 
+    # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
+    # antes de ele reaparecer.
+    ml_fl_ignore_days: int = 7
+
     # Flex fee calibration (real commission + freight per Flex MLB from settled
     # orders). Weekly — Sundays 04:20 UTC. Heavy (re-pulls orders + shipment
     # costs), so off-peak and infrequent.
