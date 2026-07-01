@@ -3,11 +3,11 @@
 Two responsibilities:
 
 1. **Read the per-MLB metrics** that every tab needs (one row per FULFILLMENT
-   listing): FL stock (available + in_transfer, from ``mv_coverage`` at the SKU
-   pool), galpão, per-MLB 30d sales/ritmo, 90d revenue (for the ABC curve),
-   coverage classification (``mv_coverage.status_base``), product age and the
-   current active promotion. Sales/promo are per MLB; stock/status are the SKU
-   pool that backs the listing (see the ARCHITECTURE note).
+   listing): FL stock = the listing's own ``available_quantity`` at ML (units apt
+   to sell for THAT anúncio — a kit reports its own sellable count, not the SKU
+   pool), galpão + coverage classification (``mv_coverage``, SKU-level), per-MLB
+   30d sales/ritmo, 90d revenue (for the ABC curve), product age and the current
+   active promotion. Stock/sales/promo are per MLB; galpão/status are SKU-level.
 
 2. **Persist the workflow state** — ``ml_fl_tracking`` (+ snapshots),
    ``ml_fl_tracking_events`` (timeline/annotations) and ``ml_fl_dismissals``
@@ -34,7 +34,7 @@ from tiny_mirror.infrastructure.orm.models import (
 _METRICS_SQL = text(
     """
     WITH fl AS (
-        SELECT mlb_id, sku, title, permalink
+        SELECT mlb_id, sku, title, permalink, available_quantity
         FROM ml_listings
         WHERE logistic_type = 'fulfillment' AND sku IS NOT NULL
     ),
@@ -65,7 +65,11 @@ _METRICS_SQL = text(
         fl.sku,
         fl.title,
         fl.permalink,
-        COALESCE(mc.stock_full_ml, 0)   AS stock_full,
+        -- Estoque FL POR ANÚNCIO: available_quantity do próprio anúncio no ML
+        -- (o que ele tem apto a vender). NÃO usar mv_coverage.stock_full_ml, que
+        -- é o pool agregado por SKU em unidades (SKU base + combos + kits somados)
+        -- e infla listagens de kit (ex.: kit mostrava 813 em vez de 18 reais).
+        COALESCE(fl.available_quantity, 0) AS stock_full,
         COALESCE(mc.stock_galpao, 0)    AS stock_galpao,
         mc.status_base                  AS status_base,
         COALESCE(s.sold_30d, 0)         AS sold_30d,
