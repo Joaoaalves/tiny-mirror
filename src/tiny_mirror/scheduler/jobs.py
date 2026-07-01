@@ -124,6 +124,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
                 settings.sync_ml_catalog_status_cron, timezone="UTC"
             ),
             "ml_sales_sync": CronTrigger.from_crontab(settings.sync_ml_sales_cron, timezone="UTC"),
+            "ml_sales_reconcile": CronTrigger.from_crontab(
+                settings.sync_ml_sales_reconcile_cron, timezone="UTC"
+            ),
             "flex_calibration": CronTrigger.from_crontab(
                 settings.sync_flex_calibration_cron, timezone="UTC"
             ),
@@ -207,6 +210,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_sales_sync() -> None:
         await ml_sales_sync_job(http_client, app.state.ml_token_service)
+
+    async def _ml_sales_reconcile() -> None:
+        await ml_sales_reconcile_job(http_client, app.state.ml_token_service)
 
     async def _flex_calibration() -> None:
         await flex_calibration_job(http_client, app.state.ml_token_service)
@@ -335,6 +341,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_sales_sync,
         trigger=triggers["ml_sales_sync"],
         id="ml_sales_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_sales_reconcile,
+        trigger=triggers["ml_sales_reconcile"],
+        id="ml_sales_reconcile",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -962,6 +974,28 @@ async def ml_sales_sync_job(http_client: Any, ml_token_service: Any) -> None:
     )
     stats = await service.backfill(days=settings.sync_ml_sales_window_days)
     logger.info("ML sales sync job completed", **stats)
+
+
+async def ml_sales_reconcile_job(http_client: Any, ml_token_service: Any) -> None:
+    """Weekly: re-backfill a WIDER window of ``ml_sales_daily`` so old-order
+    status changes (cancellations/returns) that fall outside the daily 7-day
+    window still get corrected. The daily cron only re-fetches recent days, so
+    without this, a sale cancelled weeks later stays counted forever."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML sales reconcile skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.ml_sales_sync_service import MLSalesSyncService
+
+    logger.info("ML sales reconcile job started")
+    service = MLSalesSyncService(
+        token_service=ml_token_service,
+        http_client=http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+    stats = await service.backfill(days=settings.sync_ml_sales_reconcile_days)
+    logger.info("ML sales reconcile job completed", **stats)
 
 
 async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:

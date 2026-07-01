@@ -226,6 +226,11 @@ class Settings(BaseSettings):
     # confirmações tardias; o backfill completo é manual.
     sync_ml_sales_cron: str = "0 4 * * *"
     sync_ml_sales_window_days: int = 7
+    # Weekly wider re-backfill so old-order cancellations/returns (outside the
+    # daily window) get corrected. Sundays 05:30 UTC (off-peak; heavier now that
+    # the sync does a shipment lookup per order for Full-vs-non-Full).
+    sync_ml_sales_reconcile_cron: str = "30 5 * * 0"
+    sync_ml_sales_reconcile_days: int = 90
 
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.

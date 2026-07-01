@@ -35,28 +35,41 @@ _NEW_PRODUCT_DAYS = 30
 
 
 def compute_abc(metrics: list[dict[str, Any]]) -> dict[str, str]:
-    """Curva ABC (Pareto por receita 90d): A<=80%, B<=95%, C o resto.
+    """Curva ABC (Pareto por receita Full 90d): A<=80%, B<=95%, C o resto.
 
-    Ranqueia TODOS os anúncios fulfillment. Receita 0 (ou universo sem receita)
-    cai em C. Retorna ``{mlb_id: 'A'|'B'|'C'}``.
+    Ranqueia por INVENTÁRIO (Código ML) — anúncios irmãos dividem o mesmo estoque
+    e a mesma receita agregada, então contam UMA vez no Pareto (senão o total
+    infla). A curva do inventário é aplicada a todos os seus anúncios. Receita 0
+    (ou universo sem receita) cai em C. Retorna ``{mlb_id: 'A'|'B'|'C'}``.
     """
-    ranked = sorted(metrics, key=lambda m: float(m.get("rev_90d") or 0), reverse=True)
-    total = sum(float(m.get("rev_90d") or 0) for m in ranked)
+    # Agrupa por inventário (fallback = mlb_id quando não há inventory_id).
+    by_inv: dict[str, dict[str, Any]] = {}
+    for m in metrics:
+        inv = m.get("inventory_id") or m["mlb_id"]
+        g = by_inv.setdefault(inv, {"rev": float(m.get("rev_90d") or 0), "mlbs": []})
+        g["mlbs"].append(m["mlb_id"])
+    ranked = sorted(by_inv.values(), key=lambda g: g["rev"], reverse=True)
+    total = sum(g["rev"] for g in ranked)
     out: dict[str, str] = {}
     if total <= 0:
-        return {m["mlb_id"]: "C" for m in ranked}
+        for g in ranked:
+            for mlb in g["mlbs"]:
+                out[mlb] = "C"
+        return out
     cum = 0.0
-    for m in ranked:
-        rev = float(m.get("rev_90d") or 0)
+    for g in ranked:
+        rev = g["rev"]
         if rev <= 0:
-            out[m["mlb_id"]] = "C"
-            continue
-        # Classify by the cumulative share BEFORE this item, so the top item
-        # (and each boundary-straddling item) lands in the richer class — the
-        # standard ABC convention. A: prev < 80%, B: prev < 95%, C: rest.
-        prev_pct = cum / total
-        out[m["mlb_id"]] = "A" if prev_pct < 0.80 else ("B" if prev_pct < 0.95 else "C")
-        cum += rev
+            curve = "C"
+        else:
+            # Classify by the cumulative share BEFORE this inventory, so the top
+            # (and each boundary-straddling) one lands in the richer class — the
+            # standard ABC convention. A: prev < 80%, B: prev < 95%, C: rest.
+            prev_pct = cum / total
+            curve = "A" if prev_pct < 0.80 else ("B" if prev_pct < 0.95 else "C")
+            cum += rev
+        for mlb in g["mlbs"]:
+            out[mlb] = curve
     return out
 
 

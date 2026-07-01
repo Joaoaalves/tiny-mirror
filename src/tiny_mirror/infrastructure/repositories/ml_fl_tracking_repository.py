@@ -34,23 +34,30 @@ from tiny_mirror.infrastructure.orm.models import (
 _METRICS_SQL = text(
     """
     WITH fl AS (
-        SELECT mlb_id, sku, title, permalink, available_quantity
+        SELECT mlb_id, sku, title, permalink, available_quantity, inventory_id
         FROM ml_listings
         WHERE logistic_type = 'fulfillment' AND sku IS NOT NULL
     ),
+    -- Vendas Full POR INVENTÁRIO (Código ML): o painel Full do ML soma todos os
+    -- anúncios irmãos que dividem o mesmo estoque, e conta só o despachado por
+    -- Full (full_qty). Agregamos igual pra o número bater com o relatório do ML.
     sales30 AS (
-        SELECT mlb_id, SUM(qty)::int AS sold_30d
-        FROM ml_sales_daily
-        WHERE sale_date >= CURRENT_DATE - INTERVAL '30 days'
-          AND sale_date <  CURRENT_DATE
-        GROUP BY mlb_id
+        SELECT l.inventory_id, SUM(s.full_qty)::int AS sold_30d
+        FROM ml_sales_daily s
+        JOIN ml_listings l ON l.mlb_id = s.mlb_id
+        WHERE s.sale_date >= CURRENT_DATE - INTERVAL '30 days'
+          AND s.sale_date <  CURRENT_DATE
+          AND l.inventory_id IS NOT NULL
+        GROUP BY l.inventory_id
     ),
     rev90 AS (
-        SELECT mlb_id, COALESCE(SUM(revenue), 0)::numeric AS rev_90d
-        FROM ml_sales_daily
-        WHERE sale_date >= CURRENT_DATE - INTERVAL '90 days'
-          AND sale_date <  CURRENT_DATE
-        GROUP BY mlb_id
+        SELECT l.inventory_id, COALESCE(SUM(s.full_revenue), 0)::numeric AS rev_90d
+        FROM ml_sales_daily s
+        JOIN ml_listings l ON l.mlb_id = s.mlb_id
+        WHERE s.sale_date >= CURRENT_DATE - INTERVAL '90 days'
+          AND s.sale_date <  CURRENT_DATE
+          AND l.inventory_id IS NOT NULL
+        GROUP BY l.inventory_id
     ),
     promo AS (
         SELECT DISTINCT ON (mlb_id)
@@ -65,6 +72,7 @@ _METRICS_SQL = text(
         fl.sku,
         fl.title,
         fl.permalink,
+        fl.inventory_id                 AS inventory_id,
         -- Estoque FL POR ANÚNCIO: available_quantity do próprio anúncio no ML
         -- (o que ele tem apto a vender). NÃO usar mv_coverage.stock_full_ml, que
         -- é o pool agregado por SKU em unidades (SKU base + combos + kits somados)
@@ -82,8 +90,8 @@ _METRICS_SQL = text(
         pr.meli_percentage              AS promo_meli_pct
     FROM fl
     LEFT JOIN mv_coverage mc ON mc.sku = fl.sku
-    LEFT JOIN sales30 s      ON s.mlb_id = fl.mlb_id
-    LEFT JOIN rev90 r        ON r.mlb_id = fl.mlb_id
+    LEFT JOIN sales30 s      ON s.inventory_id = fl.inventory_id
+    LEFT JOIN rev90 r        ON r.inventory_id = fl.inventory_id
     LEFT JOIN products p     ON p.sku = fl.sku
     LEFT JOIN promo pr       ON pr.mlb_id = fl.mlb_id
     """

@@ -11,6 +11,7 @@ fica bem abaixo disso). Conta só pedidos pagos/enviados/entregues.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -26,6 +27,9 @@ logger = structlog.get_logger(__name__)
 _VALID_STATUSES = {"paid", "shipped", "delivered", "partially_paid"}
 _PAGE = 50
 _API = "https://api.mercadolibre.com/orders/search"
+_SHIP_API = "https://api.mercadolibre.com/shipments"
+# Quantos shipments buscar em paralelo (o logistic_type não vem no pedido).
+_SHIP_CONCURRENCY = 8
 
 
 class MLSalesSyncService:
@@ -39,10 +43,17 @@ class MLSalesSyncService:
         return {"Authorization": f"Bearer {access}"}
 
     async def _fetch_day(self, day: date) -> dict[tuple[str, date], dict[str, Any]]:
-        """Agrega vendas (mlb, dia) -> {qty, sku} de um único dia."""
+        """Agrega vendas (mlb, dia) -> {qty, revenue, full_qty, full_revenue, sku}.
+
+        ``full_*`` é a parcela despachada por Full (``shipment.logistic_type ==
+        'fulfillment'``) — o que o painel Full do ML conta em "Vendas 30 dias". O
+        ``logistic_type`` não vem no pedido, então buscamos o shipment de cada
+        pedido (concorrente, limitado).
+        """
         frm = f"{day.isoformat()}T00:00:00.000-00:00"
         to = f"{day.isoformat()}T23:59:59.999-00:00"
-        agg: dict[tuple[str, date], dict[str, Any]] = {}
+        # (odate, shipment_id, [(mlb, qty, unit_price, seller_sku), ...])
+        orders: list[tuple[date, str | None, list[tuple[str, int, float, str | None]]]] = []
         offset = 0
         while True:
             headers = await self._auth()
@@ -72,6 +83,8 @@ class MLSalesSyncService:
                     odate = date.fromisoformat(created)
                 except ValueError:
                     odate = day
+                sid = (o.get("shipping") or {}).get("id")
+                items: list[tuple[str, int, float, str | None]] = []
                 for it in o.get("order_items") or []:
                     item = it.get("item") or {}
                     mlb = item.get("id")
@@ -86,12 +99,9 @@ class MLSalesSyncService:
                         unit_price = float(it.get("unit_price") or 0)
                     except (TypeError, ValueError):
                         unit_price = 0.0
-                    key = (mlb, odate)
-                    cur = agg.setdefault(key, {"qty": 0, "sku": None, "revenue": 0.0})
-                    cur["qty"] += qty
-                    cur["revenue"] += unit_price * qty
-                    if not cur["sku"]:
-                        cur["sku"] = item.get("seller_sku")
+                    items.append((mlb, qty, unit_price, item.get("seller_sku")))
+                if items:
+                    orders.append((odate, str(sid) if sid else None, items))
             if not results:
                 break
             total = (data.get("paging") or {}).get("total")
@@ -100,7 +110,52 @@ class MLSalesSyncService:
             # keep going until an empty page (or the 10k offset hard cap).
             if (total is not None and int(total) > 0 and offset >= int(total)) or offset >= 10000:
                 break
+
+        # Classifica Full vs não-Full pelo logistic_type do shipment.
+        ship_ids = {sid for _, sid, _ in orders if sid}
+        ship_type = await self._fetch_shipment_types(ship_ids)
+
+        agg: dict[tuple[str, date], dict[str, Any]] = {}
+        for odate, sid, items in orders:
+            is_full = ship_type.get(sid) == "fulfillment" if sid else False
+            for mlb, qty, unit_price, seller_sku in items:
+                key = (mlb, odate)
+                cur = agg.setdefault(
+                    key,
+                    {"qty": 0, "sku": None, "revenue": 0.0, "full_qty": 0, "full_revenue": 0.0},
+                )
+                cur["qty"] += qty
+                cur["revenue"] += unit_price * qty
+                if is_full:
+                    cur["full_qty"] += qty
+                    cur["full_revenue"] += unit_price * qty
+                if not cur["sku"]:
+                    cur["sku"] = seller_sku
         return agg
+
+    async def _fetch_shipment_types(self, shipment_ids: set[str]) -> dict[str, str | None]:
+        """``{shipment_id -> logistic_type}``. Concorrente e limitado; um shipment
+        que falhe vira ``None`` (tratado como não-Full)."""
+        if not shipment_ids:
+            return {}
+        sem = asyncio.Semaphore(_SHIP_CONCURRENCY)
+        out: dict[str, str | None] = {}
+
+        async def one(sid: str) -> None:
+            url = f"{_SHIP_API}/{sid}"
+            async with sem:
+                try:
+                    headers = await self._auth()
+                    r = await self._http.get(url, headers=headers)
+                    if r.status_code == 401:
+                        access = await self._tok.handle_unauthorized()
+                        r = await self._http.get(url, headers={"Authorization": f"Bearer {access}"})
+                    out[sid] = r.json().get("logistic_type") if r.status_code == 200 else None
+                except Exception:  # pragma: no cover — network noise
+                    out[sid] = None
+
+        await asyncio.gather(*(one(s) for s in shipment_ids))
+        return out
 
     async def backfill(self, days: int = 90) -> dict[str, Any]:
         """Reconstrói ml_sales_daily dos últimos ``days`` dias (incl. hoje)."""
@@ -120,9 +175,14 @@ class MLSalesSyncService:
                 logger.warning("ml_sales day failed", day=day.isoformat(), error=str(exc))
                 continue
             for key, v in agg.items():
-                cur = total_agg.setdefault(key, {"qty": 0, "sku": None, "revenue": 0.0})
+                cur = total_agg.setdefault(
+                    key,
+                    {"qty": 0, "sku": None, "revenue": 0.0, "full_qty": 0, "full_revenue": 0.0},
+                )
                 cur["qty"] += v["qty"]
                 cur["revenue"] += v.get("revenue", 0.0)
+                cur["full_qty"] += v.get("full_qty", 0)
+                cur["full_revenue"] += v.get("full_revenue", 0.0)
                 if not cur["sku"]:
                     cur["sku"] = v["sku"]
             days_done += 1
@@ -133,6 +193,8 @@ class MLSalesSyncService:
                 "sku": v["sku"],
                 "qty": v["qty"],
                 "revenue": round(v["revenue"], 2),
+                "full_qty": v["full_qty"],
+                "full_revenue": round(v["full_revenue"], 2),
             }
             for (mlb, odate), v in total_agg.items()
             if odate >= start
@@ -156,6 +218,8 @@ class MLSalesSyncService:
                             "qty": stmt.excluded.qty,
                             "sku": stmt.excluded.sku,
                             "revenue": stmt.excluded.revenue,
+                            "full_qty": stmt.excluded.full_qty,
+                            "full_revenue": stmt.excluded.full_revenue,
                         },
                     )
                     await session.execute(stmt)
