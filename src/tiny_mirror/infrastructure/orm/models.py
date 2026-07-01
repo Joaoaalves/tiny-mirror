@@ -1112,6 +1112,11 @@ class MLSalesDailyORM(Base):
     revenue: Mapped[Decimal] = mapped_column(
         Numeric(12, 2), nullable=False, server_default=text("0")
     )
+    # Parcela despachada por Full (logistic_type=fulfillment). Subconjunto de qty/revenue.
+    full_qty: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    full_revenue: Mapped[Decimal] = mapped_column(
+        Numeric(12, 2), nullable=False, server_default=text("0")
+    )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
