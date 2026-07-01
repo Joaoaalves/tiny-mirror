@@ -149,34 +149,6 @@ async def test_fetch_day_missing_unit_price_defaults_revenue_zero(
     assert agg[("MLB1", date(2026, 6, 10))]["revenue"] == 0.0
 
 
-async def test_fetch_day_excludes_d2c_direct_orders(token_service: MagicMock) -> None:
-    """direct-to-consumer (tag d2c) orders are excluded — the ML listing doesn't
-    count them in its 'vendas', so the mirror shouldn't either."""
-    http = AsyncMock()
-    http.get = AsyncMock(
-        side_effect=[
-            _response(
-                200,
-                {
-                    "results": [
-                        _order("MLB1", 1, unit_price=50.0),  # marketplace → counts
-                        _order(
-                            "MLB1", 1, unit_price=50.0, tags=["d2c", "one_shot", "paid"]
-                        ),  # d2c → skip
-                    ],
-                    "paging": {"total": 2},
-                },
-            ),
-        ]
-    )
-    service = MLSalesSyncService(token_service, http, "12345")
-
-    agg = await service._fetch_day(date(2026, 6, 10))
-
-    assert agg[("MLB1", date(2026, 6, 10))]["qty"] == 1  # only the marketplace order
-    assert agg[("MLB1", date(2026, 6, 10))]["revenue"] == pytest.approx(50.0)
-
-
 async def test_fetch_day_stops_at_paging_total(token_service: MagicMock) -> None:
     http = AsyncMock()
     http.get = AsyncMock(

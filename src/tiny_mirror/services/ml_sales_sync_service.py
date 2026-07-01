@@ -24,10 +24,6 @@ from tiny_mirror.infrastructure.orm.models import MLSalesDailyORM
 logger = structlog.get_logger(__name__)
 
 _VALID_STATUSES = {"paid", "shipped", "delivered", "partially_paid"}
-# Pedidos direct-to-consumer (tag ``d2c``, sempre acompanhada de ``one_shot``) são
-# vendas diretas que o ML NÃO conta no "vendas" do anúncio. Excluímos pra o espelho
-# bater com o número que o operador vê no ML (senão o anúncio conta +1 por venda d2c).
-_EXCLUDED_ORDER_TAGS = {"d2c"}
 _PAGE = 50
 _API = "https://api.mercadolibre.com/orders/search"
 
@@ -71,8 +67,6 @@ class MLSalesSyncService:
             for o in results:
                 if (o.get("status") or "") not in _VALID_STATUSES:
                     continue
-                if _EXCLUDED_ORDER_TAGS.intersection(o.get("tags") or ()):
-                    continue  # venda direct-to-consumer — o ML não conta no anúncio
                 created = str(o.get("date_created") or "")[:10]
                 try:
                     odate = date.fromisoformat(created)
