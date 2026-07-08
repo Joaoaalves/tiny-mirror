@@ -71,13 +71,13 @@ BANDS_CALIBRATED = [
 
 
 @pytest.mark.asyncio
-async def test_fulfillment_commission_never_overridden_freight_banded() -> None:
-    """FULL: commission stays from the snapshot ALWAYS; freight uses the banded
-    schedule from ML's calculator when the calibration row carries one
-    (operator decision 2026-07-08)."""
+async def test_fulfillment_gets_banded_freight_and_nominal_commission() -> None:
+    """FULL: freight from the banded calculator schedule AND commission from the
+    nominal ML schedule (operator decisions 2026-07-08). The snapshot commission
+    remains as the band-lookup fallback; COST never flows through here."""
     comm, bands, comm_bands = await _effective_fees(_Session("fulfillment", CALIB), "MLB1", SNAP)
-    assert comm == Decimal("11.50")  # snapshot commission, untouched
-    assert comm_bands is None  # nominal schedule never applies to FULL
+    assert comm == Decimal("11.50")  # snapshot % = fallback do lookup por banda
+    assert comm_bands == COMM_BANDS  # escada nominal vale pro FULL também
     assert bands == [{**b, "payback": 0.0} for b in FULL_FR_BANDS]
 
 
@@ -94,8 +94,8 @@ async def test_fulfillment_without_freight_schedule_keeps_snapshot() -> None:
     )
     comm, bands, comm_bands = await _effective_fees(_Session("fulfillment", calib), "MLB1", SNAP)
     assert comm == Decimal("11.50")
-    assert bands == SNAP.freight_bands
-    assert comm_bands is None
+    assert bands == SNAP.freight_bands  # sem tabela de frete → planilha
+    assert comm_bands == COMM_BANDS  # mas a escada nominal ainda vale
 
 
 @pytest.mark.asyncio
@@ -125,12 +125,12 @@ async def test_unknown_logistic_keeps_snapshot() -> None:
 def test_apply_flex_calibration_pure_helper() -> None:
     from tiny_mirror.services.pricing_service import apply_flex_calibration
 
-    # fulfillment: SÓ o frete é sobrescrito (comissão do snapshot, sem bandas)
+    # fulfillment: frete por faixa + escada nominal (snapshot % = fallback)
     comm, bands, comm_bands = apply_flex_calibration(
         "fulfillment", Decimal("11.5"), SNAP.freight_bands, CALIB
     )
     assert comm == Decimal("11.5")
-    assert comm_bands is None
+    assert comm_bands == COMM_BANDS
     assert bands == [{**b, "payback": 0.0} for b in FULL_FR_BANDS]
     # unknown / no-calib → unchanged
     assert apply_flex_calibration("xd_drop_off", Decimal("11.5"), SNAP.freight_bands, None) == (
