@@ -1836,6 +1836,13 @@ class MLFlexFeeCalibrationORM(Base):
     payback_per_unit_ge79: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
     n_freight_lt79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
     n_freight_ge79: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("0"))
+    # Nominal ML commission SCHEDULE (price-banded) from /sites/MLB/listing_prices,
+    # per (category, listing_type) — the fee Mercado Turbo charges. A JSON list of
+    # ``{min, max, pct}`` (inclusive ends, max=None open). The % is NOT constant:
+    # many categories drop it a few points in a mid-price band, so a flat rate
+    # can't reproduce it. When present, the margin engine looks commission up by
+    # band; ``real_comm_pct`` remains the fallback. Fulfillment is never touched.
+    commission_bands: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

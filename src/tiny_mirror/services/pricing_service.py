@@ -94,6 +94,39 @@ def _freight_for(price: Decimal, freight_bands: list[dict[str, Any]] | None) -> 
     return Decimal("0")
 
 
+def _commission_pct_for(
+    price: Decimal,
+    commission_bands: list[dict[str, Any]] | None,
+    fallback_pct: Decimal,
+) -> Decimal:
+    """Nominal ML commission % for the band containing ``price``.
+
+    ML's per-listing sale_fee is ``percentage_fee(price) x price`` (fixed_fee is
+    0 for the categories we sell — verified against Mercado Turbo, 278/290 exact).
+    The percentage is NOT constant: many categories drop it a few points in a
+    mid-price band (e.g. gold_pro 17% → 14% between ~R$150-500 → 17%), so a single
+    scalar can't reproduce it. ``commission_bands`` is a list of
+    ``{min, max, pct}`` (inclusive ends, ``max=None`` open-ended) probed from
+    ``/sites/MLB/listing_prices`` per (category, listing_type). Falls back to the
+    scalar snapshot % when no band matches or no schedule is present.
+    """
+    if not commission_bands:
+        return fallback_pct
+    p = float(price)
+    for band in commission_bands:
+        lo = band.get("min")
+        hi = band.get("max")
+        if lo is None:
+            continue
+        if p < float(lo):
+            continue
+        if hi is not None and p > float(hi):
+            continue
+        pct = band.get("pct")
+        return Decimal(str(pct)) if pct is not None else fallback_pct
+    return fallback_pct
+
+
 def _dec(v: Any) -> Decimal:
     if v is None:
         raise PricingDataError("required field is None")
@@ -105,25 +138,30 @@ def apply_flex_calibration(
     commission_pct: Any,
     freight_bands: list[dict[str, Any]] | None,
     calib: Any,
-) -> tuple[Any, list[dict[str, Any]] | None]:
-    """Return effective ``(commission_pct, freight_bands)`` for margin math.
+) -> tuple[Any, list[dict[str, Any]] | None, list[dict[str, Any]] | None]:
+    """Return effective ``(commission_pct, freight_bands, commission_bands)``.
 
     For **Flex** (non-fulfillment) listings that have a per-MLB calibration row
-    (``ml_flex_fee_calibration``), commission becomes the real effective rate and
-    freight becomes a synthetic 2-band table split at R$79 (the free-shipping
-    cliff: ML covers ~100% under R$79 and ~10% above). Fulfillment listings, an
-    unknown ``logistic_type``, or a missing/empty calibration return the
-    snapshot values UNCHANGED — fulfillment fees are already correct and must
-    never be overridden. This is the single source of truth for the override;
-    both the caps enrichment and the floor recompute use it.
+    (``ml_flex_fee_calibration``), freight becomes a synthetic 2-band table split
+    at R$79 (the free-shipping cliff: ML covers ~100% under R$79 and ~10% above)
+    and commission becomes the **nominal ML fee schedule** (``commission_bands``,
+    price-banded, from ``/sites/MLB/listing_prices`` — this is what Mercado Turbo
+    charges). Fulfillment listings, an unknown ``logistic_type``, or a missing/
+    empty calibration return the snapshot values UNCHANGED with no commission
+    bands — fulfillment fees are already correct and must never be overridden.
+    This is the single source of truth for the override; both the caps enrichment
+    and the floor recompute use it.
     """
     if logistic_type is None or logistic_type == "fulfillment" or calib is None:
-        return commission_pct, freight_bands
+        return commission_pct, freight_bands, None
     # Flex with a calibration row: ALWAYS replace the (wrong) generic freight
     # bands with the calibrated 2-band Flex table — fallback rows for listings
     # without sales still carry the global Flex mean, so they don't silently
-    # revert to the fulfillment-style bands. Commission is overridden only when
-    # we actually measured it (real_comm_pct); otherwise keep the snapshot %.
+    # revert to the fulfillment-style bands.
+    #
+    # Commission: prefer the nominal price-banded schedule (matches Mercado Turbo
+    # exactly); fall back to the real historical median, then the snapshot %.
+    comm_bands = getattr(calib, "commission_bands", None) or None
     real_comm = getattr(calib, "real_comm_pct", None)
     eff_comm = real_comm if real_comm is not None else commission_pct
     # ``payback`` (ML freight subsidy) rides along on each band for the UI; the
@@ -142,7 +180,7 @@ def apply_flex_calibration(
             "payback": float(getattr(calib, "payback_per_unit_ge79", 0) or 0),
         },
     ]
-    return eff_comm, bands
+    return eff_comm, bands, comm_bands
 
 
 def margin_at_price(
@@ -153,6 +191,7 @@ def margin_at_price(
     freight_bands: list[dict[str, Any]] | None,
     list_price: Decimal | float | int | None = None,
     meli_banca_pct: Decimal | float | int = 0,
+    commission_bands: list[dict[str, Any]] | None = None,
 ) -> MarginBreakdown:
     """Compute margin breakdown at a given selling price.
 
@@ -161,18 +200,23 @@ def margin_at_price(
         base_cost: product cost (BRL).
         commission_pct: ML commission tier for this SKU, in **percent**
             (e.g. 11.5 not 0.115). Matches the snapshot's commission_pct.
+            Used as the fallback when ``commission_bands`` is absent or has no
+            band for ``price``.
         freight_bands: list of ``{min, max, cost}`` dicts from the snapshot.
         list_price: original (non-promo) price. Required only when
             ``meli_banca_pct > 0`` (SMART/DEAL co-pay is on the list price).
         meli_banca_pct: ML co-pay percentage for the promo (also in
             **percent**, e.g. 3.7). Zero for PRICE_DISCOUNT.
+        commission_bands: optional price-banded nominal ML fee schedule
+            (``{min, max, pct}``). When present, the commission % is looked up
+            by band — reproduces Mercado Turbo's per-price tarifa exactly.
 
     Returns a ``MarginBreakdown`` with all components and the final margin
     in both BRL and % of price.
     """
     p = _dec(price)
     cost = _dec(base_cost)
-    comm_pct = _dec(commission_pct)
+    comm_pct = _commission_pct_for(p, commission_bands, _dec(commission_pct))
     difal_pct = _difal_pct() * Decimal(100)  # express as % to match commission_pct unit
 
     if meli_banca_pct and list_price is None:
@@ -225,6 +269,32 @@ def target_price_for_max_discount_pct(
     return (lp * (Decimal(100) - pct) / Decimal(100)).quantize(Decimal("0.01"))
 
 
+def _segment_breakpoints(
+    freight_bands: list[dict[str, Any]],
+    commission_bands: list[dict[str, Any]] | None,
+) -> list[tuple[Decimal, Decimal | None]]:
+    """Union the freight and commission band edges into disjoint ``(lo, hi)``
+    segments over which BOTH freight and commission % are constant. Needed by
+    the floor solver: with a price-banded commission the closed-form is only
+    valid inside a segment where every fee is flat."""
+    edges: set[Decimal] = {Decimal("0")}
+    for src in (freight_bands, commission_bands or []):
+        for b in src:
+            lo = b.get("min")
+            hi = b.get("max")
+            if lo is not None:
+                edges.add(Decimal(str(lo)))
+            if hi is not None:
+                # segment boundary sits just above the inclusive band max
+                edges.add(Decimal(str(hi)))
+    ordered = sorted(edges)
+    segments: list[tuple[Decimal, Decimal | None]] = []
+    for i, lo in enumerate(ordered):
+        hi = ordered[i + 1] if i + 1 < len(ordered) else None
+        segments.append((lo, hi))
+    return segments
+
+
 def target_price_for_min_margin_pct(
     *,
     base_cost: Decimal | float | int,
@@ -233,25 +303,25 @@ def target_price_for_min_margin_pct(
     min_margin_pct: Decimal | float | int,
     list_price: Decimal | float | int | None = None,
     meli_banca_pct: Decimal | float | int = 0,
+    commission_bands: list[dict[str, Any]] | None = None,
 ) -> Decimal:
     """Solve for the lowest price that still yields ``min_margin_pct`` margin.
 
-    Closed-form when freight is constant in a given band; the freight
-    discontinuities mean we evaluate band-by-band and pick the highest
-    valid floor across the band breakpoints below the unconstrained
-    minimum.
+    Closed-form when freight AND commission are constant in a segment; the
+    discontinuities (freight bands + the nominal commission schedule) mean we
+    evaluate segment-by-segment and pick the lowest valid floor.
 
-    Formula (per band, freight = F constant within band):
+    Formula (per segment, freight = F, commission = c, both constant):
         margin_pct/100 * P = P + banca - cost - P*(c+d)/100 - F
         P * [1 - margin_pct/100 - (c+d)/100] = cost + F - banca
         P = (cost + F - banca) / [1 - margin_pct/100 - (c+d)/100]
 
-    If the divisor is <= 0 (margin_pct too high relative to fees), the
-    target is unreachable — we return Decimal('NaN-like') signalled by
-    raising. Caller should fall back to list_price or a sensible cap.
+    If every segment's divisor is <= 0 (margin_pct too high relative to fees),
+    the target is unreachable and we raise. Caller should fall back to
+    list_price or a sensible cap.
     """
     cost = _dec(base_cost)
-    comm_pct = _dec(commission_pct)
+    fallback_comm = _dec(commission_pct)
     margin_pct = _dec(min_margin_pct)
     difal_pct = _difal_pct() * Decimal(100)
 
@@ -259,31 +329,33 @@ def target_price_for_min_margin_pct(
     if meli_banca_pct and list_price is not None:
         banca = _dec(list_price) * _dec(meli_banca_pct) / Decimal(100)
 
-    fee_pct = comm_pct + difal_pct  # both expressed as %
-    divisor = Decimal(100) - margin_pct - fee_pct  # all in % units, sum back to 100
-    if divisor <= 0:
-        raise PricingDataError(
-            f"margin {margin_pct}% unreachable: fees ({fee_pct}%) leave no headroom"
-        )
-
     bands = freight_bands or [{"min": 0, "max": None, "cost": 0}]
-    # Try the unconstrained candidate per band; valid if it falls inside the band.
+    segments = _segment_breakpoints(bands, commission_bands)
+    # Evaluate the unconstrained candidate per segment; valid if it falls inside.
     candidates: list[Decimal] = []
-    for band in bands:
-        freight = Decimal(str(band.get("cost", 0)))
+    any_headroom = False
+    for lo, hi in segments:
+        # sample the fees at the segment's interior (its lower edge is inside it)
+        freight = _freight_for(lo, bands)
+        comm = _commission_pct_for(lo, commission_bands, fallback_comm)
+        divisor = Decimal(100) - margin_pct - (comm + difal_pct)
+        if divisor <= 0:
+            continue  # this segment can't yield the margin; try the next
+        any_headroom = True
         # numerator in same units (BRL); divisor is in %, so multiply by 100
         p_target = ((cost + freight - banca) * Decimal(100) / divisor).quantize(Decimal("0.01"))
-        lo = Decimal(str(band.get("min", 0)))
-        hi_raw = band.get("max")
-        hi = Decimal(str(hi_raw)) if hi_raw is not None else None
         if p_target < lo:
-            # margin achievable at a price below this band — band's lower bound is the floor
+            # margin achievable below this segment — its lower bound is the floor
             candidates.append(lo)
         elif hi is not None and p_target > hi:
-            # margin not achievable in this band; skip
+            # margin not achievable in this segment; skip
             continue
         else:
             candidates.append(p_target)
+    if not any_headroom:
+        raise PricingDataError(
+            f"margin {margin_pct}% unreachable: fees leave no headroom in any band"
+        )
     if not candidates:
         raise PricingDataError("no freight band yields the target margin")
     # The lowest price that satisfies the margin is the floor we want.

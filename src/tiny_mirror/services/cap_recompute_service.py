@@ -146,6 +146,7 @@ def calc_cap_from_active_promo(
     *,
     commission_pct: Any = None,
     freight_bands: list[dict[str, Any]] | None = None,
+    commission_bands: list[dict[str, Any]] | None = None,
 ) -> CapCalculation:
     """Anchor cap + floor to live STARTED promos on this MLB.
 
@@ -177,6 +178,7 @@ def calc_cap_from_active_promo(
                 base_cost=snap.base_cost,
                 commission_pct=commission_pct,
                 freight_bands=freight_bands,
+                commission_bands=commission_bands,
             )
             margin_at_floor = realised.margin_pct
         except PricingDataError:
@@ -212,6 +214,7 @@ def calc_cap_for_snapshot(
     *,
     commission_pct: Any = None,
     freight_bands: list[dict[str, Any]] | None = None,
+    commission_bands: list[dict[str, Any]] | None = None,
 ) -> CapCalculation:
     """Fallback derivation for MLBs that have NO active STARTED promo.
 
@@ -267,6 +270,7 @@ def calc_cap_for_snapshot(
         base_cost=snap.base_cost,
         commission_pct=commission_pct,
         freight_bands=freight_bands,
+        commission_bands=commission_bands,
     )
     if full_price_margin.margin_pct < MIN_MARGIN_PCT:
         return CapCalculation(
@@ -289,6 +293,7 @@ def calc_cap_for_snapshot(
             commission_pct=commission_pct,
             freight_bands=freight_bands,
             min_margin_pct=MIN_MARGIN_PCT,
+            commission_bands=commission_bands,
         )
     except PricingDataError as exc:
         return CapCalculation(
@@ -317,6 +322,7 @@ def calc_cap_for_snapshot(
         base_cost=snap.base_cost,
         commission_pct=commission_pct,
         freight_bands=freight_bands,
+        commission_bands=commission_bands,
     )
 
     if cap < base_cap:
@@ -518,7 +524,7 @@ async def recompute_all_caps(
                 if baseline is not None:
                     active_promo_price = baseline["min_price"]
                 stats["mlbs_fetched_promos"] += 1
-            eff_comm, eff_bands = apply_flex_calibration(
+            eff_comm, eff_bands, eff_comm_bands = apply_flex_calibration(
                 logistic_by_mlb.get(snap.mlb_id),
                 snap.commission_pct,
                 snap.freight_bands,
@@ -526,10 +532,19 @@ async def recompute_all_caps(
             )
             calc = (
                 calc_cap_from_active_promo(
-                    snap, baseline, commission_pct=eff_comm, freight_bands=eff_bands
+                    snap,
+                    baseline,
+                    commission_pct=eff_comm,
+                    freight_bands=eff_bands,
+                    commission_bands=eff_comm_bands,
                 )
                 if baseline is not None
-                else calc_cap_for_snapshot(snap, commission_pct=eff_comm, freight_bands=eff_bands)
+                else calc_cap_for_snapshot(
+                    snap,
+                    commission_pct=eff_comm,
+                    freight_bands=eff_bands,
+                    commission_bands=eff_comm_bands,
+                )
             )
 
             if calc.skipped:
