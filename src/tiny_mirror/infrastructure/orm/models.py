@@ -1843,6 +1843,14 @@ class MLFlexFeeCalibrationORM(Base):
     # can't reproduce it. When present, the margin engine looks commission up by
     # band; ``real_comm_pct`` remains the fallback. Fulfillment is never touched.
     commission_bands: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
+    # Price-banded seller FREIGHT schedule from ML's freight calculator
+    # (/users/{uid}/shipping_options/free, dimensions + item_price) — what the
+    # seller pays at EACH price bracket for this listing's package dimensions
+    # (= Mercado Turbo's frete, verified exact). A JSON list of ``{min, max,
+    # cost}``. The flat lt79/ge79 quote is only right in the bracket the listing
+    # sells at TODAY; this schedule prices freight at the simulated/promo price.
+    # When present it wins over the flat 2-band synthesis; lt79/ge79 = fallback.
+    freight_bands: Mapped[Any | None] = mapped_column(JSONB, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

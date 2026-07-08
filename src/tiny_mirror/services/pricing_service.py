@@ -164,22 +164,30 @@ def apply_flex_calibration(
     comm_bands = getattr(calib, "commission_bands", None) or None
     real_comm = getattr(calib, "real_comm_pct", None)
     eff_comm = real_comm if real_comm is not None else commission_pct
+    # Freight: prefer the full price-banded schedule from ML's freight calculator
+    # (dimensions + item_price, = Mercado Turbo's frete at ANY simulated price).
+    # Fallback: the flat shipping_options quote split into 2 bands — only right
+    # in the price bracket the listing sells at today.
     # ``payback`` (ML freight subsidy) rides along on each band for the UI; the
     # margin math only reads ``cost`` so the extra key is harmless.
-    bands: list[dict[str, Any]] = [
-        {
-            "min": 0,
-            "max": 78.99,
-            "cost": float(getattr(calib, "freight_per_unit_lt79", 0) or 0),
-            "payback": float(getattr(calib, "payback_per_unit_lt79", 0) or 0),
-        },
-        {
-            "min": 79,
-            "max": None,
-            "cost": float(getattr(calib, "freight_per_unit_ge79", 0) or 0),
-            "payback": float(getattr(calib, "payback_per_unit_ge79", 0) or 0),
-        },
-    ]
+    calib_fr_bands = getattr(calib, "freight_bands", None) or None
+    if calib_fr_bands:
+        bands: list[dict[str, Any]] = [{**b, "payback": 0.0} for b in calib_fr_bands]
+    else:
+        bands = [
+            {
+                "min": 0,
+                "max": 78.99,
+                "cost": float(getattr(calib, "freight_per_unit_lt79", 0) or 0),
+                "payback": float(getattr(calib, "payback_per_unit_lt79", 0) or 0),
+            },
+            {
+                "min": 79,
+                "max": None,
+                "cost": float(getattr(calib, "freight_per_unit_ge79", 0) or 0),
+                "payback": float(getattr(calib, "payback_per_unit_ge79", 0) or 0),
+            },
+        ]
     return eff_comm, bands, comm_bands
 
 
