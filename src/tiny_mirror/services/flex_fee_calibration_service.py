@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import statistics as st
 from datetime import UTC, date, datetime, timedelta
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import structlog
@@ -81,6 +81,102 @@ class FlexFeeCalibrationService:
             if (o.get("cost") or 0) == 0 and o.get("list_cost") is not None
         ]
         return round(max(free), 2) if free else 0.0
+
+    # Grade de preços p/ mapear a escada de comissão. Densa nas quebras conhecidas
+    # (o "vale" de tarifa reduzida costuma abrir em ~100-150 e fechar em ~500-800).
+    _FEE_GRID: ClassVar[list[int]] = [
+        12,
+        15,
+        20,
+        25,
+        30,
+        40,
+        50,
+        60,
+        70,
+        79,
+        80,
+        90,
+        100,
+        110,
+        120,
+        130,
+        140,
+        150,
+        175,
+        200,
+        250,
+        300,
+        350,
+        400,
+        450,
+        500,
+        550,
+        600,
+        700,
+        800,
+        900,
+        1000,
+        1200,
+        1500,
+        2000,
+        3000,
+        5000,
+    ]
+
+    async def _item_cat_lt(self, mlbs: list[str]) -> dict[str, tuple[str, str]]:
+        """``{mlb: (category_id, listing_type_id)}`` via o multiget de items."""
+        out: dict[str, tuple[str, str]] = {}
+        for i in range(0, len(mlbs), 20):
+            data = await self._get(
+                f"{_API}/items",
+                {"ids": ",".join(mlbs[i : i + 20]), "attributes": "id,category_id,listing_type_id"},
+            )
+            for e in data or []:
+                b = e.get("body") or {}
+                mid, cat, lt = b.get("id"), b.get("category_id"), b.get("listing_type_id")
+                if mid and cat and lt:
+                    out[mid] = (cat, lt)
+        return out
+
+    async def _commission_schedule(self, cat: str, lt: str) -> list[dict[str, Any]] | None:
+        """Nominal ML fee schedule for a (category, listing_type), probed from
+        ``/sites/MLB/listing_prices`` across a price grid and compressed into
+        ``[{min, max, pct}]`` bands (inclusive ends, last ``max=None``). This is
+        the fee Mercado Turbo charges (``sale_fee = pct x price``, fixed_fee 0 for
+        our categories). Returns ``None`` on total API failure."""
+        pts: list[tuple[float, float]] = []
+        for price in self._FEE_GRID:
+            d = await self._get(
+                f"{_API}/sites/MLB/listing_prices",
+                {"price": price, "category_id": cat, "listing_type_id": lt},
+            )
+            if not isinstance(d, dict):
+                continue
+            det = d.get("sale_fee_details") or {}
+            pct = det.get("percentage_fee")
+            if pct is None:
+                sf = d.get("sale_fee_amount")
+                pct = round(float(sf) / price * 100, 2) if sf and price else None
+            if pct is not None:
+                pts.append((float(price), round(float(pct), 2)))
+        if not pts:
+            return None
+        # comprime pontos consecutivos de mesma % numa banda; a quebra fica no
+        # ponto médio entre a última amostra de uma % e a primeira da próxima.
+        bands: list[dict[str, Any]] = []
+        seg_lo: float = 0.0
+        cur_pct = pts[0][1]
+        prev_price = pts[0][0]
+        for pr, pc in pts[1:]:
+            if pc != cur_pct:
+                boundary = round((prev_price + pr) / 2, 2)
+                bands.append({"min": seg_lo, "max": boundary, "pct": cur_pct})
+                seg_lo = boundary
+                cur_pct = pc
+            prev_price = pr
+        bands.append({"min": seg_lo, "max": None, "pct": cur_pct})
+        return bands
 
     async def _orders_for_day(self, day: date) -> list[dict[str, Any]]:
         """Return raw order-item rows for one day: mlb, qty, unit_price, sale_fee, shipping_id."""
@@ -188,21 +284,41 @@ class FlexFeeCalibrationService:
         fb_freight = round(st.mean(ok_vals), 2) if ok_vals else 0.0  # falha de API → média
         n_freight_api = len(ok_vals)
 
+        # --- COMISSÃO NOMINAL: escada de tarifa por (categoria, tipo de anúncio),
+        # sondada do listing_prices (= o que o Mercado Turbo cobra). A % NÃO é
+        # constante no preço, então guardamos bandas por MLB. Poucas (cat,lt)
+        # distintas → sonda uma vez cada e reaproveita em todos os MLBs.
+        cat_lt = await self._item_cat_lt(active_flex)
+        distinct_pairs = sorted(set(cat_lt.values()))
+        _csem = asyncio.Semaphore(6)
+
+        async def _sched(
+            pair: tuple[str, str],
+        ) -> tuple[tuple[str, str], list[dict[str, Any]] | None]:
+            async with _csem:
+                return pair, await self._commission_schedule(pair[0], pair[1])
+
+        sched_by_pair = dict(await asyncio.gather(*[_sched(p) for p in distinct_pairs]))
+        n_sched_ok = sum(1 for v in sched_by_pair.values() if v)
+
         # --- assemble: 1 linha por anúncio Flex ATIVO — frete do shipping_options pra
-        # todos (igual ao Turbo); comissão real das vendas quando houver. A cota do frete
-        # independe do preço, então vale pras duas faixas (lt79/ge79). payback=0 (a cota já
-        # é o bruto que o vendedor paga; o subsídio do ML é o da promo, via meli_banca).
+        # todos (igual ao Turbo); comissão da escada nominal (fallback = mediana real das
+        # vendas). A cota do frete independe do preço, então vale pras duas faixas
+        # (lt79/ge79). payback=0 (a cota já é o bruto que o vendedor paga; o subsídio do
+        # ML é o da promo, via meli_banca).
         values: list[dict[str, Any]] = []
         for mlb in active_flex:
             fr = freight_by.get(mlb)
             fr = fr if fr is not None else fb_freight
             rates = by.get(mlb, {}).get("rates", [])
+            comm_bands = sched_by_pair.get(cat_lt[mlb]) if mlb in cat_lt else None
             values.append(
                 {
                     "mlb_id": mlb,
                     "sku": sku_by_mlb.get(mlb),
                     "n_sales": len(rates),
                     "real_comm_pct": round(st.median(rates), 2) if rates else None,
+                    "commission_bands": comm_bands,
                     "freight_per_unit_lt79": fr,
                     "freight_per_unit_ge79": fr,
                     "payback_per_unit_lt79": 0.0,
@@ -226,6 +342,9 @@ class FlexFeeCalibrationService:
             "flex_mlbs_with_sales": len(by),
             "freight_from_ml_endpoint": n_freight_api,
             "freight_api_fallback_mean": fb_freight,
+            "commission_pairs_probed": len(distinct_pairs),
+            "commission_schedules_ok": n_sched_ok,
+            "mlbs_with_commission_bands": sum(1 for v in values if v["commission_bands"]),
             "rows_written": len(values),
         }
         logger.info("flex_fee_calibration done", **stats)

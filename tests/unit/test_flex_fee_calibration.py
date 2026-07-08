@@ -43,8 +43,15 @@ SNAP = SimpleNamespace(
     commission_pct=Decimal("11.50"),
     freight_bands=[{"min": 0, "max": None, "cost": 16.85}],
 )
+# Nominal ML fee schedule (price-banded) — gold_pro style mid-band discount.
+COMM_BANDS = [
+    {"min": 0, "max": 125.0, "pct": 16.5},
+    {"min": 125.0, "max": 650.0, "pct": 13.5},
+    {"min": 650.0, "max": None, "pct": 16.5},
+]
 CALIB = SimpleNamespace(
     real_comm_pct=Decimal("16.50"),
+    commission_bands=COMM_BANDS,
     freight_per_unit_lt79=Decimal("6.75"),
     freight_per_unit_ge79=Decimal("18.35"),
     payback_per_unit_lt79=Decimal("2.00"),
@@ -59,48 +66,57 @@ BANDS_CALIBRATED = [
 
 @pytest.mark.asyncio
 async def test_fulfillment_is_never_overridden() -> None:
-    comm, bands = await _effective_fees(_Session("fulfillment", CALIB), "MLB1", SNAP)
+    comm, bands, comm_bands = await _effective_fees(_Session("fulfillment", CALIB), "MLB1", SNAP)
     assert comm == Decimal("11.50")
     assert bands == SNAP.freight_bands
+    assert comm_bands is None
 
 
 @pytest.mark.asyncio
 async def test_flex_with_calibration_overrides_to_2band_split() -> None:
-    comm, bands = await _effective_fees(_Session("xd_drop_off", CALIB), "MLB1", SNAP)
+    comm, bands, comm_bands = await _effective_fees(_Session("xd_drop_off", CALIB), "MLB1", SNAP)
     assert comm == Decimal("16.50")
     assert bands == BANDS_CALIBRATED
+    assert comm_bands == COMM_BANDS
 
 
 @pytest.mark.asyncio
 async def test_flex_without_calibration_keeps_snapshot() -> None:
-    comm, bands = await _effective_fees(_Session("self_service", None), "MLB1", SNAP)
+    comm, bands, comm_bands = await _effective_fees(_Session("self_service", None), "MLB1", SNAP)
     assert comm == Decimal("11.50")
     assert bands == SNAP.freight_bands
+    assert comm_bands is None
 
 
 @pytest.mark.asyncio
 async def test_unknown_logistic_keeps_snapshot() -> None:
-    comm, bands = await _effective_fees(_Session(None, CALIB), "MLB1", SNAP)
+    comm, bands, comm_bands = await _effective_fees(_Session(None, CALIB), "MLB1", SNAP)
     assert comm == Decimal("11.50")
     assert bands == SNAP.freight_bands
+    assert comm_bands is None
 
 
 def test_apply_flex_calibration_pure_helper() -> None:
     from tiny_mirror.services.pricing_service import apply_flex_calibration
 
-    # fulfillment / unknown / no-calib → unchanged
+    # fulfillment / unknown / no-calib → unchanged, no commission bands
     assert apply_flex_calibration("fulfillment", Decimal("11.5"), SNAP.freight_bands, CALIB) == (
         Decimal("11.5"),
         SNAP.freight_bands,
+        None,
     )
     assert apply_flex_calibration("xd_drop_off", Decimal("11.5"), SNAP.freight_bands, None) == (
         Decimal("11.5"),
         SNAP.freight_bands,
+        None,
     )
-    # flex + calib → real rate + 2-band split
-    comm, bands = apply_flex_calibration("xd_drop_off", Decimal("11.5"), SNAP.freight_bands, CALIB)
+    # flex + calib → real rate + 2-band split + nominal commission schedule
+    comm, bands, comm_bands = apply_flex_calibration(
+        "xd_drop_off", Decimal("11.5"), SNAP.freight_bands, CALIB
+    )
     assert comm == Decimal("16.50")
     assert bands == BANDS_CALIBRATED
+    assert comm_bands == COMM_BANDS
 
 
 def test_apply_flex_calibration_fallback_row_overrides_only_freight() -> None:
@@ -115,10 +131,11 @@ def test_apply_flex_calibration_fallback_row_overrides_only_freight() -> None:
         payback_per_unit_lt79=Decimal("0.00"),
         payback_per_unit_ge79=Decimal("0.00"),
     )
-    comm, bands = apply_flex_calibration(
+    comm, bands, comm_bands = apply_flex_calibration(
         "xd_drop_off", Decimal("11.5"), SNAP.freight_bands, fallback
     )
     assert comm == Decimal("11.5")  # commission kept — no measured rate
+    assert comm_bands is None  # no schedule on this fallback row
     assert bands == [
         {"min": 0, "max": 78.99, "cost": 5.54, "payback": 0.0},
         {"min": 79, "max": None, "cost": 37.82, "payback": 0.0},
@@ -226,3 +243,63 @@ async def test_orders_for_day_missing_paging_keeps_fetching_until_empty_page() -
 
     assert http.get.await_count == 3
     assert [r["mlb"] for r in rows] == ["MLB1", "MLB2"]
+
+
+@pytest.mark.asyncio
+async def test_commission_schedule_compresses_midband_discount() -> None:
+    """The nominal fee schedule probe must collapse the price grid into bands and
+    reproduce ML's mid-price commission dip (gold_pro 16.5% → 13.5% → 16.5%)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    tok = MagicMock()
+    tok.get_valid_access_token = AsyncMock(return_value="t")
+    service = FlexFeeCalibrationService(tok, AsyncMock(), "12345")
+
+    def pct_for(price: float) -> float:
+        # real ML shape: cheaper in the ~130-575 window
+        return 13.5 if 130 <= price <= 575 else 16.5
+
+    async def fake_get(url: str, params=None):
+        p = float(params["price"])
+        return {"sale_fee_details": {"percentage_fee": pct_for(p), "fixed_fee": 0}}
+
+    service._get = fake_get  # type: ignore[method-assign]
+    bands = await service._commission_schedule("MLB1387", "gold_pro")
+
+    assert bands is not None
+    assert [b["pct"] for b in bands] == [16.5, 13.5, 16.5]
+    assert bands[0]["min"] == 0
+    assert bands[-1]["max"] is None
+    # spot-check the lookup reproduces the right rate at MT prices
+
+    def pct_at(price, bands):
+        for b in bands:
+            if price < b["min"]:
+                continue
+            if b["max"] is not None and price > b["max"]:
+                continue
+            return b["pct"]
+        return None
+
+    assert pct_at(60, bands) == 16.5
+    assert pct_at(411.58, bands) == 13.5
+    assert pct_at(1007, bands) == 16.5
+
+
+@pytest.mark.asyncio
+async def test_commission_schedule_none_on_total_api_failure() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    tok = MagicMock()
+    tok.get_valid_access_token = AsyncMock(return_value="t")
+    service = FlexFeeCalibrationService(tok, AsyncMock(), "12345")
+
+    async def fake_get(url: str, params=None):
+        return None
+
+    service._get = fake_get  # type: ignore[method-assign]
+    assert await service._commission_schedule("C", "gold_pro") is None

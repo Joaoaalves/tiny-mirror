@@ -252,3 +252,95 @@ def test_margin_breakdown_as_dict_roundtrip() -> None:
     assert d["margin_value"] == pytest.approx(7.28)
     assert d["margin_pct"] == pytest.approx(18.25)
     assert d["seller_receives"] == pytest.approx(39.90)
+
+
+# --- Nominal commission schedule (price-banded), from ML listing_prices ----
+# gold_pro category MLB1387: 16.5% up to ~R$100, drops to 13.5% in the mid
+# band (~R$150-500), back to 16.5% above. Verified against Mercado Turbo's
+# per-price tarifa (278/290 exact). fixed_fee is always 0 for our categories.
+GOLD_PRO_COMM_BANDS = [
+    {"min": 0, "max": 100, "pct": 16.5},
+    {"min": 100.01, "max": 500, "pct": 13.5},
+    {"min": 500.01, "max": None, "pct": 16.5},
+]
+FLAT_FREIGHT = [{"min": 0, "max": None, "cost": 14.45}]
+
+
+def test_commission_bands_lookup_by_price() -> None:
+    """Commission % follows the band containing the price (not a flat rate)."""
+    # low band 16.5%
+    lo = margin_at_price(
+        price=Decimal("60"),
+        base_cost=Decimal("20"),
+        commission_pct=Decimal("99"),  # fallback must NOT be used
+        freight_bands=FLAT_FREIGHT,
+        commission_bands=GOLD_PRO_COMM_BANDS,
+    )
+    assert float(lo.commission_value) == pytest.approx(9.90)  # 60 * 16.5%
+    # mid band 13.5%
+    mid = margin_at_price(
+        price=Decimal("300"),
+        base_cost=Decimal("20"),
+        commission_pct=Decimal("99"),
+        freight_bands=FLAT_FREIGHT,
+        commission_bands=GOLD_PRO_COMM_BANDS,
+    )
+    assert float(mid.commission_value) == pytest.approx(40.50)  # 300 * 13.5%
+    # top band 16.5% again (the non-monotonic return)
+    hi = margin_at_price(
+        price=Decimal("1007"),
+        base_cost=Decimal("20"),
+        commission_pct=Decimal("99"),
+        freight_bands=FLAT_FREIGHT,
+        commission_bands=GOLD_PRO_COMM_BANDS,
+    )
+    assert float(hi.commission_value) == pytest.approx(166.16)  # 1007 * 16.5%, rounded
+
+
+def test_commission_bands_falls_back_to_scalar_when_absent() -> None:
+    """No bands (fulfillment path) → the flat commission_pct is used as before."""
+    m = margin_at_price(
+        price=Decimal("300"),
+        base_cost=Decimal("20"),
+        commission_pct=Decimal("16"),
+        freight_bands=FLAT_FREIGHT,
+        commission_bands=None,
+    )
+    assert float(m.commission_value) == pytest.approx(48.0)  # 300 * 16%
+
+
+def test_commission_bands_reproduce_mercado_turbo_int_vaporclean() -> None:
+    """The R$47 tail case: INT-VAPORCLEAN at R$1007. MT tarifa = 161.12 (16%);
+    the old flat historical median gave 113.49 (11.27%). With the nominal
+    schedule the commission matches MT."""
+    bands = [{"min": 0, "max": 100, "pct": 18}, {"min": 100.01, "max": None, "pct": 16}]
+    m = margin_at_price(
+        price=Decimal("1007"),
+        base_cost=Decimal("399.03"),
+        commission_pct=Decimal("11.27"),  # the stale median — must be ignored
+        freight_bands=[{"min": 0, "max": None, "cost": 48.05}],
+        commission_bands=bands,
+    )
+    assert float(m.commission_value) == pytest.approx(161.12)  # 1007 * 16%
+
+
+def test_floor_solver_respects_commission_bands() -> None:
+    """The floor solver must segment on commission breakpoints too: a floor that
+    lands in the cheaper mid-band uses 13.5%, not the boundary rate."""
+    target = target_price_for_min_margin_pct(
+        base_cost=Decimal("120"),
+        commission_pct=Decimal("16.5"),
+        freight_bands=FLAT_FREIGHT,
+        min_margin_pct=Decimal("10"),
+        commission_bands=GOLD_PRO_COMM_BANDS,
+    )
+    # Round-trip: the realised margin at the returned price must meet the floor,
+    # with commission looked up by band at that price.
+    realised = margin_at_price(
+        price=target,
+        base_cost=Decimal("120"),
+        commission_pct=Decimal("16.5"),
+        freight_bands=FLAT_FREIGHT,
+        commission_bands=GOLD_PRO_COMM_BANDS,
+    )
+    assert realised.margin_pct >= Decimal("9.95")

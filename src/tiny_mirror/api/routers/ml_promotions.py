@@ -193,6 +193,9 @@ class CapOut(BaseModel):
     list_price: Decimal | None = None
     sheet_promo_price: Decimal | None = None
     freight_bands: Any | None = None
+    # Nominal ML commission schedule (price-banded) for Flex listings — matches
+    # Mercado Turbo's per-price tarifa. Null ⇒ use the flat commission_pct.
+    commission_bands: Any | None = None
     margin_at_floor_value: Decimal | None = None
     margin_at_floor_pct: Decimal | None = None
     # Joined from ml_catalog_status (price_to_win / buy-box).
@@ -227,6 +230,9 @@ class CostSnapshotOut(BaseModel):
     # DIFAL (sheet-wide constant). Sent on every snapshot so the frontend
     # can mirror the margin formula locally without a separate config call.
     difal_pct: Decimal | None = None
+    # Nominal ML commission schedule (price-banded) for Flex listings — matches
+    # Mercado Turbo's per-price tarifa. Null ⇒ use the flat commission_pct.
+    commission_bands: Any | None = None
 
 
 class ActionOut(BaseModel):
@@ -573,17 +579,17 @@ async def _build_decision_context(
 # ---------------------------------------------------------------------------
 # CAPS
 # ---------------------------------------------------------------------------
-async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tuple[Any, Any]:
-    """Return ``(commission_pct, freight_bands)`` for margin math, applying the
-    per-MLB **Flex** fee calibration when one exists.
+async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tuple[Any, Any, Any]:
+    """Return ``(commission_pct, freight_bands, commission_bands)`` for margin
+    math, applying the per-MLB **Flex** fee calibration when one exists.
 
     Fulfillment listings (and any MLB with unknown logistic_type or no
-    calibration row) return the snapshot values UNCHANGED — fulfillment fees are
-    already correct and must never be overridden. For Flex listings with a
-    calibration row, commission_pct becomes the real effective rate and
-    freight_bands becomes a synthetic 2-band table split at R$79 (the
-    free-shipping cliff), so both margin engines and the frontend pick up the
-    real seller freight without any further changes.
+    calibration row) return the snapshot values UNCHANGED with ``commission_bands
+    = None`` — fulfillment fees are already correct and must never be overridden.
+    For Flex listings with a calibration row, freight_bands becomes a synthetic
+    2-band table split at R$79 (the free-shipping cliff) and commission_bands
+    becomes the nominal ML fee schedule (price-banded, = Mercado Turbo), so both
+    margin engines and the frontend pick up the real fees without further changes.
     """
     from sqlalchemy import select
 
@@ -602,7 +608,7 @@ async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tupl
         )
     ).scalar_one_or_none()
     if logistic_type is None or logistic_type == "fulfillment":
-        return base_comm, base_bands
+        return base_comm, base_bands, None
 
     calib = await session.get(MLFlexFeeCalibrationORM, mlb_id)
     return apply_flex_calibration(logistic_type, base_comm, base_bands, calib)
@@ -684,9 +690,12 @@ async def _enrich_cap(
     # Flex listings: override the (wrong) spreadsheet commission + generic freight
     # bands with the per-MLB calibration. Fulfillment is unchanged. Roda mesmo sem
     # snapshot (snap=None) — a calibração Flex independe do custo da planilha.
-    eff_commission_pct, eff_freight_bands = await _effective_fees(session, cap.mlb_id, snap)
+    eff_commission_pct, eff_freight_bands, eff_commission_bands = await _effective_fees(
+        session, cap.mlb_id, snap
+    )
     out.commission_pct = eff_commission_pct
     out.freight_bands = eff_freight_bands
+    out.commission_bands = eff_commission_bands
 
     # Fallback de custo: quando a PLANILHA não tem (snapshot vazio/ausente), usa o
     # custo do Tiny (products.prices.cost_price) — senão a margem fica "—". Na prática
@@ -718,6 +727,7 @@ async def _enrich_cap(
                 base_cost=out.base_cost,
                 commission_pct=eff_commission_pct,
                 freight_bands=eff_freight_bands,
+                commission_bands=eff_commission_bands,
             )
             out.margin_at_floor_value = breakdown.margin_value
             out.margin_at_floor_pct = breakdown.margin_pct
@@ -901,14 +911,21 @@ async def delete_cap(
 # ---------------------------------------------------------------------------
 # COSTS
 # ---------------------------------------------------------------------------
-def _snapshot_out(row: Any) -> CostSnapshotOut:
-    """Build a CostSnapshotOut and attach the DIFAL constant so the
-    frontend can mirror the margin formula without an extra config call.
+async def _snapshot_out(row: Any, session: AsyncSession) -> CostSnapshotOut:
+    """Build a CostSnapshotOut, attach the DIFAL constant, and — for Flex
+    listings — the calibrated commission schedule + freight so the frontend's
+    live margin matches the caps board (and Mercado Turbo) without an extra call.
     """
     from tiny_mirror.config import settings
 
     out = CostSnapshotOut.model_validate(row)
     out.difal_pct = Decimal(str(settings.margin_difal_pct))
+    eff_comm, eff_bands, eff_comm_bands = await _effective_fees(session, row.mlb_id, row)
+    if eff_comm is not None:
+        out.commission_pct = eff_comm
+    if eff_bands is not None:
+        out.freight_bands = eff_bands
+    out.commission_bands = eff_comm_bands
     return out
 
 
@@ -919,7 +936,7 @@ async def get_costs(
 ) -> list[CostSnapshotOut]:
     repo = MLCostsSnapshotRepository(session)
     rows = await repo.get_by_sku(sku)
-    return [_snapshot_out(r) for r in rows]
+    return [await _snapshot_out(r, session) for r in rows]
 
 
 @router.post("/costs/refresh/{sku}", response_model=list[CostSnapshotOut])
@@ -937,7 +954,7 @@ async def refresh_costs(
     await session.commit()
     repo = MLCostsSnapshotRepository(session)
     rows = await repo.get_by_sku(sku)
-    return [_snapshot_out(r) for r in rows]
+    return [await _snapshot_out(r, session) for r in rows]
 
 
 @router.post("/costs/refresh-all", response_model=dict[str, int])
@@ -1276,6 +1293,9 @@ async def profitability(
                 }
             )
             continue
+        # Flex: pick up the calibrated freight + nominal commission schedule so
+        # this endpoint's margin matches the caps board (and Mercado Turbo).
+        eff_comm, eff_bands, eff_comm_bands = await _effective_fees(session, snap.mlb_id, snap)
         try:
             if price is not None:
                 effective_price = price
@@ -1288,19 +1308,21 @@ async def profitability(
                 assert min_margin_pct is not None
                 effective_price = target_price_for_min_margin_pct(
                     base_cost=snap.base_cost,
-                    commission_pct=snap.commission_pct,
-                    freight_bands=snap.freight_bands,
+                    commission_pct=eff_comm,
+                    freight_bands=eff_bands,
                     min_margin_pct=min_margin_pct,
                     list_price=snap.list_price,
                     meli_banca_pct=meli_banca_pct,
+                    commission_bands=eff_comm_bands,
                 )
             breakdown = margin_at_price(
                 price=effective_price,
                 base_cost=snap.base_cost,
-                commission_pct=snap.commission_pct,
-                freight_bands=snap.freight_bands,
+                commission_pct=eff_comm,
+                freight_bands=eff_bands,
                 list_price=snap.list_price,
                 meli_banca_pct=meli_banca_pct,
+                commission_bands=eff_comm_bands,
             )
         except PricingDataError as exc:
             out.append({"mlb_id": snap.mlb_id, "error": str(exc)})
@@ -4336,21 +4358,25 @@ async def catalog_competitors(
         and suggested > current + 0.01
     )
 
+    # Flex: calibrated freight + nominal commission schedule (= Mercado Turbo).
+    _eff_comm, _eff_bands, _eff_comm_bands = await _effective_fees(session, mlb_id, snap)
+
     def _margin(price: float | None) -> dict[str, float] | None:
         if (
             price is None
             or not snap
             or snap.base_cost is None
-            or snap.commission_pct is None
-            or not snap.freight_bands
+            or _eff_comm is None
+            or not _eff_bands
         ):
             return None
         try:
             b = margin_at_price(
                 price=price,
                 base_cost=snap.base_cost,
-                commission_pct=snap.commission_pct,
-                freight_bands=snap.freight_bands,
+                commission_pct=_eff_comm,
+                freight_bands=_eff_bands,
+                commission_bands=_eff_comm_bands,
             )
             return {"pct": float(b.margin_pct), "value": float(b.margin_value)}
         except Exception:  # pragma: no cover — dados de custo incompletos
