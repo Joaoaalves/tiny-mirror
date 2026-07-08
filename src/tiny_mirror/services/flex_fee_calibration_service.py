@@ -124,20 +124,98 @@ class FlexFeeCalibrationService:
         5000,
     ]
 
-    async def _item_cat_lt(self, mlbs: list[str]) -> dict[str, tuple[str, str]]:
-        """``{mlb: (category_id, listing_type_id)}`` via o multiget de items."""
-        out: dict[str, tuple[str, str]] = {}
+    @staticmethod
+    def _parse_dims(attrs: list[dict[str, Any]]) -> str | None:
+        """``"AxLxC,gramas"`` a partir dos atributos do item — preferindo as medidas
+        declaradas pelo vendedor (SELLER_PACKAGE_*, as que o Mercado Turbo usa no
+        tooltip), com fallback nas certificadas (PACKAGE_*). None se incompleto."""
+
+        def num(vid: str) -> float | None:
+            for a in attrs:
+                if a.get("id") == vid:
+                    raw = str(a.get("value_name") or "")
+                    try:
+                        return float(raw.split()[0].replace(",", "."))
+                    except (ValueError, IndexError):
+                        return None
+            return None
+
+        for prefix in ("SELLER_PACKAGE_", "PACKAGE_"):
+            h = num(f"{prefix}HEIGHT")
+            w = num(f"{prefix}WIDTH")
+            ln = num(f"{prefix}LENGTH")
+            g = num(f"{prefix}WEIGHT")
+            if None not in (h, w, ln, g):
+                return f"{h:g}x{w:g}x{ln:g},{g:g}"
+        return None
+
+    async def _item_meta(self, mlbs: list[str]) -> dict[str, dict[str, Any]]:
+        """``{mlb: {cat, lt, dims}}`` via o multiget de items (1 chamada por 20)."""
+        out: dict[str, dict[str, Any]] = {}
         for i in range(0, len(mlbs), 20):
             data = await self._get(
                 f"{_API}/items",
-                {"ids": ",".join(mlbs[i : i + 20]), "attributes": "id,category_id,listing_type_id"},
+                {
+                    "ids": ",".join(mlbs[i : i + 20]),
+                    "attributes": "id,category_id,listing_type_id,attributes",
+                },
             )
             for e in data or []:
                 b = e.get("body") or {}
-                mid, cat, lt = b.get("id"), b.get("category_id"), b.get("listing_type_id")
-                if mid and cat and lt:
-                    out[mid] = (cat, lt)
+                mid = b.get("id")
+                if not mid:
+                    continue
+                out[mid] = {
+                    "cat": b.get("category_id"),
+                    "lt": b.get("listing_type_id"),
+                    "dims": self._parse_dims(b.get("attributes") or []),
+                }
         return out
+
+    # Faixas de preço da tabela de frete do ML (mesmas da planilha/Mercado Turbo);
+    # sondamos a calculadora com um preço no MIOLO de cada faixa.
+    _FREIGHT_BRACKETS: ClassVar[list[tuple[float, float | None, float]]] = [
+        (0, 18.99, 12),
+        (19, 48.99, 30),
+        (49, 78.99, 60),
+        (79, 99.99, 85),
+        (100, 119.99, 110),
+        (120, 149.99, 135),
+        (150, 199.99, 175),
+        (200, None, 250),
+    ]
+
+    async def _freight_schedule(self, dims: str, lt: str | None) -> list[dict[str, Any]] | None:
+        """Tabela de frete do vendedor por faixa de preço para um pacote ``dims``,
+        via a calculadora do ML (``/users/{uid}/shipping_options/free`` com
+        ``item_price``) — o MESMO frete que o Mercado Turbo exibe (validado 7/7
+        exato). Uma sonda por faixa; ``None`` se nenhuma responder."""
+        bands: list[dict[str, Any]] = []
+        for lo, hi, probe in self._FREIGHT_BRACKETS:
+            d = await self._get(
+                f"{_API}/users/{self._uid}/shipping_options/free",
+                {
+                    "dimensions": dims,
+                    "item_price": probe,
+                    "listing_type_id": lt or "gold_special",
+                    "mode": "me2",
+                    "condition": "new",
+                },
+            )
+            cost = (((d or {}).get("coverage") or {}).get("all_country") or {}).get("list_cost")
+            if cost is None:
+                continue
+            bands.append({"min": lo, "max": hi, "cost": round(float(cost), 2)})
+        if not bands:
+            return None
+        # faixas contíguas de mesmo custo colapsam numa só (menos ruído no JSON)
+        merged: list[dict[str, Any]] = [bands[0]]
+        for b in bands[1:]:
+            if b["cost"] == merged[-1]["cost"]:
+                merged[-1]["max"] = b["max"]
+            else:
+                merged.append(b)
+        return merged
 
     async def _commission_schedule(self, cat: str, lt: str) -> list[dict[str, Any]] | None:
         """Nominal ML fee schedule for a (category, listing_type), probed from
@@ -284,11 +362,15 @@ class FlexFeeCalibrationService:
         fb_freight = round(st.mean(ok_vals), 2) if ok_vals else 0.0  # falha de API → média
         n_freight_api = len(ok_vals)
 
+        # --- metadados por item (1 multiget): categoria+tipo (p/ comissão) e
+        # dimensões do pacote (p/ frete).
+        meta = await self._item_meta(active_flex)
+
         # --- COMISSÃO NOMINAL: escada de tarifa por (categoria, tipo de anúncio),
         # sondada do listing_prices (= o que o Mercado Turbo cobra). A % NÃO é
         # constante no preço, então guardamos bandas por MLB. Poucas (cat,lt)
         # distintas → sonda uma vez cada e reaproveita em todos os MLBs.
-        cat_lt = await self._item_cat_lt(active_flex)
+        cat_lt = {m: (v["cat"], v["lt"]) for m, v in meta.items() if v.get("cat") and v.get("lt")}
         distinct_pairs = sorted(set(cat_lt.values()))
         _csem = asyncio.Semaphore(6)
 
@@ -301,17 +383,34 @@ class FlexFeeCalibrationService:
         sched_by_pair = dict(await asyncio.gather(*[_sched(p) for p in distinct_pairs]))
         n_sched_ok = sum(1 for v in sched_by_pair.values() if v)
 
-        # --- assemble: 1 linha por anúncio Flex ATIVO — frete do shipping_options pra
-        # todos (igual ao Turbo); comissão da escada nominal (fallback = mediana real das
-        # vendas). A cota do frete independe do preço, então vale pras duas faixas
-        # (lt79/ge79). payback=0 (a cota já é o bruto que o vendedor paga; o subsídio do
-        # ML é o da promo, via meli_banca).
+        # --- FRETE POR FAIXA: a calculadora do ML dá o frete do vendedor por
+        # (dimensões, faixa de preço) — o flat da cota só vale na faixa em que o
+        # anúncio vende HOJE (uma caixa 56L custa 11,75 <79 e 48,55 >=79). Sondamos
+        # por (dims, lt) distintos e reaproveitamos (mesma caixa → mesma tabela).
+        freight_keys = sorted({(v["dims"], v.get("lt")) for v in meta.values() if v.get("dims")})
+
+        async def _fsched(
+            key: tuple[str, str | None],
+        ) -> tuple[tuple[str, str | None], list[dict[str, Any]] | None]:
+            async with _csem:
+                return key, await self._freight_schedule(key[0], key[1])
+
+        fsched_by_key = dict(await asyncio.gather(*[_fsched(k) for k in freight_keys]))
+        n_fsched_ok = sum(1 for v in fsched_by_key.values() if v)
+
+        # --- assemble: 1 linha por anúncio Flex ATIVO — frete da calculadora por
+        # faixa (fallback: cota flat do shipping_options quando o item não tem
+        # dimensões); comissão da escada nominal (fallback = mediana real das
+        # vendas). payback=0 (a tabela já é o bruto que o vendedor paga; o subsídio
+        # do ML é o da promo, via meli_banca).
         values: list[dict[str, Any]] = []
         for mlb in active_flex:
             fr = freight_by.get(mlb)
             fr = fr if fr is not None else fb_freight
             rates = by.get(mlb, {}).get("rates", [])
             comm_bands = sched_by_pair.get(cat_lt[mlb]) if mlb in cat_lt else None
+            mm = meta.get(mlb) or {}
+            fr_bands = fsched_by_key.get((mm["dims"], mm.get("lt"))) if mm.get("dims") else None
             values.append(
                 {
                     "mlb_id": mlb,
@@ -319,6 +418,7 @@ class FlexFeeCalibrationService:
                     "n_sales": len(rates),
                     "real_comm_pct": round(st.median(rates), 2) if rates else None,
                     "commission_bands": comm_bands,
+                    "freight_bands": fr_bands,
                     "freight_per_unit_lt79": fr,
                     "freight_per_unit_ge79": fr,
                     "payback_per_unit_lt79": 0.0,
@@ -345,6 +445,9 @@ class FlexFeeCalibrationService:
             "commission_pairs_probed": len(distinct_pairs),
             "commission_schedules_ok": n_sched_ok,
             "mlbs_with_commission_bands": sum(1 for v in values if v["commission_bands"]),
+            "freight_dims_probed": len(freight_keys),
+            "freight_schedules_ok": n_fsched_ok,
+            "mlbs_with_freight_bands": sum(1 for v in values if v["freight_bands"]),
             "rows_written": len(values),
         }
         logger.info("flex_fee_calibration done", **stats)

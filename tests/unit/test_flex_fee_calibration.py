@@ -303,3 +303,96 @@ async def test_commission_schedule_none_on_total_api_failure() -> None:
 
     service._get = fake_get  # type: ignore[method-assign]
     assert await service._commission_schedule("C", "gold_pro") is None
+
+
+def test_apply_flex_calibration_prefers_freight_schedule() -> None:
+    """When the calibration row carries a price-banded freight schedule (from
+    ML's freight calculator), it must win over the flat lt79/ge79 quote."""
+    from tiny_mirror.services.pricing_service import apply_flex_calibration
+
+    fr_bands = [
+        {"min": 0, "max": 78.99, "cost": 11.75},
+        {"min": 79, "max": None, "cost": 48.55},
+    ]
+    calib = SimpleNamespace(
+        real_comm_pct=None,
+        commission_bands=None,
+        freight_bands=fr_bands,
+        freight_per_unit_lt79=Decimal("0.00"),  # the flat quote said 0 — must lose
+        freight_per_unit_ge79=Decimal("0.00"),
+        payback_per_unit_lt79=Decimal("0.00"),
+        payback_per_unit_ge79=Decimal("0.00"),
+    )
+    _comm, bands, _cb = apply_flex_calibration(
+        "xd_drop_off", Decimal("11.5"), SNAP.freight_bands, calib
+    )
+    assert bands == [
+        {"min": 0, "max": 78.99, "cost": 11.75, "payback": 0.0},
+        {"min": 79, "max": None, "cost": 48.55, "payback": 0.0},
+    ]
+
+
+def test_parse_dims_prefers_seller_package() -> None:
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    attrs = [
+        {"id": "PACKAGE_HEIGHT", "value_name": "34 cm"},
+        {"id": "PACKAGE_WIDTH", "value_name": "59 cm"},
+        {"id": "PACKAGE_LENGTH", "value_name": "41 cm"},
+        {"id": "PACKAGE_WEIGHT", "value_name": "1300 g"},
+        {"id": "SELLER_PACKAGE_HEIGHT", "value_name": "58 cm"},
+        {"id": "SELLER_PACKAGE_WIDTH", "value_name": "42 cm"},
+        {"id": "SELLER_PACKAGE_LENGTH", "value_name": "37 cm"},
+        {"id": "SELLER_PACKAGE_WEIGHT", "value_name": "1800 g"},
+    ]
+    # MT usa as medidas do vendedor (58x42x37, 1800) — não as certificadas
+    assert FlexFeeCalibrationService._parse_dims(attrs) == "58x42x37,1800"
+    # sem as do vendedor → cai nas certificadas
+    certified_only = [a for a in attrs if not a["id"].startswith("SELLER_")]
+    assert FlexFeeCalibrationService._parse_dims(certified_only) == "34x59x41,1300"
+    # incompleto → None
+    assert FlexFeeCalibrationService._parse_dims(certified_only[:2]) is None
+
+
+@pytest.mark.asyncio
+async def test_freight_schedule_probes_brackets_and_merges() -> None:
+    """The freight schedule probes ML's calculator per price bracket and merges
+    contiguous equal-cost brackets (reproduces the UNI-CX 11.75/48.55 shape)."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    tok = MagicMock()
+    tok.get_valid_access_token = AsyncMock(return_value="t")
+    service = FlexFeeCalibrationService(tok, AsyncMock(), "12345")
+
+    async def fake_get(url: str, params=None):
+        price = float(params["item_price"])
+        assert params["dimensions"] == "58x42x37,1800"
+        cost = 11.75 if price < 79 else 48.55
+        return {"coverage": {"all_country": {"list_cost": cost}}}
+
+    service._get = fake_get  # type: ignore[method-assign]
+    bands = await service._freight_schedule("58x42x37,1800", "gold_special")
+
+    assert bands == [
+        {"min": 0, "max": 78.99, "cost": 11.75},
+        {"min": 79, "max": None, "cost": 48.55},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_freight_schedule_none_on_total_failure() -> None:
+    from unittest.mock import AsyncMock, MagicMock
+
+    from tiny_mirror.services.flex_fee_calibration_service import FlexFeeCalibrationService
+
+    tok = MagicMock()
+    tok.get_valid_access_token = AsyncMock(return_value="t")
+    service = FlexFeeCalibrationService(tok, AsyncMock(), "12345")
+
+    async def fake_get(url: str, params=None):
+        return None
+
+    service._get = fake_get  # type: ignore[method-assign]
+    assert await service._freight_schedule("10x10x10,500", None) is None
