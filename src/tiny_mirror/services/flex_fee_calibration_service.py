@@ -374,12 +374,9 @@ class FlexFeeCalibrationService:
         # sondada do listing_prices (= o que o Mercado Turbo cobra). A % NÃO é
         # constante no preço, então guardamos bandas por MLB. Poucas (cat,lt)
         # distintas → sonda uma vez cada e reaproveita em todos os MLBs.
-        # SÓ Flex: a comissão do fulfillment é da planilha e não é recalibrada.
-        cat_lt = {
-            m: (v["cat"], v["lt"])
-            for m, v in meta.items()
-            if v.get("cat") and v.get("lt") and m in set(active_flex)
-        }
+        # Vale pra TODOS (Flex e fulfillment — operador autorizou 2026-07-08; a
+        # planilha do FULL divergiu da nominal). Só o CUSTO segue intocável.
+        cat_lt = {m: (v["cat"], v["lt"]) for m, v in meta.items() if v.get("cat") and v.get("lt")}
         distinct_pairs = sorted(set(cat_lt.values()))
         _csem = asyncio.Semaphore(6)
 
@@ -410,8 +407,8 @@ class FlexFeeCalibrationService:
         # --- assemble — 1 linha por anúncio ATIVO:
         #   Flex: frete da calculadora por faixa (fallback: cota flat) + comissão
         #     da escada nominal (fallback = mediana real das vendas).
-        #   Fulfillment: SÓ freight_bands (comissão/custo do FULL ficam da planilha,
-        #     intocados); sem tabela de frete → sem linha (snapshot segue valendo).
+        #   Fulfillment: freight_bands + commission_bands nominais (o CUSTO do FULL
+        #     fica da planilha, intocável); sem banda nenhuma → sem linha.
         # payback=0 (a tabela já é o bruto que o vendedor paga; o subsídio do ML é
         # o da promo, via meli_banca).
         values: list[dict[str, Any]] = []
@@ -442,16 +439,17 @@ class FlexFeeCalibrationService:
         for mlb in active_full:
             mm = meta.get(mlb) or {}
             fr_bands = fsched_by_key.get((mm["dims"], mm.get("lt"))) if mm.get("dims") else None
-            if not fr_bands:
-                continue  # sem dims → fulfillment fica 100% na planilha
+            comm_bands = sched_by_pair.get(cat_lt[mlb]) if mlb in cat_lt else None
+            if not fr_bands and not comm_bands:
+                continue  # sem banda nenhuma → fulfillment fica 100% na planilha
             n_full_banded += 1
             values.append(
                 {
                     "mlb_id": mlb,
                     "sku": sku_by_mlb.get(mlb),
                     "n_sales": 0,
-                    "real_comm_pct": None,  # comissão do FULL nunca é sobrescrita
-                    "commission_bands": None,
+                    "real_comm_pct": None,  # fallback do FULL = comissão da planilha
+                    "commission_bands": comm_bands,
                     "freight_bands": fr_bands,
                     "freight_per_unit_lt79": None,
                     "freight_per_unit_ge79": None,

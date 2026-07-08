@@ -148,10 +148,12 @@ def apply_flex_calibration(
     price-banded, from ``/sites/MLB/listing_prices`` — this is what Mercado Turbo
     charges).
 
-    **Fulfillment**: ONLY freight is overridden, and only when the calibration row
-    carries a banded ``freight_bands`` schedule (operator decision 2026-07-08 —
-    the sheet's freight table drifted from ML's calculator). Commission and cost
-    for FULL stay from the snapshot, untouched, always.
+    **Fulfillment**: freight comes from the banded calculator schedule and
+    commission from the nominal ML schedule, each only when the calibration row
+    carries it (operator decisions 2026-07-08 — the sheet's freight table AND
+    commission drifted from ML's nominal). The snapshot commission stays as the
+    band-lookup fallback; the COST for FULL is never touched (it doesn't flow
+    through here). No banded data → snapshot unchanged.
 
     An unknown ``logistic_type`` or a missing calibration returns the snapshot
     values UNCHANGED with no commission bands. This is the single source of truth
@@ -161,9 +163,9 @@ def apply_flex_calibration(
         return commission_pct, freight_bands, None
     if logistic_type == "fulfillment":
         full_fr = getattr(calib, "freight_bands", None) or None
-        if full_fr:
-            return commission_pct, [{**b, "payback": 0.0} for b in full_fr], None
-        return commission_pct, freight_bands, None
+        full_comm = getattr(calib, "commission_bands", None) or None
+        eff_fr = [{**b, "payback": 0.0} for b in full_fr] if full_fr else freight_bands
+        return commission_pct, eff_fr, full_comm
     # Flex with a calibration row: ALWAYS replace the (wrong) generic freight
     # bands with the calibrated 2-band Flex table — fallback rows for listings
     # without sales still carry the global Flex mean, so they don't silently
