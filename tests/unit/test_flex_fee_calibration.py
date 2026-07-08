@@ -49,9 +49,15 @@ COMM_BANDS = [
     {"min": 125.0, "max": 650.0, "pct": 13.5},
     {"min": 650.0, "max": None, "pct": 16.5},
 ]
+# Banded freight schedule (from ML's calculator) carried by the calib row.
+FULL_FR_BANDS = [
+    {"min": 0, "max": 78.99, "cost": 11.75},
+    {"min": 79, "max": None, "cost": 48.55},
+]
 CALIB = SimpleNamespace(
     real_comm_pct=Decimal("16.50"),
     commission_bands=COMM_BANDS,
+    freight_bands=FULL_FR_BANDS,
     freight_per_unit_lt79=Decimal("6.75"),
     freight_per_unit_ge79=Decimal("18.35"),
     payback_per_unit_lt79=Decimal("2.00"),
@@ -65,18 +71,38 @@ BANDS_CALIBRATED = [
 
 
 @pytest.mark.asyncio
-async def test_fulfillment_is_never_overridden() -> None:
+async def test_fulfillment_commission_never_overridden_freight_banded() -> None:
+    """FULL: commission stays from the snapshot ALWAYS; freight uses the banded
+    schedule from ML's calculator when the calibration row carries one
+    (operator decision 2026-07-08)."""
     comm, bands, comm_bands = await _effective_fees(_Session("fulfillment", CALIB), "MLB1", SNAP)
+    assert comm == Decimal("11.50")  # snapshot commission, untouched
+    assert comm_bands is None  # nominal schedule never applies to FULL
+    assert bands == [{**b, "payback": 0.0} for b in FULL_FR_BANDS]
+
+
+@pytest.mark.asyncio
+async def test_fulfillment_without_freight_schedule_keeps_snapshot() -> None:
+    calib = SimpleNamespace(
+        real_comm_pct=Decimal("16.50"),
+        commission_bands=COMM_BANDS,
+        freight_bands=None,
+        freight_per_unit_lt79=Decimal("6.75"),
+        freight_per_unit_ge79=Decimal("18.35"),
+        payback_per_unit_lt79=Decimal("0.00"),
+        payback_per_unit_ge79=Decimal("0.00"),
+    )
+    comm, bands, comm_bands = await _effective_fees(_Session("fulfillment", calib), "MLB1", SNAP)
     assert comm == Decimal("11.50")
     assert bands == SNAP.freight_bands
     assert comm_bands is None
 
 
 @pytest.mark.asyncio
-async def test_flex_with_calibration_overrides_to_2band_split() -> None:
+async def test_flex_with_calibration_uses_banded_freight_and_commission() -> None:
     comm, bands, comm_bands = await _effective_fees(_Session("xd_drop_off", CALIB), "MLB1", SNAP)
     assert comm == Decimal("16.50")
-    assert bands == BANDS_CALIBRATED
+    assert bands == [{**b, "payback": 0.0} for b in FULL_FR_BANDS]  # schedule wins
     assert comm_bands == COMM_BANDS
 
 
@@ -99,23 +125,30 @@ async def test_unknown_logistic_keeps_snapshot() -> None:
 def test_apply_flex_calibration_pure_helper() -> None:
     from tiny_mirror.services.pricing_service import apply_flex_calibration
 
-    # fulfillment / unknown / no-calib → unchanged, no commission bands
-    assert apply_flex_calibration("fulfillment", Decimal("11.5"), SNAP.freight_bands, CALIB) == (
-        Decimal("11.5"),
-        SNAP.freight_bands,
-        None,
+    # fulfillment: SÓ o frete é sobrescrito (comissão do snapshot, sem bandas)
+    comm, bands, comm_bands = apply_flex_calibration(
+        "fulfillment", Decimal("11.5"), SNAP.freight_bands, CALIB
     )
+    assert comm == Decimal("11.5")
+    assert comm_bands is None
+    assert bands == [{**b, "payback": 0.0} for b in FULL_FR_BANDS]
+    # unknown / no-calib → unchanged
     assert apply_flex_calibration("xd_drop_off", Decimal("11.5"), SNAP.freight_bands, None) == (
         Decimal("11.5"),
         SNAP.freight_bands,
         None,
     )
-    # flex + calib → real rate + 2-band split + nominal commission schedule
+    assert apply_flex_calibration(None, Decimal("11.5"), SNAP.freight_bands, CALIB) == (
+        Decimal("11.5"),
+        SNAP.freight_bands,
+        None,
+    )
+    # flex + calib → comissão real + frete por faixa + escada nominal
     comm, bands, comm_bands = apply_flex_calibration(
         "xd_drop_off", Decimal("11.5"), SNAP.freight_bands, CALIB
     )
     assert comm == Decimal("16.50")
-    assert bands == BANDS_CALIBRATED
+    assert bands == [{**b, "payback": 0.0} for b in FULL_FR_BANDS]
     assert comm_bands == COMM_BANDS
 
 

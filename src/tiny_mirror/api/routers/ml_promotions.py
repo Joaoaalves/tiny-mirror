@@ -581,15 +581,15 @@ async def _build_decision_context(
 # ---------------------------------------------------------------------------
 async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tuple[Any, Any, Any]:
     """Return ``(commission_pct, freight_bands, commission_bands)`` for margin
-    math, applying the per-MLB **Flex** fee calibration when one exists.
+    math, applying the per-MLB fee calibration when one exists.
 
-    Fulfillment listings (and any MLB with unknown logistic_type or no
-    calibration row) return the snapshot values UNCHANGED with ``commission_bands
-    = None`` — fulfillment fees are already correct and must never be overridden.
-    For Flex listings with a calibration row, freight_bands becomes a synthetic
-    2-band table split at R$79 (the free-shipping cliff) and commission_bands
-    becomes the nominal ML fee schedule (price-banded, = Mercado Turbo), so both
-    margin engines and the frontend pick up the real fees without further changes.
+    Flex: freight becomes the price-banded schedule from ML's freight calculator
+    (fallback: flat 2-band quote) and commission_bands the nominal ML fee
+    schedule (price-banded, = Mercado Turbo). Fulfillment: ONLY freight is
+    overridden (banded schedule, when present) — commission and cost for FULL
+    stay from the snapshot, always. Unknown logistic_type or no calibration row
+    return the snapshot values unchanged. The rules live in
+    ``apply_flex_calibration``; this wrapper just loads the inputs.
     """
     from sqlalchemy import select
 
@@ -607,7 +607,7 @@ async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tupl
             select(MLListingORM.logistic_type).where(MLListingORM.mlb_id == mlb_id)
         )
     ).scalar_one_or_none()
-    if logistic_type is None or logistic_type == "fulfillment":
+    if logistic_type is None:
         return base_comm, base_bands, None
 
     calib = await session.get(MLFlexFeeCalibrationORM, mlb_id)
