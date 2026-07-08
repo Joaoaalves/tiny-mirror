@@ -451,8 +451,9 @@ async def recompute_all_caps(
     snapshots = list(result.scalars().all())
     assert snap_repo is not None
 
-    # Bulk-load the Flex fee calibration + each MLB's logistic_type so the floor
-    # uses the REAL fees for Flex listings (fulfillment stays on the snapshot).
+    # Bulk-load the fee calibration + each MLB's logistic_type so the floor uses
+    # the REAL fees: Flex gets commission+freight schedules; fulfillment gets
+    # ONLY the banded freight (commission/cost stay on the snapshot).
     from tiny_mirror.infrastructure.orm.models import MLFlexFeeCalibrationORM, MLListingORM
     from tiny_mirror.services.pricing_service import apply_flex_calibration
 

@@ -142,17 +142,27 @@ def apply_flex_calibration(
     """Return effective ``(commission_pct, freight_bands, commission_bands)``.
 
     For **Flex** (non-fulfillment) listings that have a per-MLB calibration row
-    (``ml_flex_fee_calibration``), freight becomes a synthetic 2-band table split
-    at R$79 (the free-shipping cliff: ML covers ~100% under R$79 and ~10% above)
-    and commission becomes the **nominal ML fee schedule** (``commission_bands``,
+    (``ml_flex_fee_calibration``), freight becomes the price-banded schedule from
+    ML's freight calculator (fallback: flat 2-band quote split at R$79) and
+    commission becomes the **nominal ML fee schedule** (``commission_bands``,
     price-banded, from ``/sites/MLB/listing_prices`` — this is what Mercado Turbo
-    charges). Fulfillment listings, an unknown ``logistic_type``, or a missing/
-    empty calibration return the snapshot values UNCHANGED with no commission
-    bands — fulfillment fees are already correct and must never be overridden.
-    This is the single source of truth for the override; both the caps enrichment
-    and the floor recompute use it.
+    charges).
+
+    **Fulfillment**: ONLY freight is overridden, and only when the calibration row
+    carries a banded ``freight_bands`` schedule (operator decision 2026-07-08 —
+    the sheet's freight table drifted from ML's calculator). Commission and cost
+    for FULL stay from the snapshot, untouched, always.
+
+    An unknown ``logistic_type`` or a missing calibration returns the snapshot
+    values UNCHANGED with no commission bands. This is the single source of truth
+    for the override; both the caps enrichment and the floor recompute use it.
     """
-    if logistic_type is None or logistic_type == "fulfillment" or calib is None:
+    if logistic_type is None or calib is None:
+        return commission_pct, freight_bands, None
+    if logistic_type == "fulfillment":
+        full_fr = getattr(calib, "freight_bands", None) or None
+        if full_fr:
+            return commission_pct, [{**b, "payback": 0.0} for b in full_fr], None
         return commission_pct, freight_bands, None
     # Flex with a calibration row: ALWAYS replace the (wrong) generic freight
     # bands with the calibrated 2-band Flex table — fallback rows for listings

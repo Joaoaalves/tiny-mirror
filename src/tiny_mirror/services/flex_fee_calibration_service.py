@@ -346,11 +346,15 @@ class FlexFeeCalibrationService:
             )
             d["rates"].append(r["sale_fee"] / r["price"] * 100)
 
-        # --- FRETE: padronizado no shipping_options do ML (igual ao Mercado Turbo) pra
-        # TODOS os anúncios Flex ativos — não mais o frete-por-envio. A cota do ML é o que
-        # o Turbo usa (pode superestimar vs o cobrado real, mas o operador quer bater com a
-        # ferramenta). A comissão segue do real das vendas (real_comm_pct).
+        # --- FRETE flat (fallback Flex): cota do shipping_options no preço atual —
+        # usada só quando o item não tem dimensões pra tabela por faixa.
         active_flex = [mlb for mlb in logi if status.get(mlb) == "active" and is_flex(mlb)]
+        # Fulfillment entra SÓ pro frete por faixa (calculadora) — comissão/custo do
+        # FULL seguem intocados (planilha), por decisão do operador (2026-07-08:
+        # frete de TODOS pela calculadora; a cerca segue valendo pro resto).
+        active_full = [
+            mlb for mlb in logi if status.get(mlb) == "active" and logi.get(mlb) == "fulfillment"
+        ]
         _fsem = asyncio.Semaphore(8)
 
         async def _est(mlb: str) -> tuple[str, float | None]:
@@ -363,14 +367,19 @@ class FlexFeeCalibrationService:
         n_freight_api = len(ok_vals)
 
         # --- metadados por item (1 multiget): categoria+tipo (p/ comissão) e
-        # dimensões do pacote (p/ frete).
-        meta = await self._item_meta(active_flex)
+        # dimensões do pacote (p/ frete). Full incluso (frete por faixa).
+        meta = await self._item_meta(active_flex + active_full)
 
         # --- COMISSÃO NOMINAL: escada de tarifa por (categoria, tipo de anúncio),
         # sondada do listing_prices (= o que o Mercado Turbo cobra). A % NÃO é
         # constante no preço, então guardamos bandas por MLB. Poucas (cat,lt)
         # distintas → sonda uma vez cada e reaproveita em todos os MLBs.
-        cat_lt = {m: (v["cat"], v["lt"]) for m, v in meta.items() if v.get("cat") and v.get("lt")}
+        # SÓ Flex: a comissão do fulfillment é da planilha e não é recalibrada.
+        cat_lt = {
+            m: (v["cat"], v["lt"])
+            for m, v in meta.items()
+            if v.get("cat") and v.get("lt") and m in set(active_flex)
+        }
         distinct_pairs = sorted(set(cat_lt.values()))
         _csem = asyncio.Semaphore(6)
 
@@ -398,11 +407,13 @@ class FlexFeeCalibrationService:
         fsched_by_key = dict(await asyncio.gather(*[_fsched(k) for k in freight_keys]))
         n_fsched_ok = sum(1 for v in fsched_by_key.values() if v)
 
-        # --- assemble: 1 linha por anúncio Flex ATIVO — frete da calculadora por
-        # faixa (fallback: cota flat do shipping_options quando o item não tem
-        # dimensões); comissão da escada nominal (fallback = mediana real das
-        # vendas). payback=0 (a tabela já é o bruto que o vendedor paga; o subsídio
-        # do ML é o da promo, via meli_banca).
+        # --- assemble — 1 linha por anúncio ATIVO:
+        #   Flex: frete da calculadora por faixa (fallback: cota flat) + comissão
+        #     da escada nominal (fallback = mediana real das vendas).
+        #   Fulfillment: SÓ freight_bands (comissão/custo do FULL ficam da planilha,
+        #     intocados); sem tabela de frete → sem linha (snapshot segue valendo).
+        # payback=0 (a tabela já é o bruto que o vendedor paga; o subsídio do ML é
+        # o da promo, via meli_banca).
         values: list[dict[str, Any]] = []
         for mlb in active_flex:
             fr = freight_by.get(mlb)
@@ -423,6 +434,29 @@ class FlexFeeCalibrationService:
                     "freight_per_unit_ge79": fr,
                     "payback_per_unit_lt79": 0.0,
                     "payback_per_unit_ge79": 0.0,
+                    "n_freight_lt79": 0,
+                    "n_freight_ge79": 0,
+                }
+            )
+        n_full_banded = 0
+        for mlb in active_full:
+            mm = meta.get(mlb) or {}
+            fr_bands = fsched_by_key.get((mm["dims"], mm.get("lt"))) if mm.get("dims") else None
+            if not fr_bands:
+                continue  # sem dims → fulfillment fica 100% na planilha
+            n_full_banded += 1
+            values.append(
+                {
+                    "mlb_id": mlb,
+                    "sku": sku_by_mlb.get(mlb),
+                    "n_sales": 0,
+                    "real_comm_pct": None,  # comissão do FULL nunca é sobrescrita
+                    "commission_bands": None,
+                    "freight_bands": fr_bands,
+                    "freight_per_unit_lt79": None,
+                    "freight_per_unit_ge79": None,
+                    "payback_per_unit_lt79": None,
+                    "payback_per_unit_ge79": None,
                     "n_freight_lt79": 0,
                     "n_freight_ge79": 0,
                 }
@@ -448,6 +482,8 @@ class FlexFeeCalibrationService:
             "freight_dims_probed": len(freight_keys),
             "freight_schedules_ok": n_fsched_ok,
             "mlbs_with_freight_bands": sum(1 for v in values if v["freight_bands"]),
+            "active_full_listings": len(active_full),
+            "full_freight_banded": n_full_banded,
             "rows_written": len(values),
         }
         logger.info("flex_fee_calibration done", **stats)
