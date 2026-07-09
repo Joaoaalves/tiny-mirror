@@ -38,6 +38,26 @@ from tiny_mirror.infrastructure.orm.models import (
 
 logger = structlog.get_logger(__name__)
 
+_FULL_DISCOUNT_MIN = 200.0  # desconto Full (1pp) só vale a partir deste preço
+
+
+def _apply_full_discount(bands: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aplica o desconto Full de 1pp à parte >= R$200 de cada banda de comissão,
+    partindo a banda que cruza o corte. Nunca deixa a % negativa."""
+    out: list[dict[str, Any]] = []
+    for b in bands:
+        lo, hi, pct = float(b["min"]), b["max"], float(b["pct"])
+        disc = max(round(pct - 1.0, 2), 0.0)
+        if hi is not None and float(hi) < _FULL_DISCOUNT_MIN:
+            out.append({**b, "pct": pct})
+        elif lo >= _FULL_DISCOUNT_MIN:
+            out.append({**b, "pct": disc})
+        else:
+            out.append({"min": lo, "max": round(_FULL_DISCOUNT_MIN - 0.01, 2), "pct": pct})
+            out.append({"min": _FULL_DISCOUNT_MIN, "max": hi, "pct": disc})
+    return out
+
+
 _API = "https://api.mercadolibre.com"
 _REP_ZIP = "01310100"  # Av. Paulista, SP — CEP representativo p/ estimar frete dos sem-venda
 _PAGE = 50
@@ -441,14 +461,14 @@ class FlexFeeCalibrationService:
             fr_bands = fsched_by_key.get((mm["dims"], mm.get("lt"))) if mm.get("dims") else None
             comm_bands = sched_by_pair.get(cat_lt[mlb]) if mlb in cat_lt else None
             # Desconto Full: o ML cobra 1pp a MENOS de comissão em anúncios
-            # fulfillment. O listing_prices NÃO expõe isso (sondado: nenhum
-            # parâmetro muda a resposta); validado no ground truth — mediana
-            # real%-nominal% = -0,99 em 3.444 itens FULL liquidados (90d) — e é
-            # exatamente o que o Mercado Turbo aplica (26/26 divergências = 1,00pp).
+            # fulfillment, mas SÓ a partir de R$200. Mapeado no dataset do MT
+            # (251 pontos FULL): <200 = nominal cravado (213/213 fora 3 pontos de
+            # fronteira de banda); >=200 = nominal-1pp (27/27), inclusive o MESMO
+            # MLB dos dois lados do corte (ex.: 195,36 nominal / 201,00 com
+            # desconto). O listing_prices NÃO expõe isso (nenhum parâmetro muda
+            # a resposta), então partimos as bandas em 200 aqui.
             if comm_bands:
-                comm_bands = [
-                    {**b, "pct": max(round(float(b["pct"]) - 1.0, 2), 0.0)} for b in comm_bands
-                ]
+                comm_bands = _apply_full_discount(comm_bands)
             if not fr_bands and not comm_bands:
                 continue  # sem banda nenhuma → fulfillment fica 100% na planilha
             n_full_banded += 1
