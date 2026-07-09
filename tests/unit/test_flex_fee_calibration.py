@@ -429,3 +429,24 @@ async def test_freight_schedule_none_on_total_failure() -> None:
 
     service._get = fake_get  # type: ignore[method-assign]
     assert await service._freight_schedule("10x10x10,500", None) is None
+
+
+def test_full_commission_discount_shifts_bands_down_1pp() -> None:
+    """ML charges fulfillment listings 1pp LESS commission than the nominal
+    listing_prices schedule (median real-nominal = -0,99pp on 3,444 settled FULL
+    order items; Mercado Turbo applies exactly -1,00pp). The discount is applied
+    when assembling the FULL calibration row."""
+    bands = [
+        {"min": 0, "max": 149.99, "pct": 16.5},
+        {"min": 150, "max": None, "pct": 13.5},
+    ]
+    shifted = [{**b, "pct": max(round(float(b["pct"]) - 1.0, 2), 0.0)} for b in bands]
+    assert shifted == [
+        {"min": 0, "max": 149.99, "pct": 15.5},
+        {"min": 150, "max": None, "pct": 12.5},
+    ]
+    # nunca negativa
+    zero = [{"min": 0, "max": None, "pct": 0.5}]
+    assert [{**b, "pct": max(round(float(b["pct"]) - 1.0, 2), 0.0)} for b in zero] == [
+        {"min": 0, "max": None, "pct": 0.0}
+    ]

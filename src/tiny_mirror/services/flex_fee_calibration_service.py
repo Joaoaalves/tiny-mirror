@@ -440,6 +440,15 @@ class FlexFeeCalibrationService:
             mm = meta.get(mlb) or {}
             fr_bands = fsched_by_key.get((mm["dims"], mm.get("lt"))) if mm.get("dims") else None
             comm_bands = sched_by_pair.get(cat_lt[mlb]) if mlb in cat_lt else None
+            # Desconto Full: o ML cobra 1pp a MENOS de comissão em anúncios
+            # fulfillment. O listing_prices NÃO expõe isso (sondado: nenhum
+            # parâmetro muda a resposta); validado no ground truth — mediana
+            # real%-nominal% = -0,99 em 3.444 itens FULL liquidados (90d) — e é
+            # exatamente o que o Mercado Turbo aplica (26/26 divergências = 1,00pp).
+            if comm_bands:
+                comm_bands = [
+                    {**b, "pct": max(round(float(b["pct"]) - 1.0, 2), 0.0)} for b in comm_bands
+                ]
             if not fr_bands and not comm_bands:
                 continue  # sem banda nenhuma → fulfillment fica 100% na planilha
             n_full_banded += 1
