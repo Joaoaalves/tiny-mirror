@@ -431,22 +431,22 @@ async def test_freight_schedule_none_on_total_failure() -> None:
     assert await service._freight_schedule("10x10x10,500", None) is None
 
 
-def test_full_commission_discount_shifts_bands_down_1pp() -> None:
-    """ML charges fulfillment listings 1pp LESS commission than the nominal
-    listing_prices schedule (median real-nominal = -0,99pp on 3,444 settled FULL
-    order items; Mercado Turbo applies exactly -1,00pp). The discount is applied
-    when assembling the FULL calibration row."""
+def test_full_commission_discount_applies_only_from_200() -> None:
+    """ML's 1pp Full commission discount starts at R$200 (verified in the MT
+    dataset: same MLB at 195,36 pays nominal, at 201,00 pays nominal-1pp).
+    Bands crossing the cutoff are split; below 200 stays nominal."""
+    from tiny_mirror.services.flex_fee_calibration_service import _apply_full_discount
+
     bands = [
         {"min": 0, "max": 149.99, "pct": 16.5},
         {"min": 150, "max": None, "pct": 13.5},
     ]
-    shifted = [{**b, "pct": max(round(float(b["pct"]) - 1.0, 2), 0.0)} for b in bands]
-    assert shifted == [
-        {"min": 0, "max": 149.99, "pct": 15.5},
-        {"min": 150, "max": None, "pct": 12.5},
+    assert _apply_full_discount(bands) == [
+        {"min": 0, "max": 149.99, "pct": 16.5},  # < 200: nominal
+        {"min": 150.0, "max": 199.99, "pct": 13.5},  # banda partida no corte
+        {"min": 200.0, "max": None, "pct": 12.5},  # >= 200: -1pp
     ]
-    # nunca negativa
-    zero = [{"min": 0, "max": None, "pct": 0.5}]
-    assert [{**b, "pct": max(round(float(b["pct"]) - 1.0, 2), 0.0)} for b in zero] == [
-        {"min": 0, "max": None, "pct": 0.0}
+    # banda inteira acima do corte → -1pp direto; nunca negativa
+    assert _apply_full_discount([{"min": 250, "max": None, "pct": 0.5}]) == [
+        {"min": 250.0, "max": None, "pct": 0.0}
     ]
