@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -588,6 +589,50 @@ async def _build_decision_context(
 # ---------------------------------------------------------------------------
 # CAPS
 # ---------------------------------------------------------------------------
+_VIG_MONTHS = {
+    "jan": 1,
+    "fev": 2,
+    "mar": 3,
+    "abr": 4,
+    "mai": 5,
+    "jun": 6,
+    "jul": 7,
+    "ago": 8,
+    "set": 9,
+    "out": 10,
+    "nov": 11,
+    "dez": 12,
+}
+_VIG_RE = re.compile(r"(\d{1,2})(?:/(\w{3}))?\s*a\s*(\d{1,2})/(\w{3})")
+
+
+def _parse_vigencia(texto: str | None) -> tuple[datetime | None, datetime | None]:
+    """Vigência do PAINEL ("7 a 12/jul", "1/jul a 1/ago") → datas reais.
+
+    O painel não traz o ano: assume o ano corrente; se o fim ficar antes do
+    início (virada dez→jan), o fim rola pro ano seguinte. Fim = 23:59:59 pra
+    não marcar "encerrada" no próprio último dia."""
+    if not texto:
+        return None, None
+    m = _VIG_RE.search(texto.strip().lower())
+    if not m:
+        return None, None
+    d1, m1, d2, m2 = m.groups()
+    mon2 = _VIG_MONTHS.get(m2 or "")
+    mon1 = _VIG_MONTHS.get(m1 or "") if m1 else mon2
+    if mon1 is None or mon2 is None:
+        return None, None
+    year = datetime.now(UTC).year
+    try:
+        start = datetime(year, mon1, int(d1), tzinfo=UTC)
+        end = datetime(year, mon2, int(d2), 23, 59, 59, tzinfo=UTC)
+    except ValueError:
+        return None, None
+    if end < start:
+        end = end.replace(year=year + 1)
+    return start, end
+
+
 async def _effective_fees(session: AsyncSession, mlb_id: str, snap: Any) -> tuple[Any, Any, Any]:
     """Return ``(commission_pct, freight_bands, commission_bands)`` for margin
     math, applying the per-MLB fee calibration when one exists.
@@ -2188,8 +2233,8 @@ async def list_available_promotions(
                 stock_max=None,
                 reason="Campanha visível só no painel do ML (a API não a retorna) — participe pelo painel",
                 status="pending",
-                promo_start_date=None,
-                promo_finish_date=None,
+                promo_start_date=(vig := _parse_vigencia(pr["vigencia"]))[0],
+                promo_finish_date=vig[1],
                 created_at=pr["scraped_at"],
                 decided_at=None,
                 decided_by=None,
