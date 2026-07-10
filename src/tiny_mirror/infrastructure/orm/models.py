@@ -1895,6 +1895,11 @@ class MLPanelPromoORM(Base):
     is_suggested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_coupon: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     action_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # id + tipo (API) da campanha, do botão de ação do painel — permitem
+    # inscrever via /promotions/enroll mesmo sem a campanha na seller-promotions
+    # API (panel-only). None = campanha sem ação de participar (já inscrita/etc).
+    promo_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    api_promo_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
     scraped_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

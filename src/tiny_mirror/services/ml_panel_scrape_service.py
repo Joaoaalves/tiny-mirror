@@ -51,6 +51,18 @@ _PCT_RE = re.compile(r"\((\d+(?:[.,]\d+)?)%\)")
 _REDUZIMOS_RE = re.compile(r"Reduzimos\s*R\$\s*([\d.]+(?:,\d{1,2})?)")
 _VIGENCIA_RE = re.compile(r"\d+(?:/\w+)?\s*a\s*\d+/\w+")
 _STATUS_CHIPS = {"ATIVA", "PROGRAMADA", "PAUSADA", "FINALIZADA"}
+_PROMOID_RE = re.compile(r"promoId=([\w-]+)")
+_PROMOTYPE_RE = re.compile(r"promotionType=([a-z_]+)")
+# Tipo do painel (urlCallback) → promotion_type da seller-promotions API. Só os
+# que ``apply_decision_to_ml`` sabe inscrever entram como enrolláveis; SMART é
+# ML-managed (fluxo activate-smart) e cupom é escondido.
+_PANEL_TYPE_MAP = {
+    "tier": "DEAL",
+    "seller_campaigns": "SELLER_CAMPAIGN",
+    "price_discount": "PRICE_DISCOUNT",
+    "smart_campaign": "SMART",
+    "seller_coupon_campaigns_massive": "SELLER_COUPON_CAMPAIGN",
+}
 
 
 class PanelSessionExpired(Exception):
@@ -87,6 +99,11 @@ class PanelPromo:
     is_suggested: bool = False
     is_coupon: bool = False
     action_label: str | None = None
+    # id + tipo (mapeado p/ a API) da campanha, extraídos do botão de ação do
+    # painel — permitem INSCREVER via /promotions/enroll mesmo quando a
+    # seller-promotions API não lista a campanha pro anúncio (panel-only).
+    promo_id: str | None = None
+    api_promo_type: str | None = None
 
 
 # ---------------------------------------------------------------------- parse
@@ -221,6 +238,23 @@ def _parse_row(row: dict[str, Any], mlb_id: str) -> PanelPromo | None:
             if k == "text" and v.strip():
                 p.action_label = v.strip()
                 break
+        # id + tipo da campanha: preferimos o urlCallback do botão, que traz os
+        # DOIS juntos ("...promotionType=tier&...&promoId=P-MLB...") — evita casar
+        # o tipo de um callback com o id de outro. Fallback: primeiros soltos.
+        for _, v in _walk(cols[5]):
+            if isinstance(v, str) and "promotionType=" in v and "promoId=" in v:
+                mt = _PROMOTYPE_RE.search(v)
+                mid = _PROMOID_RE.search(v)
+                if mt:
+                    p.api_promo_type = _PANEL_TYPE_MAP.get(mt.group(1))
+                if mid:
+                    p.promo_id = mid.group(1)
+                break
+        if p.promo_id is None:
+            for _, v in _walk(cols[5]):
+                if isinstance(v, str) and re.fullmatch(r"[A-Z]+-MLB\d+", v):
+                    p.promo_id = v
+                    break
 
     return p if p.promo_name else None
 
