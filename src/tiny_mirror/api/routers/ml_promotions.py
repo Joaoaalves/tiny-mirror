@@ -209,6 +209,10 @@ class CapOut(BaseModel):
     # True when the underlying MLB is still active in ml_listings. False
     # means the cap row is orphan and the UI should hide it by default.
     has_active_listing: bool | None = None
+    # products.manual_status (cores da planilha GERAL): 'queima' | 'analise' |
+    # 'normal' | None (produto fora da planilha). A UI mostra a tag colorida
+    # ao lado do SKU e filtra por queima.
+    manual_status: str | None = None
 
 
 class CostSnapshotOut(BaseModel):
@@ -696,6 +700,14 @@ async def _enrich_cap(
     out.commission_pct = eff_commission_pct
     out.freight_bands = eff_freight_bands
     out.commission_bands = eff_commission_bands
+
+    # Status manual do produto (cores da planilha GERAL → products.manual_status).
+    out.manual_status = (
+        await session.execute(
+            text("SELECT manual_status FROM products WHERE sku = :sku LIMIT 1"),
+            {"sku": cap.sku},
+        )
+    ).scalar_one_or_none()
 
     # Fallback de custo: quando a PLANILHA não tem (snapshot vazio/ausente), usa o
     # custo do Tiny (products.prices.cost_price) — senão a margem fica "—". Na prática
