@@ -1837,6 +1837,9 @@ async def list_decisions(
 # Co-participação CONDICIONAL: o ML define o preço dinamicamente (o `price` é só
 # o piso). NÃO mostrar como desconto fixo.
 _DYNAMIC_PROMO_TYPES = frozenset({"SMART", "PRICE_MATCHING", "MARKETPLACE_CAMPAIGN"})
+_PANEL_ENROLLABLE_TYPES = frozenset(
+    {"DEAL", "SELLER_CAMPAIGN", "PRICE_DISCOUNT", "DOD", "LIGHTNING"}
+)
 
 
 @router.get("/board")
@@ -2050,7 +2053,8 @@ async def list_available_promotions(
             await session.execute(
                 text(
                     "SELECT p.mlb_id, p.promo_name, p.final_price, p.discount_pct, "
-                    "  p.meli_reduction, p.scraped_at, p.status_chip, p.vigencia "
+                    "  p.meli_reduction, p.scraped_at, p.status_chip, p.vigencia, "
+                    "  p.promo_id, p.api_promo_type, p.action_label "
                     "FROM ml_panel_promos p "
                     "JOIN ml_listings l ON l.mlb_id = p.mlb_id AND l.status = 'active' "
                     "WHERE NOT p.is_coupon AND p.final_price IS NOT NULL "
@@ -2205,16 +2209,29 @@ async def list_available_promotions(
             if pr["meli_reduction"] is not None and orig and orig > 0
             else None
         )
+        # Inscrevível quando o painel expõe a ação de PARTICIPAR com id + tipo
+        # que a API sabe inscrever (Ferias/Inverno = DEAL). Aí a linha vira uma
+        # oferta normal (botão Entrar → /promotions/enroll), não só um link.
+        act = (pr["action_label"] or "").strip().lower()
+        enrollable = (
+            act.startswith("particip")
+            and pr["promo_id"] is not None
+            and pr["api_promo_type"] in _PANEL_ENROLLABLE_TYPES
+        )
         out.append(
             DecisionOut(
                 id=synth_id,
                 mlb_id=pr["mlb_id"],
                 sku=sku_by_mlb.get(pr["mlb_id"]) or pr["mlb_id"],
-                promo_key=f"PANEL-{pr['mlb_id']}-{abs(hash(key[1])) % 10**8}",
-                promo_id=None,
-                promo_type="PANEL_ONLY",
+                promo_key=(
+                    pr["promo_id"]
+                    if enrollable
+                    else f"PANEL-{pr['mlb_id']}-{abs(hash(key[1])) % 10**8}"
+                ),
+                promo_id=pr["promo_id"] if enrollable else None,
+                promo_type=pr["api_promo_type"] if enrollable else "PANEL_ONLY",
                 promo_name=pr["promo_name"],
-                decision_kind="panel_only",
+                decision_kind="mirror_offer" if enrollable else "panel_only",
                 target_price=target,
                 target_total_pct=total_pct,
                 target_seller_pct=(
@@ -2223,7 +2240,6 @@ async def list_available_promotions(
                     else total_pct
                 ),
                 meli_percentage=meli,
-                constraint_used="panel",
                 list_price=orig,
                 cap_pct=None,
                 floor_price=None,
@@ -2231,7 +2247,12 @@ async def list_available_promotions(
                 max_price=None,
                 stock_min=None,
                 stock_max=None,
-                reason="Campanha visível só no painel do ML (a API não a retorna) — participe pelo painel",
+                reason=(
+                    "Disponível no painel do ML (a API não a lista) — Entrar inscreve pela API"
+                    if enrollable
+                    else "Campanha visível só no painel do ML (a API não a retorna) — participe pelo painel"
+                ),
+                constraint_used="mirror" if enrollable else "panel",
                 status="pending",
                 promo_start_date=(vig := _parse_vigencia(pr["vigencia"]))[0],
                 promo_finish_date=vig[1],

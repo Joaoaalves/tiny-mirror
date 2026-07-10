@@ -226,3 +226,24 @@ def test_parse_vigencia() -> None:
     assert e.year == s.year + 1
     assert _parse_vigencia(None) == (None, None)
     assert _parse_vigencia("sem data") == (None, None)
+
+
+def test_parse_row_extracts_promo_id_and_type_from_action() -> None:
+    # coluna de ação com o urlCallback do painel (tipo + id juntos)
+    row = _row("Julho de Ferias", chip=None, action="Participar")
+    row["columns"][5] = {
+        "lines": [
+            {
+                "button": {
+                    "text": "Participar",
+                    "urlCallback": "promotionType=tier&action=MODAL&scope=mlb&view_id=promos&promoId=P-MLB17791012",
+                },
+                "tracks": [{"data": {"event_data": {"promo_id": "P-MLB17791012"}}}],
+            }
+        ]
+    }
+    html = _page("MLB3709682777", [row], [])
+    (p,) = parse_page(html, SELLER)
+    assert p.promo_id == "P-MLB17791012"
+    assert p.api_promo_type == "DEAL"  # tier -> DEAL
+    assert p.action_label == "Participar"
