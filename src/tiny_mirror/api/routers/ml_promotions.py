@@ -2004,11 +2004,12 @@ async def list_available_promotions(
         (
             await session.execute(
                 text(
-                    "SELECT mlb_id, promo_name, final_price, discount_pct, "
-                    "  meli_reduction, scraped_at "
-                    "FROM ml_panel_promos "
-                    "WHERE NOT is_coupon AND final_price IS NOT NULL "
-                    "  AND scraped_at > now() - interval '24 hours'"
+                    "SELECT p.mlb_id, p.promo_name, p.final_price, p.discount_pct, "
+                    "  p.meli_reduction, p.scraped_at, p.status_chip, p.vigencia "
+                    "FROM ml_panel_promos p "
+                    "JOIN ml_listings l ON l.mlb_id = p.mlb_id AND l.status = 'active' "
+                    "WHERE NOT p.is_coupon AND p.final_price IS NOT NULL "
+                    "  AND p.scraped_at > now() - interval '24 hours'"
                 )
             )
         )
@@ -2018,6 +2019,13 @@ async def list_available_promotions(
 
     def _norm_name(n: str | None) -> str:
         return (n or "").strip().lower()
+
+    sku_by_mlb = {
+        r[0]: r[1]
+        for r in (
+            await session.execute(text("SELECT mlb_id, sku FROM ml_listings WHERE sku IS NOT NULL"))
+        ).all()
+    }
 
     panel_by_key: dict[tuple[str, str], Any] = {}
     panel_lightning: dict[str, Any] = {}
@@ -2104,6 +2112,79 @@ async def list_available_promotions(
                 panel_scraped_at=panel_scraped_at,
             )
         )
+
+    # --- Campanhas PANEL-ONLY ------------------------------------------------
+    # Campanhas que o painel oferece mas a seller-promotions API NÃO retorna
+    # (ex.: "Julho de Ferias"/"Inverno" 2026-07-10). Sem promotion_id não há
+    # inscrição via API — a linha é informativa e a ação no front vira link pro
+    # painel. Só candidatas (sem chip ATIVA/PROGRAMADA = não inscritas) e frescas.
+    matched_keys = {(r["mlb_id"], _norm_name(r["name"])) for r in rows} | {
+        (r["mlb_id"], "__lightning__") for r in rows if r["promotion_type"] == "LIGHTNING"
+    }
+    listing_orig = {r["mlb_id"]: r["original_price"] for r in rows}
+    synth_id = -1
+    for pr in panel_rows:
+        key = (pr["mlb_id"], _norm_name(pr["promo_name"]))
+        is_lightning_panel = "relâmpago" in key[1] or "relampago" in key[1]
+        if key in matched_keys:
+            continue
+        if is_lightning_panel and (pr["mlb_id"], "__lightning__") in matched_keys:
+            continue
+        # chips ATIVA/PROGRAMADA = já inscrita (aparece em Inscritas via API)
+        if pr["status_chip"]:
+            continue
+        orig = listing_orig.get(pr["mlb_id"])
+        target = Decimal(pr["final_price"])
+        total_pct = (
+            ((orig - target) / orig * Decimal(100)).quantize(Decimal("0.01"))
+            if orig and orig > 0
+            else None
+        )
+        meli = (
+            (Decimal(pr["meli_reduction"]) / orig * Decimal(100)).quantize(Decimal("0.01"))
+            if pr["meli_reduction"] is not None and orig and orig > 0
+            else None
+        )
+        out.append(
+            DecisionOut(
+                id=synth_id,
+                mlb_id=pr["mlb_id"],
+                sku=sku_by_mlb.get(pr["mlb_id"]) or pr["mlb_id"],
+                promo_key=f"PANEL-{pr['mlb_id']}-{abs(hash(key[1])) % 10**8}",
+                promo_id=None,
+                promo_type="PANEL_ONLY",
+                promo_name=pr["promo_name"],
+                decision_kind="panel_only",
+                target_price=target,
+                target_total_pct=total_pct,
+                target_seller_pct=(
+                    (total_pct - meli).quantize(Decimal("0.01"))
+                    if total_pct is not None and meli is not None
+                    else total_pct
+                ),
+                meli_percentage=meli,
+                constraint_used="panel",
+                list_price=orig,
+                cap_pct=None,
+                floor_price=None,
+                min_price=None,
+                max_price=None,
+                stock_min=None,
+                stock_max=None,
+                reason="Campanha visível só no painel do ML (a API não a retorna) — participe pelo painel",
+                status="pending",
+                promo_start_date=None,
+                promo_finish_date=None,
+                created_at=pr["scraped_at"],
+                decided_at=None,
+                decided_by=None,
+                notes=pr["vigencia"],
+                is_dynamic=False,
+                price_source="panel",
+                panel_scraped_at=pr["scraped_at"],
+            )
+        )
+        synth_id -= 1
     return out
 
 
