@@ -36,9 +36,83 @@ logger = structlog.get_logger(__name__)
 # that must not reach the DB — products.mlb_id is varchar(20).
 _VALID_MLB_RE = re.compile(r"^MLB\d{6,16}$")
 
+# ── Fail-loud guards ─────────────────────────────────────────────────────────
+# O payload vem de um Apps Script que lê a aba "Mercado Livre" por POSIÇÃO de
+# coluna. Se alguém inserir/mover uma coluna, ele continua devolvendo um JSON
+# estruturalmente válido — só que com os valores errados. Foi exatamente assim
+# que o manual_status passou a devolver COD. FAB como se fosse SKU (2026-07-08)
+# e ninguém foi avisado.
+#
+# `ml_costs_snapshot` alimenta caps e margens de promoções: gravar lixo aqui é
+# pior que não gravar nada. Então, antes de qualquer upsert, exigimos que a
+# FORMA do payload bata. Se não bater, abortamos alto (CostRefreshError) em vez
+# de degradar em silêncio.
+#
+# Tetos calibrados sobre o payload real de 2026-07-10 (515 itens):
+#   mlb_id inválido 0.4% · sku vazio 0% · baseCost ausente 0% · bands ausente 0%
+# Uma coluna deslocada leva qualquer um desses para perto de 100%.
+_MAX_INVALID_MLB_RATIO = 0.05
+_MAX_MISSING_SKU_RATIO = 0.05
+_MAX_MISSING_COST_RATIO = 0.10
+_MAX_MISSING_BANDS_RATIO = 0.10
+
+# Proporção precisa de amostra: com 2 itens, uma célula malformada já dá 50%.
+# Um layout deslocado sempre vem com a aba inteira (~500 linhas), então só
+# aplicamos os tetos a partir daqui. Abaixo disso, o payload é anômalo por
+# outro motivo (config/parcial) e o skip por linha já protege o banco.
+_MIN_SAMPLE_FOR_RATIOS = 20
+
 
 class CostRefreshError(Exception):
     """Raised when the GAS bulk endpoint cannot be reached or returns no items."""
+
+
+def _assert_payload_sane(items: dict[str, Any]) -> dict[str, float]:
+    """Aborta se a forma do payload indicar que a planilha mudou de layout.
+
+    Retorna as proporções observadas (telemetria). Levanta ``CostRefreshError``
+    assim que qualquer teto for estourado — antes de gravar qualquer linha.
+    """
+    total = len(items)
+    if not total:
+        raise CostRefreshError("GAS costs_all returned 0 items")
+
+    invalid_mlb = [k for k in items if not _VALID_MLB_RE.match(k)]
+    rows = [(k, v) for k, v in items.items() if isinstance(v, dict)]
+    missing_sku = [k for k, v in rows if not str(v.get("sku") or "").strip()]
+    missing_cost = [k for k, v in rows if not v.get("baseCost")]
+    missing_bands = [k for k, v in rows if not v.get("freightBands")]
+
+    ratios = {
+        "invalid_mlb": len(invalid_mlb) / total,
+        "missing_sku": len(missing_sku) / total,
+        "missing_cost": len(missing_cost) / total,
+        "missing_bands": len(missing_bands) / total,
+    }
+    if total < _MIN_SAMPLE_FOR_RATIOS:
+        logger.warning(
+            "cost_refresh_small_payload_ratios_not_enforced",
+            received=total,
+            min_sample=_MIN_SAMPLE_FOR_RATIOS,
+            **{f"ratio_{k}": round(v, 4) for k, v in ratios.items()},
+        )
+        return ratios
+
+    checks = (
+        ("invalid_mlb", _MAX_INVALID_MLB_RATIO, invalid_mlb, "chave não parece um MLB"),
+        ("missing_sku", _MAX_MISSING_SKU_RATIO, missing_sku, "sku vazio"),
+        ("missing_cost", _MAX_MISSING_COST_RATIO, missing_cost, "baseCost ausente/zero"),
+        ("missing_bands", _MAX_MISSING_BANDS_RATIO, missing_bands, "freightBands ausente"),
+    )
+    for name, ceiling, offenders, what in checks:
+        if ratios[name] > ceiling:
+            raise CostRefreshError(
+                f"payload da planilha parece ter mudado de layout: {what} em "
+                f"{len(offenders)}/{total} itens ({ratios[name]:.1%} > teto {ceiling:.0%}). "
+                f"Exemplos: {offenders[:3]}. Verifique a aba 'Mercado Livre' antes de "
+                f"deixar isto gravar em ml_costs_snapshot."
+            )
+    return ratios
 
 
 def _decimal(v: Any) -> Decimal | None:
@@ -83,8 +157,8 @@ async def refresh_all_from_bulk(
         raise CostRefreshError(str(exc)) from exc
 
     items: dict[str, Any] = payload.get("items") or {}
-    if not items:
-        raise CostRefreshError("GAS costs_all returned 0 items")
+    # Falha ALTO se a forma do payload indicar layout mudado — antes de gravar.
+    ratios = _assert_payload_sane(items)
 
     snap_repo = MLCostsSnapshotRepository(session)
     ok = 0
@@ -157,5 +231,6 @@ async def refresh_all_from_bulk(
         difal_pct=payload.get("difalPct"),
         generated_at=payload.get("generatedAt"),
         **stats,
+        **{f"ratio_{k}": round(v, 4) for k, v in ratios.items()},
     )
     return stats
