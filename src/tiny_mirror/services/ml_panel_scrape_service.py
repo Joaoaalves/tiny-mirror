@@ -383,6 +383,39 @@ class MLPanelScrapeService:
             await self._upsert(promos)
         return {"mlb_id": mlb_id, "promos": len(promos)}
 
+    async def _demote_stale_panel_enrolls(self) -> int:
+        """Cura inscrições panel-only que o operador DESFEZ pelo painel do ML.
+
+        A linha started criada pelo enroll panel-only tem ``enrolled_at`` (proteção
+        anti-flap do eligible) e ``raw='{}'`` (nosso marcador de origem). Se o
+        PAINEL — que é a fonte da campanha — voltou a oferecer "Participar" sem
+        chip pra mesma (mlb, campanha), a inscrição morreu do lado do ML e a linha
+        ficou órfã (incidente Inverno 2026-07-10: exit via painel → stale em
+        Inscritas). Janela de 2h protege contra o lag do próprio painel logo após
+        um enroll legítimo. Só toca linhas de origem panel-only; as demais são
+        reconciliadas pelo sweep da API/webhooks."""
+        async with AsyncSessionLocal() as session:
+            res = await session.execute(
+                text(
+                    "DELETE FROM ml_promotions mp "
+                    "WHERE mp.raw = '{}'::jsonb AND mp.enrolled_at IS NOT NULL "
+                    "  AND mp.enrolled_at < now() - interval '2 hours' "
+                    "  AND mp.status IN ('started', 'pending') "
+                    "  AND EXISTS ("
+                    "    SELECT 1 FROM ml_panel_promos pp "
+                    "    WHERE pp.mlb_id = mp.mlb_id "
+                    "      AND lower(trim(pp.promo_name)) = lower(trim(mp.name)) "
+                    "      AND pp.scraped_at > now() - interval '2 hours' "
+                    "      AND pp.status_chip IS NULL "
+                    "      AND lower(COALESCE(pp.action_label, '')) LIKE 'particip%')"
+                )
+            )
+            await session.commit()
+            n = getattr(res, "rowcount", 0) or 0
+            if n:
+                logger.info("ml_panel_demoted_stale_enrolls", rows=n)
+            return n
+
     async def run_sweep(self, max_pages: int = 40) -> dict[str, Any]:
         """Varre as páginas do painel (25 anúncios/página) e grava tudo."""
         pages = 0
@@ -408,6 +441,7 @@ class MLPanelScrapeService:
             "rows": total_rows,
             "mlbs": len(mlbs),
             "stale_deleted": getattr(gone, "rowcount", 0) or 0,
+            "demoted_stale_enrolls": await self._demote_stale_panel_enrolls(),
         }
         logger.info("ml_panel_sweep_ok", **stats)
         return stats
