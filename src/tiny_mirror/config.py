@@ -244,7 +244,10 @@ class Settings(BaseSettings):
     # API oficial serve defasada). Requer o cookie jar da sessão web (Netscape),
     # mantido aquecido pelo probe do host. Vazio = job desabilitado.
     ml_panel_cookie_jar: str = ""
-    ml_panel_scrape_cron: str = "10 * * * *"
+    # 2x/hora (5,35) — o painel do ML flip-flopa valores de candidata ao longo
+    # do dia; janela menor = menos tempo exibindo valor velho. Fora do :40 do
+    # probe do host, que é quem reescreve o cookie jar.
+    ml_panel_scrape_cron: str = "5,35 * * * *"
     ml_panel_scrape_max_pages: int = 40
     sync_flex_calibration_days: int = 90
     sync_flex_calibration_max_shipments: int = 3000
