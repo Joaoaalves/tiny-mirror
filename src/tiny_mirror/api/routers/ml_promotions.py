@@ -3707,8 +3707,13 @@ async def enroll_offer_generic(
                         "INSERT INTO ml_promotions (mlb_id, sku, promo_key, promotion_id, "
                         "  promotion_type, status, price, original_price, name, raw, "
                         "  enrolled_at, first_seen_at, last_seen_at, updated_at) "
-                        "SELECT :m, :sku, :p, :p, :pt, 'started', :price, l.price, "
-                        "  COALESCE(pp.promo_name, :pt), '{}'::jsonb, now(), now(), now(), now() "
+                        # casts explícitos: o MESMO parâmetro em colunas de tipos
+                        # diferentes (varchar vs text) dispara AmbiguousParameterError
+                        # no asyncpg (incidente 2026-07-10: 201 do ML sem linha started)
+                        "SELECT :m, :sku, :p, :p, CAST(:pt AS varchar), 'started', "
+                        "  :price, l.price, "
+                        "  COALESCE(pp.promo_name, CAST(:pt AS text)), '{}'::jsonb, "
+                        "  now(), now(), now(), now() "
                         "FROM ml_listings l "
                         "LEFT JOIN ml_panel_promos pp ON pp.mlb_id = :m AND pp.promo_id = :p "
                         "WHERE l.mlb_id = :m "
