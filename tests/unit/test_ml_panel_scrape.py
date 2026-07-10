@@ -207,3 +207,22 @@ def test_parse_page_skips_rows_without_mlb_link() -> None:
     ctx = {"a": {"promotionList": {"promotionBoxes": [_row("X")], "collapsibleRows": []}}}
     html = '<script id="__NORDIC_RENDERING_CTX__">_n.ctx.r=' + json.dumps(ctx) + "</script>"
     assert parse_page(html, SELLER) == []
+
+
+def test_parse_vigencia() -> None:
+    from datetime import UTC, datetime
+
+    from tiny_mirror.api.routers.ml_promotions import _parse_vigencia
+
+    y = datetime.now(UTC).year
+    s, e = _parse_vigencia("7 a 12/jul")
+    assert (s.month, s.day, e.month, e.day, e.hour) == (7, 7, 7, 12, 23)
+    s, e = _parse_vigencia("1/jul a 1/ago")
+    assert (s.month, s.day, e.month, e.day) == (7, 1, 8, 1)
+    s, e = _parse_vigencia("22/jun a 20/jul")
+    assert (s.month, e.month) == (6, 7) and s.year == e.year == y
+    # virada de ano: dez → jan rola o fim pro ano seguinte
+    s, e = _parse_vigencia("20/dez a 5/jan")
+    assert e.year == s.year + 1
+    assert _parse_vigencia(None) == (None, None)
+    assert _parse_vigencia("sem data") == (None, None)
