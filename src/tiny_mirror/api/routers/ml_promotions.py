@@ -337,6 +337,11 @@ class DecisionOut(BaseModel):
     # define o preço dinamicamente; o ``target_price`` é só o piso, NÃO o preço
     # ativo. O front mostra "preço dinâmico" em vez de fingir um desconto fixo.
     is_dynamic: bool = False
+    # Fonte do preço exibido nas CANDIDATAS: "panel" = verdade raspada do painel
+    # do vendedor (ml_panel_promos — a API oficial serve sugestões defasadas);
+    # "api" = espelho da seller-promotions API. Inscritas são sempre "api" (exata).
+    price_source: str = "api"
+    panel_scraped_at: datetime | None = None
 
 
 class DecisionDecideIn(BaseModel):
@@ -1990,6 +1995,40 @@ async def list_available_promotions(
         .mappings()
         .all()
     )
+    # --- Overlay do PAINEL nas candidatas -----------------------------------
+    # A seller-promotions API serve sugestões DEFASADAS pra candidatas (preço,
+    # % SMART e banca podem divergir do painel do vendedor — verificado caso a
+    # caso 2026-07-10). ml_panel_promos guarda a verdade raspada do painel;
+    # quando existe linha fresca (<24h) pro (mlb, campanha), ela vence.
+    panel_rows = (
+        (
+            await session.execute(
+                text(
+                    "SELECT mlb_id, promo_name, final_price, discount_pct, "
+                    "  meli_reduction, scraped_at "
+                    "FROM ml_panel_promos "
+                    "WHERE NOT is_coupon AND final_price IS NOT NULL "
+                    "  AND scraped_at > now() - interval '24 hours'"
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    def _norm_name(n: str | None) -> str:
+        return (n or "").strip().lower()
+
+    panel_by_key: dict[tuple[str, str], Any] = {}
+    panel_lightning: dict[str, Any] = {}
+    for pr in panel_rows:
+        panel_by_key[(pr["mlb_id"], _norm_name(pr["promo_name"]))] = pr
+        # LIGHTNING não tem nome no espelho; no painel chama "Oferta relâmpago"
+        if "relâmpago" in _norm_name(pr["promo_name"]) or "relampago" in _norm_name(
+            pr["promo_name"]
+        ):
+            panel_lightning[pr["mlb_id"]] = pr
+
     out: list[DecisionOut] = []
     for r in rows:
         ptype = r["promotion_type"]
@@ -2003,6 +2042,20 @@ async def list_available_promotions(
             (v for v in (r["price"], r["suggested_price"], r["min_price"]) if v and v > 0),
             None,
         )
+        # Painel vence quando existe (preço + banca frescos do painel do vendedor)
+        panel = panel_by_key.get((r["mlb_id"], _norm_name(r["name"])))
+        if panel is None and ptype == "LIGHTNING":
+            panel = panel_lightning.get(r["mlb_id"])
+        price_source = "api"
+        panel_scraped_at = None
+        if panel is not None and panel["final_price"]:
+            target = Decimal(panel["final_price"])
+            price_source = "panel"
+            panel_scraped_at = panel["scraped_at"]
+            if panel["meli_reduction"] is not None and orig and orig > 0:
+                meli = (Decimal(panel["meli_reduction"]) / orig * Decimal(100)).quantize(
+                    Decimal("0.01")
+                )
         total_pct: Decimal | None = None
         if target is not None and orig and orig > 0:
             total_pct = ((orig - target) / orig * Decimal(100)).quantize(Decimal("0.01"))
@@ -2047,9 +2100,41 @@ async def list_available_promotions(
                 decided_by=None,
                 notes=None,
                 is_dynamic=is_dynamic,
+                price_source=price_source,
+                panel_scraped_at=panel_scraped_at,
             )
         )
     return out
+
+
+@router.post("/panel-scrape")
+async def panel_scrape_now(
+    request: Request,
+    mlb: str | None = Query(default=None, description="só este anúncio (?search=)"),
+) -> dict[str, Any]:
+    """Roda o scrape do PAINEL de promoções agora (sweep completo ou 1 MLB).
+
+    Mesmo código do job horário. 503 quando o cookie jar não está configurado;
+    409 quando a sessão web caiu (re-login manual + probe do host alerta)."""
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.ml_panel_scrape_service import (
+        MLPanelScrapeService,
+        PanelSessionExpired,
+    )
+
+    if not settings.ml_panel_cookie_jar:
+        raise HTTPException(status_code=503, detail="ml_panel_cookie_jar não configurado")
+    service = MLPanelScrapeService(
+        http_client=request.app.state.http_client,
+        cookie_jar_path=settings.ml_panel_cookie_jar,
+        ml_user_id=settings.ml_user_id,
+    )
+    try:
+        if mlb:
+            return await service.refresh_mlb(mlb.strip().upper())
+        return await service.run_sweep(max_pages=settings.ml_panel_scrape_max_pages)
+    except PanelSessionExpired as exc:
+        raise HTTPException(status_code=409, detail=f"sessão do painel expirou: {exc}") from exc
 
 
 class RecCandidateIn(BaseModel):

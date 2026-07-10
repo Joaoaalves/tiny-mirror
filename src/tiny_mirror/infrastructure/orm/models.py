@@ -1857,6 +1857,50 @@ class MLFlexFeeCalibrationORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_panel_promos — verdade do PAINEL do vendedor por (anúncio, campanha)
+# ---------------------------------------------------------------------------
+class MLPanelPromoORM(Base):
+    __tablename__ = "ml_panel_promos"
+    __table_args__ = (
+        UniqueConstraint("mlb_id", "promo_name", name="uq_ml_panel_promos_mlb_name"),
+        Index("ix_ml_panel_promos_mlb", "mlb_id"),
+        Index("ix_ml_panel_promos_scraped", "scraped_at"),
+        {
+            "comment": (
+                "Valores de promoção raspados do PAINEL do vendedor "
+                "(/anuncios/lista/promos, JSON embutido) — a API oficial serve "
+                "dados defasados/ausentes pra CANDIDATAS (sugestões, % SMART, "
+                "campanhas painel-only). Inclui a banca SMART ('Reduzimos R$ X') "
+                "e o detalhe de custos. Sweep horário + refresh por MLB; overlay "
+                "nas candidatas do board (inscritas ficam na API, já exata)."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    promo_name: Mapped[str] = mapped_column(Text, nullable=False)
+    badge: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status_chip: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    vigencia: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discount_value: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    discount_pct: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    final_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    you_receive: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    sale_fee: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    shipping_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    listing_type_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Banca do ML nas SMART: "Reduzimos R$ X das suas tarifas por cada venda".
+    meli_reduction: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    is_suggested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_coupon: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    action_label: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scraped_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_fl_tracking  (Estoque Full — acompanhamento de anúncios FULFILLMENT)
 # ---------------------------------------------------------------------------
 class MLFlTrackingORM(Base):
