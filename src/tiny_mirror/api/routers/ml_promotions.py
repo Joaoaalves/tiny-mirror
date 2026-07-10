@@ -2020,12 +2020,13 @@ async def list_available_promotions(
     def _norm_name(n: str | None) -> str:
         return (n or "").strip().lower()
 
-    sku_by_mlb = {
-        r[0]: r[1]
-        for r in (
-            await session.execute(text("SELECT mlb_id, sku FROM ml_listings WHERE sku IS NOT NULL"))
-        ).all()
-    }
+    listing_rows = (
+        await session.execute(
+            text("SELECT mlb_id, sku, linked_mlb_ids FROM ml_listings WHERE sku IS NOT NULL")
+        )
+    ).all()
+    sku_by_mlb = {r[0]: r[1] for r in listing_rows}
+    linked_of: dict[str, list[str]] = {r[0]: list(r[2] or []) for r in listing_rows}
 
     panel_by_key: dict[tuple[str, str], Any] = {}
     panel_lightning: dict[str, Any] = {}
@@ -2052,8 +2053,22 @@ async def list_available_promotions(
         )
         # Painel vence quando existe (preço + banca frescos do painel do vendedor)
         panel = panel_by_key.get((r["mlb_id"], _norm_name(r["name"])))
+        if panel is None:
+            # gêmeo vinculado (catálogo↔tradicional): mesma campanha, painel pode
+            # listar só um dos dois — o valor vale pros dois
+            for linked in linked_of.get(r["mlb_id"], []):
+                panel = panel_by_key.get((linked, _norm_name(r["name"])))
+                if panel is not None:
+                    break
         if panel is None and ptype == "LIGHTNING":
-            panel = panel_lightning.get(r["mlb_id"])
+            panel = panel_lightning.get(r["mlb_id"]) or next(
+                (
+                    panel_lightning[linked]
+                    for linked in linked_of.get(r["mlb_id"], [])
+                    if linked in panel_lightning
+                ),
+                None,
+            )
         price_source = "api"
         panel_scraped_at = None
         if panel is not None and panel["final_price"]:
