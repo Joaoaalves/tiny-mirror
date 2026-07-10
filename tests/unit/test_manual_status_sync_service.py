@@ -1,7 +1,9 @@
-"""Unit tests for ManualStatusSyncService (post GASClient refactor).
+"""Unit tests for ManualStatusSyncService.
 
-The GAS HTTP plumbing is now isolated in GASClient — these tests inject
-a fake GASClient and assert the service's parsing / DB-update behaviour.
+The status source is now injected (``SheetsManualStatusFetcher`` in prod) —
+these tests use a fake source and assert the service's validation / DB-update
+behaviour. Parsing of the spreadsheet itself is covered by
+``test_sheets_manual_status.py``.
 """
 
 from __future__ import annotations
@@ -11,63 +13,66 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from tiny_mirror.services.gas_client import GASClientError
 from tiny_mirror.services.manual_status_sync_service import (
     ManualStatusSyncError,
     ManualStatusSyncService,
 )
+from tiny_mirror.services.sheets_manual_status import SheetsManualStatusError
 
 pytestmark = pytest.mark.unit
 
 
-def _fake_gas(payload: Any = None, error: str | None = None) -> Any:
-    """Build a GASClient stand-in whose ``manual_status()`` returns
-    ``payload`` or raises ``GASClientError(error)``.
-    """
-    gas = MagicMock()
+def _fake_source(payload: Any = None, error: str | None = None) -> Any:
+    """Source stand-in whose ``fetch_statuses()`` returns ``payload`` or raises."""
+    src = MagicMock()
     if error is not None:
-        gas.manual_status = AsyncMock(side_effect=GASClientError(error))
+        src.fetch_statuses = AsyncMock(side_effect=SheetsManualStatusError(error))
     else:
-        gas.manual_status = AsyncMock(return_value=payload)
-    return gas
+        src.fetch_statuses = AsyncMock(return_value=payload)
+    return src
 
 
 @pytest.mark.asyncio
-async def test_fetch_parses_payload_and_filters_invalid_statuses() -> None:
-    payload = {
-        "generatedAt": "2026-05-19T20:30:00Z",
-        "sheet": "GERAL",
-        "counts": {"queima": 2, "analise": 1, "normal": 1},
-        "skus": {
-            "SKU-A": {"status": "queima", "row": 3},
-            "SKU-B": {"status": "analise", "row": 4},
-            "SKU-C": {"status": "normal", "row": 5},
-            "SKU-D": {"status": "queima", "row": 6},
-            "SKU-E": {"status": "bogus", "row": 7},
-            "SKU-F": "not-a-dict",
-        },
-    }
-    svc = ManualStatusSyncService(gas=_fake_gas(payload))
-    result = await svc.fetch()
-    assert result == {
+async def test_fetch_filters_invalid_statuses_and_blank_skus() -> None:
+    svc = ManualStatusSyncService(
+        source=_fake_source(
+            {
+                "SKU-A": "queima",
+                "SKU-B": "analise",
+                "SKU-C": "normal",
+                "SKU-D": "bogus",  # status inválido
+                "   ": "queima",  # sku vazio
+                " SKU-E ": "queima",  # espaços são aparados
+            }
+        )
+    )
+    assert await svc.fetch() == {
         "SKU-A": "queima",
         "SKU-B": "analise",
         "SKU-C": "normal",
-        "SKU-D": "queima",
+        "SKU-E": "queima",
     }
 
 
 @pytest.mark.asyncio
-async def test_fetch_propagates_gas_client_error() -> None:
-    svc = ManualStatusSyncService(gas=_fake_gas(error="unauthorized"))
-    with pytest.raises(ManualStatusSyncError, match="unauthorized"):
+async def test_fetch_propagates_source_error() -> None:
+    svc = ManualStatusSyncService(source=_fake_source(error="sheets HTTP 403"))
+    with pytest.raises(ManualStatusSyncError, match="403"):
         await svc.fetch()
 
 
 @pytest.mark.asyncio
-async def test_fetch_raises_on_missing_skus_field() -> None:
-    svc = ManualStatusSyncService(gas=_fake_gas({"counts": {}}))
-    with pytest.raises(ManualStatusSyncError, match="missing 'skus'"):
+async def test_fetch_refuses_empty_payload() -> None:
+    """Guarda-chuva: um payload vazio faria o apply() resetar TUDO pra 'normal'."""
+    svc = ManualStatusSyncService(source=_fake_source({}))
+    with pytest.raises(ManualStatusSyncError, match="no valid SKUs"):
+        await svc.fetch()
+
+
+@pytest.mark.asyncio
+async def test_fetch_refuses_payload_with_only_invalid_statuses() -> None:
+    svc = ManualStatusSyncService(source=_fake_source({"SKU-A": "bogus"}))
+    with pytest.raises(ManualStatusSyncError, match="no valid SKUs"):
         await svc.fetch()
 
 
@@ -100,7 +105,7 @@ async def test_apply_buckets_updates_per_status_and_clears_others() -> None:
 
     session.execute = AsyncMock(side_effect=fake_execute)
 
-    svc = ManualStatusSyncService(gas=_fake_gas({}))
+    svc = ManualStatusSyncService(source=_fake_source({}))
     stats = await svc.apply(session, statuses)
     assert stats == {
         "queima": 2,
@@ -135,7 +140,7 @@ async def test_apply_counts_unmatched_skus() -> None:
 
     session.execute = AsyncMock(side_effect=fake_execute)
 
-    svc = ManualStatusSyncService(gas=_fake_gas({}))
+    svc = ManualStatusSyncService(source=_fake_source({}))
     stats = await svc.apply(session, statuses)
     assert stats["unmatched_in_db"] == 1
     assert stats["queima"] == 0
@@ -147,7 +152,7 @@ async def test_apply_empty_statuses_is_noop() -> None:
     session = MagicMock()
     session.commit = AsyncMock()
     session.execute = AsyncMock()
-    svc = ManualStatusSyncService(gas=_fake_gas({}))
+    svc = ManualStatusSyncService(source=_fake_source({}))
     stats = await svc.apply(session, {})
     assert stats == {
         "queima": 0,

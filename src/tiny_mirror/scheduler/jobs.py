@@ -821,26 +821,26 @@ async def manual_status_sync_job() -> None:
     """Pull operator's manual SKU classification from the GAS Web App and
     upsert into ``products.manual_status``. No-ops if not configured.
     """
-    if not settings.gas_base_url or not settings.gas_token:
-        logger.debug("Manual status sync skipped: GAS URL/token not configured")
+    if not settings.sheets_sa_key_path or not settings.sheets_spreadsheet_id:
+        logger.debug("Manual status sync skipped: Sheets SA key / spreadsheet not configured")
         return
     import httpx
 
-    from tiny_mirror.services.gas_client import GASClient
     from tiny_mirror.services.manual_status_sync_service import (
         ManualStatusSyncError,
         ManualStatusSyncService,
     )
+    from tiny_mirror.services.sheets_manual_status import SheetsManualStatusFetcher
 
     logger.info("Manual status sync job started")
     async with httpx.AsyncClient() as http:
-        gas = GASClient(
-            http=http,
-            base_url=settings.gas_base_url,
-            token=settings.gas_token,
-            timeout_seconds=settings.gas_http_timeout_seconds,
+        fetcher = SheetsManualStatusFetcher(
+            http,
+            key_path=settings.sheets_sa_key_path,
+            spreadsheet_id=settings.sheets_spreadsheet_id,
+            range_a1=settings.sheets_manual_status_range,
         )
-        service = ManualStatusSyncService(gas=gas)
+        service = ManualStatusSyncService(source=fetcher)
         try:
             async with AsyncSessionLocal() as session:
                 stats = await service.run(session)

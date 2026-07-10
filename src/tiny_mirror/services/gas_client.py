@@ -73,7 +73,13 @@ class GASClient:
         return body
 
     async def manual_status(self) -> dict[str, Any]:
-        """Return ``{ generatedAt, counts, skus: { sku: {status, ...} } }``."""
+        """LEGADO — não use. Mantido só porque a action ainda existe no Web App.
+
+        O Apps Script lê a coluna do SKU por posição fixa e passou a devolver
+        COD. FAB como se fosse SKU depois que inseriram uma coluna na GERAL
+        (2026-07-08). O sync agora lê a planilha direto:
+        ``services/sheets_manual_status.py``.
+        """
         return await self._call("manual_status")
 
     async def costs_all(self) -> dict[str, Any]:

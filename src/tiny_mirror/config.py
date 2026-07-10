@@ -253,6 +253,14 @@ class Settings(BaseSettings):
     # HTTP timeout for the GAS call (cold start can be ~5s; bulk dump may be ~20s).
     gas_http_timeout_seconds: float = 60.0
 
+    # Controle 4.0 — leitura direta da planilha (Sheets API + service account),
+    # usada pelo manual_status. Substitui o Apps Script, que vivia dentro da
+    # planilha (sem versionamento) e quebrou calado quando inseriram uma coluna.
+    # Layout GERAL 2026-07-08: B=status, C=COD.FAB, D=SKU.
+    sheets_sa_key_path: str = ""
+    sheets_spreadsheet_id: str = ""
+    sheets_manual_status_range: str = "GERAL!B3:D1200"
+
     # Daily at 04:30 UTC — manual_status sync runs after products (02:00)
     # and stock_full_sync (03:00).
     sync_manual_status_cron: str = "30 4 * * *"
