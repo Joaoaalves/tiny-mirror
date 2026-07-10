@@ -130,6 +130,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "flex_calibration": CronTrigger.from_crontab(
                 settings.sync_flex_calibration_cron, timezone="UTC"
             ),
+            "ml_panel_scrape": CronTrigger.from_crontab(
+                settings.ml_panel_scrape_cron, timezone="UTC"
+            ),
             "ml_promo_resubscribe": CronTrigger.from_crontab(
                 settings.sync_ml_promo_resubscribe_cron, timezone="UTC"
             ),
@@ -216,6 +219,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _flex_calibration() -> None:
         await flex_calibration_job(http_client, app.state.ml_token_service)
+
+    async def _ml_panel_scrape() -> None:
+        await ml_panel_scrape_job(http_client)
 
     async def _ml_promo_resubscribe() -> None:
         await ml_promo_resubscribe_job(http_client, app.state.ml_token_service)
@@ -353,6 +359,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _flex_calibration,
         trigger=triggers["flex_calibration"],
         id="flex_calibration",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_panel_scrape,
+        trigger=triggers["ml_panel_scrape"],
+        id="ml_panel_scrape",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1020,6 +1032,34 @@ async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:
         max_shipments=settings.sync_flex_calibration_max_shipments,
     )
     logger.info("flex calibration job completed", **stats)
+
+
+async def ml_panel_scrape_job(http_client: Any) -> None:
+    """Hourly: scrape da verdade do PAINEL de promoções (candidatas) — a API
+    oficial serve sugestões defasadas/ausentes. No-op sem cookie jar."""
+    from tiny_mirror.config import settings
+
+    if not settings.ml_panel_cookie_jar or http_client is None:
+        logger.debug("ml panel scrape skipped: cookie jar not configured")
+        return
+    from tiny_mirror.services.ml_panel_scrape_service import (
+        MLPanelScrapeService,
+        PanelSessionExpired,
+    )
+
+    service = MLPanelScrapeService(
+        http_client=http_client,
+        cookie_jar_path=settings.ml_panel_cookie_jar,
+        ml_user_id=settings.ml_user_id,
+    )
+    try:
+        stats = await service.run_sweep(max_pages=settings.ml_panel_scrape_max_pages)
+        logger.info("ml panel scrape job completed", **stats)
+    except PanelSessionExpired as exc:
+        # O probe do host (ml_panel_probe.sh) é quem alerta no Telegram; aqui só
+        # logamos alto e mantemos os dados antigos (overlay degrada pro valor da API
+        # conforme o scraped_at envelhece).
+        logger.error("ml_panel_session_expired", error=str(exc))
 
 
 async def ml_promo_resubscribe_job(http_client: Any, ml_token_service: Any) -> None:

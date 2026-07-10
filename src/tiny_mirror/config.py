@@ -240,6 +240,12 @@ class Settings(BaseSettings):
     # orders). Weekly — Sundays 04:20 UTC. Heavy (re-pulls orders + shipment
     # costs), so off-peak and infrequent.
     sync_flex_calibration_cron: str = "20 4 * * 0"
+    # Scrape do PAINEL de promoções do vendedor (verdade das CANDIDATAS que a
+    # API oficial serve defasada). Requer o cookie jar da sessão web (Netscape),
+    # mantido aquecido pelo probe do host. Vazio = job desabilitado.
+    ml_panel_cookie_jar: str = ""
+    ml_panel_scrape_cron: str = "10 * * * *"
+    ml_panel_scrape_max_pages: int = 40
     sync_flex_calibration_days: int = 90
     sync_flex_calibration_max_shipments: int = 3000
 
