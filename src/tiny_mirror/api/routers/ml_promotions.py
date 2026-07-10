@@ -3689,13 +3689,46 @@ async def enroll_offer_generic(
             if body.deal_price is not None:
                 set_price = ", price=:price"
                 params["price"] = body.deal_price
-            await session.execute(
+            marked = await session.execute(
                 text(
                     "UPDATE ml_promotions SET status='started', enrolled_at=now(), "
                     f"updated_at=now(){set_price} WHERE mlb_id=:m AND promotion_id=:p"
                 ),
                 params,
             )
+            if (getattr(marked, "rowcount", 0) or 0) == 0:
+                # Campanha PANEL-ONLY: o espelho nunca teve a linha (a API não
+                # listava a campanha pro anúncio) — o UPDATE acerta 0 linhas e o
+                # 201 do ML ficava órfão: nada em Inscritas e a oferta sintética
+                # ressurgia (incidente Inverno 2026-07-10). Cria a linha started
+                # com nome/preço-cheio vindos do ml_panel_promos.
+                await session.execute(
+                    text(
+                        "INSERT INTO ml_promotions (mlb_id, sku, promo_key, promotion_id, "
+                        "  promotion_type, status, price, original_price, name, raw, "
+                        "  enrolled_at, first_seen_at, last_seen_at, updated_at) "
+                        "SELECT :m, :sku, :p, :p, :pt, 'started', :price, l.price, "
+                        "  COALESCE(pp.promo_name, :pt), '{}'::jsonb, now(), now(), now(), now() "
+                        "FROM ml_listings l "
+                        "LEFT JOIN ml_panel_promos pp ON pp.mlb_id = :m AND pp.promo_id = :p "
+                        "WHERE l.mlb_id = :m "
+                        "ON CONFLICT (mlb_id, promo_key) DO UPDATE SET "
+                        "  status='started', enrolled_at=now(), updated_at=now(), "
+                        "  price=EXCLUDED.price"
+                    ),
+                    {
+                        "m": body.mlb_id,
+                        "sku": sku,
+                        "p": body.promo_id,
+                        "pt": pt,
+                        "price": body.deal_price,
+                    },
+                )
+                logger.info(
+                    "enroll_offer.inserted_started_panel_only",
+                    mlb_id=body.mlb_id,
+                    promo_id=body.promo_id,
+                )
             await session.commit()
             logger.info("enroll_offer.marked_started", mlb_id=body.mlb_id, promo_id=body.promo_id)
         except Exception as exc:  # pragma: no cover — rede
