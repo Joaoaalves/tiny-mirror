@@ -1,10 +1,13 @@
 """Manual SKU status sync.
 
-Pulls the operator's manual SKU classification from the unified Controle
-4.0 GAS Web App (action=manual_status) and writes it onto
-``products.manual_status``. The GAS endpoint reads cell background colors
-on the GERAL tab (columns B/C) and returns ``queima`` / ``analise`` /
-``normal`` per SKU.
+Pulls the operator's manual SKU classification from the Controle 4.0
+spreadsheet (``GERAL`` tab, read via the Sheets API — see
+``sheets_manual_status.py``) and writes it onto ``products.manual_status``.
+
+Historically this came from an Apps Script Web App (``?action=manual_status``)
+that read cell background colours. That script lived inside the spreadsheet,
+unversioned, and broke silently when a column was inserted — so the source
+moved into this repo.
 
 Runs as a daily scheduler job. Downstream queima / reposição / FL crons
 then filter ``WHERE manual_status IS NULL OR manual_status = 'normal'``.
@@ -13,13 +16,13 @@ then filter ``WHERE manual_status IS NULL OR manual_status = 'normal'``.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 import structlog
 from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tiny_mirror.services.gas_client import GASClient, GASClientError
+from tiny_mirror.services.sheets_manual_status import SheetsManualStatusError
 
 logger = structlog.get_logger(__name__)
 
@@ -27,47 +30,45 @@ VALID_STATUSES: Final[frozenset[str]] = frozenset({"queima", "analise", "normal"
 
 
 class ManualStatusSyncError(Exception):
-    """Raised when the GAS endpoint returns an unrecoverable error."""
+    """Raised when the status source is unreachable or returns nothing usable."""
+
+
+class ManualStatusSource(Protocol):
+    """Anything that can produce ``{sku: manual_status}`` (see SheetsManualStatusFetcher)."""
+
+    async def fetch_statuses(self) -> dict[str, str]: ...
 
 
 class ManualStatusSyncService:
     """Fetches manual SKU classifications and upserts onto ``products``.
 
-    Stateless aside from the injected ``GASClient``. Safe to instantiate
-    per call.
+    Stateless aside from the injected source. Safe to instantiate per call.
     """
 
-    def __init__(self, gas: GASClient) -> None:
-        self._gas = gas
+    def __init__(self, source: ManualStatusSource) -> None:
+        self._source = source
 
     async def fetch(self) -> dict[str, str]:
-        """Call the GAS endpoint and return a ``{sku: status}`` mapping.
+        """Read the source and return a validated ``{sku: status}`` mapping.
 
-        Raises ``ManualStatusSyncError`` if the endpoint is unreachable
-        or returns an error payload.
+        Raises ``ManualStatusSyncError`` if the source fails or yields nothing —
+        never returns an empty dict, because ``apply()`` would then reset every
+        SKU to ``'normal'``.
         """
         try:
-            body = await self._gas.manual_status()
-        except GASClientError as exc:
+            raw = await self._source.fetch_statuses()
+        except SheetsManualStatusError as exc:
             raise ManualStatusSyncError(str(exc)) from exc
 
-        skus_obj = body.get("skus")
-        if not isinstance(skus_obj, dict):
-            raise ManualStatusSyncError("GAS payload missing 'skus' object")
-
-        out: dict[str, str] = {}
-        for sku, row in skus_obj.items():
-            if not isinstance(row, dict):
-                continue
-            status = row.get("status")
-            if status in VALID_STATUSES:
-                out[str(sku).strip()] = str(status)
-        logger.info(
-            "manual_status_fetch_ok",
-            total_skus=len(out),
-            counts=body.get("counts"),
-            generated_at=body.get("generatedAt"),
-        )
+        out = {
+            str(sku).strip(): status
+            for sku, status in raw.items()
+            if status in VALID_STATUSES and str(sku).strip()
+        }
+        if not out:
+            raise ManualStatusSyncError("status source returned no valid SKUs")
+        counts = {v: list(out.values()).count(v) for v in VALID_STATUSES}
+        logger.info("manual_status_fetch_ok", total_skus=len(out), counts=counts)
         return out
 
     async def apply(
