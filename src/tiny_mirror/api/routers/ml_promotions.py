@@ -2185,6 +2185,23 @@ async def list_available_promotions(
     matched_keys = {(r["mlb_id"], _norm_name(r["name"])) for r in rows} | {
         (r["mlb_id"], "__lightning__") for r in rows if r["promotion_type"] == "LIGHTNING"
     }
+    # Campanhas que o ESPELHO conhece em QUALQUER estado — inclusive started/
+    # pending, que não entram em `rows` (são Inscritas). Sem isto, inscrever uma
+    # panel-only duplicava: a started ia pra Inscritas e a sintética continuava
+    # em Disponíveis (incidente Inverno/MLB3709682777, 2026-07-10).
+    mirror_known = {
+        (m, _norm_name(n))
+        for m, n in (
+            await session.execute(
+                text("SELECT mlb_id, name FROM ml_promotions WHERE name IS NOT NULL")
+            )
+        ).all()
+    }
+    # Chips do painel (ATIVA/PROGRAMADA) por (mlb, nome) — se QUALQUER gêmeo já
+    # mostra chip, a campanha está inscrita no par (gêmeos dividem campanha).
+    panel_chipped = {
+        (pr["mlb_id"], _norm_name(pr["promo_name"])) for pr in panel_rows if pr["status_chip"]
+    }
     listing_orig = {r["mlb_id"]: r["original_price"] for r in rows}
     synth_id = -1
     for pr in panel_rows:
@@ -2194,8 +2211,13 @@ async def list_available_promotions(
             continue
         if is_lightning_panel and (pr["mlb_id"], "__lightning__") in matched_keys:
             continue
-        # chips ATIVA/PROGRAMADA = já inscrita (aparece em Inscritas via API)
-        if pr["status_chip"]:
+        # espelho conhece a campanha (qualquer estado) neste MLB ou num gêmeo →
+        # ou é candidata (overlay cuida) ou está inscrita (Inscritas cuida)
+        twin_keys = [key] + [(linked, key[1]) for linked in linked_of.get(pr["mlb_id"], [])]
+        if any(k in mirror_known for k in twin_keys):
+            continue
+        # chip ATIVA/PROGRAMADA em qualquer gêmeo = par já inscrito
+        if any(k in panel_chipped for k in twin_keys):
             continue
         orig = listing_orig.get(pr["mlb_id"])
         target = Decimal(pr["final_price"])
