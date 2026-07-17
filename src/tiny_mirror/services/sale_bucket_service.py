@@ -5,6 +5,11 @@ per-component buckets, and persists the per-day x SKU x channel
 aggregations in ``sale_buckets``. The whole period is cleared before
 inserting, so calling ``refresh_buckets`` repeatedly is idempotent.
 
+Cancelled orders (situation=2) are excluded: buckets measure demand that
+stood, not every order ever created. The hourly order reconciliation
+flips situation on the mirrored row when an order is cancelled later,
+and the next bucket refresh of that window drops it.
+
 Decimal arithmetic is used throughout — `unit_value` and `quantity` come
 back from the DB as :class:`Decimal`, and float arithmetic on those
 would silently lose precision on currency values.
@@ -33,6 +38,11 @@ from tiny_mirror.infrastructure.repositories.sale_bucket_repository import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# orders.situation code for "Cancelada" (see OrderMapper.SITUATION_NAME_TO_CODE;
+# verified against the ML side: every sampled situation=2 order is `cancelled`
+# on /orders/{id}). Cancelled orders must not count as demand.
+SITUATION_CANCELLED = 2
 
 # Composite key into the in-memory accumulator. source_kit_sku may be None
 # for direct buckets — a tuple key is fine because tuple hashing handles
@@ -64,8 +74,13 @@ class SaleBucketService:
                 deleted_count=deleted,
             )
 
-            orders = await orders_repo.get_orders_in_period(date_from, date_to)
-            logger.info("Orders to process for buckets", count=len(orders))
+            all_orders = await orders_repo.get_orders_in_period(date_from, date_to)
+            orders = [o for o in all_orders if o.get("situation") != SITUATION_CANCELLED]
+            logger.info(
+                "Orders to process for buckets",
+                count=len(orders),
+                cancelled_excluded=len(all_orders) - len(orders),
+            )
 
             # The kit signal is on the PRODUCT master, not on the order line.
             # Tiny's order API returns tipo='P' for the kit line itself, so

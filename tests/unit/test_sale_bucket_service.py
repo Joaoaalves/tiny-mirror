@@ -24,11 +24,13 @@ def _order(
     order_date: date,
     items: list[dict],
     ecommerce_name: str = "Mercado Livre",
+    situation: int = 6,  # Entregue — see OrderMapper.SITUATION_NAME_TO_CODE
 ) -> dict:
     return {
         "tiny_id": tiny_id,
         "order_date": order_date,
         "ecommerce_name": ecommerce_name,
+        "situation": situation,
         "items": items,
     }
 
@@ -239,6 +241,42 @@ async def test_component_quantity_multiplies_by_kit_qty(patched_service) -> None
     comp = next(b for b in written if b["sku"] == "COMP-A" and b["is_kit_expansion"])
     assert comp["quantity_sold"] == Decimal("6")  # 2 kits * 3 per kit
     assert comp["total_revenue"] == Decimal("0")
+
+
+async def test_cancelled_orders_are_excluded_from_buckets(patched_service) -> None:
+    """situation=2 (Cancelada) must not count as demand — neither the direct
+    bucket nor kit expansions. A non-cancelled sibling in the same window
+    still buckets normally."""
+    service, buckets_repo, orders_repo, products_repo = patched_service
+
+    kit_id = 777
+    orders_repo.get_orders_in_period = AsyncMock(
+        return_value=[
+            _order(
+                tiny_id=10,
+                order_date=date(2026, 5, 2),
+                situation=2,  # Cancelada
+                items=[
+                    _item("SKU-CANC", 111, quantity=5, unit_value=10),
+                    _item("KIT-CANC", kit_id, quantity=1, unit_value=50),
+                ],
+            ),
+            _order(
+                tiny_id=11,
+                order_date=date(2026, 5, 2),
+                items=[_item("SKU-OK", 222, quantity=2, unit_value=15)],
+            ),
+        ]
+    )
+    products_repo.get_types_for_ids = AsyncMock(return_value={222: "S"})
+
+    await service.refresh_buckets(date(2026, 5, 1), date(2026, 5, 3))
+
+    written = buckets_repo.upsert_buckets_batch.call_args.args[0]
+    assert {b["sku"] for b in written} == {"SKU-OK"}
+    assert written[0]["quantity_sold"] == Decimal("2")
+    # the cancelled order's kit never reaches the type lookup either
+    products_repo.get_kit_components_for_ids.assert_awaited_once_with([])
 
 
 async def test_empty_period_writes_no_buckets(patched_service) -> None:
