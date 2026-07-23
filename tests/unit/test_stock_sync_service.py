@@ -903,9 +903,7 @@ async def test_webhook_transfer_idempotent_when_recent_pending_exists(
         product_data={},
     )
 
-    # awaited twice since 2026-07-23: once by the galpão-anomaly suppression
-    # (galpão dropped -20 here) and once by the transfer dedupe check.
-    assert transfer_repo.has_recent_pending.await_count == 2
+    transfer_repo.has_recent_pending.assert_awaited_once()
     transfer_repo.create.assert_not_awaited()
     snapshot_repo.upsert.assert_awaited_once_with(1, tiny_fl_qty=22, stock_galpao_qty=80)
 

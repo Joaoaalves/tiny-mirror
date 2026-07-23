@@ -91,48 +91,6 @@ ML_FULL_DEPOSIT_SENTINEL_ID = 0
 # 'withdrawal' (units leaving Full back to the seller — not sellable).
 ML_FULL_EFFECTIVE_STATUSES = frozenset({"transfer", "internalProcess"})
 
-# ── Galpão anomaly detection (2026-07-23) ────────────────────────────────────
-# Balanços de origem desconhecida vêm aparecendo no depósito Galpão
-# ("Atualização de estoque Saldo: N" sem observação). Nenhum fluxo nosso
-# escreve balanço no Galpão, então todo delta que não se explica por venda
-# (pequeno), remessa ao Full (transfer recente) ou entrada de OC vira uma
-# linha em galpao_anomalies — material de estudo + alerta via dispatcher na
-# VPS. Limiares herdados da análise forense de 16-23/07 (journal).
-GALPAO_ANOMALY_DROP_ABS = 8
-GALPAO_ANOMALY_DROP_PCT_MIN_PREV = 20
-GALPAO_ANOMALY_DROP_PCT = 0.5
-GALPAO_ANOMALY_ZERO_MIN_PREV = 5
-GALPAO_ANOMALY_JUMP_ABS = 15
-# Uma remessa ao Full derruba o galpão legitimamente; se detectamos transfer
-# para o SKU nesta janela, o drop é explicado.
-GALPAO_ANOMALY_TRANSFER_WINDOW_MIN = 20
-
-
-def classify_galpao_anomaly(prev: int, new: int, *, is_kit: bool) -> str | None:
-    """Retorna o motivo da suspeita, ou None se o delta parece rotina.
-
-    Kits não guardam estoque físico próprio no Tiny (saldo derivado dos
-    componentes) — mudanças neles são eco de outro SKU, nunca anomalia
-    própria.
-    """
-    if is_kit:
-        return None
-    delta = new - prev
-    if delta == 0:
-        return None
-    reasons: list[str] = []
-    if delta <= -GALPAO_ANOMALY_DROP_ABS:
-        reasons.append(f"queda {delta}")
-    if prev >= GALPAO_ANOMALY_ZERO_MIN_PREV and new == 0:
-        reasons.append("zerou")
-    if prev >= GALPAO_ANOMALY_DROP_PCT_MIN_PREV and new >= 0 and prev > 0:
-        drop_pct = (prev - new) / prev
-        if drop_pct >= GALPAO_ANOMALY_DROP_PCT:
-            reasons.append(f"-{int(drop_pct * 100)}%")
-    if delta >= GALPAO_ANOMALY_JUMP_ABS:
-        reasons.append(f"salto +{delta}")
-    return "; ".join(reasons) if reasons else None
-
 
 class StockSyncService:
     def __init__(
@@ -448,62 +406,6 @@ class StockSyncService:
             deposits_count=len(deposits),
         )
 
-    async def _maybe_flag_galpao_anomaly(
-        self,
-        session: Any,
-        *,
-        product_tiny_id: int,
-        sku: str,
-        prev_galpao: int,
-        new_galpao: int,
-        is_kit: bool,
-    ) -> None:
-        """Grava em galpao_anomalies todo delta de Galpão suspeito.
-
-        Supressão: remessa ao Full detectada recentemente para o mesmo SKU
-        explica quedas (a NF de remessa baixa o galpão de uma vez).
-        """
-        reason = classify_galpao_anomaly(prev_galpao, new_galpao, is_kit=is_kit)
-        if reason is None:
-            return
-        if new_galpao < prev_galpao:
-            window_start = datetime.now(UTC) - timedelta(minutes=GALPAO_ANOMALY_TRANSFER_WINDOW_MIN)
-            transfers = FulfillmentTransferRepository(session)
-            if await transfers.has_recent_pending(sku, since=window_start):
-                logger.info(
-                    "Galpão drop explained by recent Full transfer, not flagging",
-                    sku=sku,
-                    prev_galpao=prev_galpao,
-                    new_galpao=new_galpao,
-                )
-                return
-        await session.execute(
-            text(
-                """
-                INSERT INTO galpao_anomalies
-                    (product_tiny_id, sku, prev_galpao, new_galpao, delta, reason)
-                VALUES
-                    (:pid, :sku, :prev, :new, :delta, :reason)
-                """
-            ),
-            {
-                "pid": product_tiny_id,
-                "sku": sku,
-                "prev": prev_galpao,
-                "new": new_galpao,
-                "delta": new_galpao - prev_galpao,
-                "reason": reason,
-            },
-        )
-        logger.warning(
-            "Galpão anomaly flagged",
-            sku=sku,
-            product_tiny_id=product_tiny_id,
-            prev_galpao=prev_galpao,
-            new_galpao=new_galpao,
-            reason=reason,
-        )
-
     # ------------------------------------------------------------------
     # Webhook delta path — compares the raw Tiny FL value vs the previous
     # snapshot. On a positive delta we also require the galpão deposit to
@@ -541,25 +443,6 @@ class StockSyncService:
                 )
                 await session.commit()
                 return
-
-            # Galpão anomaly watch — independente do fluxo de transfers.
-            # Best-effort: nunca pode derrubar o caminho principal.
-            try:
-                await self._maybe_flag_galpao_anomaly(
-                    session,
-                    product_tiny_id=product_tiny_id,
-                    sku=sku,
-                    prev_galpao=int(previous.stock_galpao_qty),
-                    new_galpao=int(new_stock_galpao_qty),
-                    is_kit=(product_data or {}).get("type") == "K",
-                )
-            except Exception as exc:
-                logger.warning(
-                    "Galpão anomaly check failed, ignoring",
-                    product_tiny_id=product_tiny_id,
-                    sku=sku,
-                    error=str(exc),
-                )
 
             fl_delta = new_tiny_fl_qty - previous.tiny_fl_qty
             if fl_delta <= 0:
