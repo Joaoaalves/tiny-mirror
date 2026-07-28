@@ -3283,9 +3283,10 @@ async def migrate_campaign(
 
     # Classifica cada faltante UM A UM no eligible do item. SMART ATIVO **não**
     # bloqueia migração (verificado: 150 anúncios estão no Julho COM SMART started).
-    # O que realmente recusa é o candidato-FANTASMA: o ML lista status=candidate mas
-    # sem faixa de preço (min/max/sugg todos None, price=0) → o enroll dá "No
-    # candidates found for item". Esses ficam de fora (voltam quando o ML der faixa).
+    # Candidato-FANTASMA: status=candidate mas sem faixa (min/max/sugg todos None)
+    # nos tipos DEAL/PRICE_DISCOUNT → enroll dá "No candidates found". Ficam fora.
+    # Exceção: SELLER_CAMPAIGN nunca define faixa via API (vendedor escolhe livremente)
+    # → ausência de faixa é normal e não bloqueia enroll.
     target_id = body.target_promotion_id
     sem = asyncio.Semaphore(10)
 
@@ -3298,6 +3299,11 @@ async def migrate_campaign(
         hi = tgt.get("max_discounted_price")
         sg = tgt.get("suggested_discounted_price")
         if lo is None and hi is None and sg is None:
+            # SELLER_CAMPAIGN não define faixa via API — o vendedor escolhe o preço
+            # livremente (dentro da política de desconto mínimo do anúncio). A ausência
+            # de faixa não é "candidato fantasma"; usa o preço da origem diretamente.
+            if target_type == "SELLER_CAMPAIGN":
+                return "ok"
             return "no_range"
         # Mantém o preço da ORIGEM (mesmo processo). Fora da faixa do destino (um DEAL
         # de liquidação tem teto bem mais baixo) → out_of_range em vez de fingir migrar.
