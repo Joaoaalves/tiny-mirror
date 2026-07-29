@@ -135,6 +135,12 @@ class Settings(BaseSettings):
     # fixed at the source. Twice/day is enough to keep base SKUs aligned
     # with ML reality without racing the Tiny invoicing pipeline.
     sync_fl_correction_cron: str = "0 6,18 * * *"
+    # Master kill-switch for EVERY stock write tiny-sync makes to Tiny
+    # (FL correction balanços + fulfillment transfer movements). Flipped to
+    # false on 2026-07-29 while the "Atualização de estoque" mystery balanços
+    # are investigated with Tiny support — so anything that still shows up in
+    # Tiny is provably not us. Reads stay untouched.
+    tiny_stock_writes_enabled: bool = True
     # Daily phantom detection: identifies SKUs where the Tiny catalog has
     # excluded duplicates AND ML orders kept arriving (= the listing's
     # SELLER_SKU points to nothing and Tiny auto-creates a phantom per

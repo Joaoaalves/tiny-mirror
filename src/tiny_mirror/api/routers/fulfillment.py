@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tiny_mirror.api.dependencies import db_session, get_tiny_client
 from tiny_mirror.api.schemas import PaginationResponse
+from tiny_mirror.config import settings
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.repositories.fulfillment_transfer_repository import (
     FulfillmentTransferRepository,
@@ -82,6 +83,13 @@ async def create_transfer(
 
     Returns the created transfer record with status=pending.
     """
+    if not settings.tiny_stock_writes_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Escritas de estoque no Tiny estão pausadas " "(TINY_STOCK_WRITES_ENABLED=false)."
+            ),
+        )
     service = FulfillmentTransferService(tiny_client=tiny_client)
     try:
         result = await service.transfer_to_full(sku=body.sku, quantity=body.quantity)

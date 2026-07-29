@@ -26,6 +26,7 @@ from typing import Any
 import structlog
 from sqlalchemy import text
 
+from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.repositories.fl_stock_correction_log_repository import (
@@ -55,6 +56,18 @@ class FLStockCorrectionService:
         Failures during a single SKU do not abort the pass — they're logged
         and the loop continues.
         """
+        if not settings.tiny_stock_writes_enabled:
+            logger.warning(
+                "FL stock correction SKIPPED — Tiny stock writes paused "
+                "(TINY_STOCK_WRITES_ENABLED=false)",
+                sync_log_id=sync_log_id,
+            )
+            async with AsyncSessionLocal() as session:
+                await SyncLogRepository(session).update_sync_log_complete(
+                    sync_log_id, items_processed=0, items_failed=0
+                )
+            return
+
         logger.info("FL stock correction job started", sync_log_id=sync_log_id)
 
         candidates = await self._load_candidates()
