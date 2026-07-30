@@ -17,6 +17,7 @@ from fastapi import Depends, FastAPI
 from tiny_mirror.api.dependencies import verify_api_key
 from tiny_mirror.api.error_handlers import register_error_handlers
 from tiny_mirror.api.middleware import RequestIdMiddleware, RequestLoggingMiddleware
+from tiny_mirror.api.routers.ads import router as ads_router
 from tiny_mirror.api.routers.fulfillment import router as fulfillment_router
 from tiny_mirror.api.routers.health import router as health_router
 from tiny_mirror.api.routers.ml_fl_tracking import router as ml_fl_tracking_router
@@ -45,6 +46,7 @@ from tiny_mirror.scheduler.jobs import (
 from tiny_mirror.services.fl_stock_correction_service import FLStockCorrectionService
 from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 from tiny_mirror.services.mercadolivre_token_service import MercadoLivreTokenService
+from tiny_mirror.services.ml_ads_service import MLAdsService
 from tiny_mirror.services.ml_listing_sync_service import MLListingSyncService
 from tiny_mirror.services.order_sync_service import OrderSyncService
 from tiny_mirror.services.phantom_detection_service import PhantomDetectionService
@@ -126,9 +128,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 ml_user_id=settings.ml_user_id,
             )
             app.state.ml_client = ml_api_client
+
+            app.state.ml_ads_service = MLAdsService(
+                token_service=ml_token_service,
+                http_client=app.state.http_client,
+            )
             logger.info("Mercado Livre overlay enabled", ml_user_id=settings.ml_user_id)
         else:
             app.state.ml_client = None
+            app.state.ml_ads_service = None
             logger.info("ML_CLIENT_ID not set; Mercado Livre overlay disabled")
 
         ml_listing_sync: MLListingSyncService | None = (
@@ -234,6 +242,7 @@ def create_app() -> FastAPI:
         tags=["Estoque Full"],
         dependencies=protected,
     )
+    app.include_router(ads_router, prefix="/ads", tags=["ADS"], dependencies=protected)
 
     return app
 
