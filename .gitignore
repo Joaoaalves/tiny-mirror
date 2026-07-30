@@ -171,7 +171,6 @@ poetry.toml
 pyrightconfig.json
 
 .claude/**
-**CLAUDE**
 .mcp.json
 
 # Local Tiny audit dumps — never commit raw catalog data
