@@ -38,7 +38,12 @@ from tiny_mirror.infrastructure.orm.models import MLPanelPromoORM
 
 logger = structlog.get_logger(__name__)
 
-_BASE = "https://www.mercadolivre.com.br/anuncios/lista/promos"
+# 2026-08-09: o ML migrou a central de vendedores de www.mercadolivre.com.br
+# para vendedores.mercadolivre.com.br. A URL antiga passou a responder 302
+# para a nova — e como o scrape não segue redirect, voltava a página de 108
+# bytes do redirect (sem __NORDIC_RENDERING_CTX__), o que o probe do host
+# reportava como "login wall" (falso positivo: a sessão estava válida).
+_BASE = "https://vendedores.mercadolivre.com.br/anuncios/lista/promos"
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
