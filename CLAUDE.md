@@ -17,7 +17,12 @@ ERP .NET (`erp-api@8080`), sem consumidores — não usar.
 3. **NUNCA editar `/opt/tiny-mirror/current/` na VPS diretamente.** É o deploy de
    produção. Todo trabalho acontece num clone do repo.
 4. **Segredos vivem só em `/opt/tiny-mirror/.env` na VPS.** Nunca commitar tokens,
-   cookies ou `.env` — `.env.example` é a referência do que existe.
+   cookies ou `.env` — `.env.example` é a referência do que existe. Exceção: credenciais
+   de marketplaces (Amazon SP-API, Shopee) são do **OpenClaw**; um cron root
+   (`deploy/export_marketplace_credentials.py`, instalado em `/usr/local/bin`) exporta uma
+   cópia só-leitura para `/opt/tiny-mirror/marketplace-credentials.json`.
+5. **Outros marketplaces (Amazon, Shopee): só leitura (GET).** O tiny-mirror **NUNCA
+   renova o token da Shopee** (o refresh token gira a cada uso; quem renova é o OpenClaw).
 
 ## Fluxo de trabalho
 
