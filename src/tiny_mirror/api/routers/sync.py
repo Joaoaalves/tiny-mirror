@@ -566,6 +566,50 @@ async def sync_amazon_listings(
     return {"message": "Amazon listings sync triggered"}
 
 
+@router.post("/shopee-orders", status_code=status.HTTP_202_ACCEPTED)
+async def sync_shopee_orders(
+    request: Request,
+    background: BackgroundTasks,
+    body: AmazonOrdersRequest = Body(default_factory=AmazonOrdersRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``mp_orders`` (Shopee) for orders created in the last ``days``
+    days, in 15-day windows. Read-only on Shopee; runs in background."""
+    from tiny_mirror.scheduler.jobs import shopee_service
+
+    service = shopee_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Shopee credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "shopee_orders")
+    background.add_task(service.sync_orders, created_days=body.days)
+    logger.info("Shopee orders backfill triggered", days=body.days)
+    return {"message": f"Shopee orders backfill triggered (days={body.days})", "days": body.days}
+
+
+@router.post("/shopee-listings", status_code=status.HTTP_202_ACCEPTED)
+async def sync_shopee_listings(
+    request: Request,
+    background: BackgroundTasks,
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Refresh ``mp_listings`` for Shopee (full pass). Read-only on Shopee."""
+    from tiny_mirror.scheduler.jobs import shopee_service
+
+    service = shopee_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Shopee credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "shopee_listings")
+    background.add_task(service.sync_listings)
+    logger.info("Shopee listings sync triggered")
+    return {"message": "Shopee listings sync triggered"}
+
+
 class InvoiceItemsBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

@@ -280,6 +280,11 @@ class Settings(BaseSettings):
     sync_amazon_orders_cron: str = "25 * * * *"
     sync_amazon_orders_updated_hours: int = 3
     sync_amazon_listings_cron: str = "20 8 * * *"
+    # Shopee: orders hourly by update_time (new + status changes), listings
+    # daily. Initial history: POST /sync/shopee-orders {"days": 90}.
+    sync_shopee_orders_cron: str = "35 * * * *"
+    sync_shopee_orders_updated_hours: int = 3
+    sync_shopee_listings_cron: str = "40 8 * * *"
 
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.
