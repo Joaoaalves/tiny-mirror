@@ -59,14 +59,13 @@ class Settings(BaseSettings):
     seq_api_key: str = ""
 
     sync_products_cron: str = "0 2 * * *"
-    # Orders run every 30 min. _filter_new_order_ids skips ids already in
-    # the local table, so the only Tiny calls are pagination + GET per
-    # genuinely new order — well under the 60 req/min budget.
+    # Orders run every 30 min. _filter_new_or_changed keeps only ids not yet
+    # mirrored or whose listed situacao differs from the mirror, so the Tiny
+    # calls are pagination + GET per new or status-changed order.
     sync_orders_cron: str = "*/30 * * * *"
-    # Daily reconciliation: re-fetch every order whose dataAtualizacao was
-    # yesterday, regardless of whether it is already in the DB. Catches
-    # status changes (cancellations, deliveries) the incremental cron
-    # cannot see, since _filter_new_order_ids skips known ids.
+    # Daily reconciliation: re-fetch every order updated since yesterday,
+    # regardless of whether it is already in the DB. Safety net for drift in
+    # fields other than the situation (the incremental catches those).
     sync_orders_reconciliation_cron: str = "0 3 * * *"
     # Both paths list by dataAtualizacao, which Tiny bumps on ANY change —
     # including deleting an old NF to free storage (it zeroes the order's

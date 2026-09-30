@@ -304,9 +304,10 @@ async def test_run_incremental_sync_records_total_enqueued(
 
 async def _recent_unmirrored_ids(tiny_client: TinyAPIClient, service: OrderSyncService) -> set[int]:
     """Ids the incremental run should publish: listed as updated in the
-    2-hour window, created on/after the age cutoff, not yet mirrored."""
+    2-hour window, created on/after the age cutoff, and either not yet
+    mirrored or mirrored with a different situation."""
     cutoff = OrderSyncService._cutoff_date()
-    recent: list[int] = []
+    recent: list[dict[str, object]] = []
     offset = 0
     while True:
         page = await tiny_client.list_orders(
@@ -315,11 +316,12 @@ async def _recent_unmirrored_ids(tiny_client: TinyAPIClient, service: OrderSyncS
             offset=offset,
         )
         items = page.get("itens", []) or []
-        recent += [int(i["id"]) for i in items if not _created_before(i, cutoff)]
+        recent += [i for i in items if not _created_before(i, cutoff)]
         offset += 100
         if len(items) < 100:
             break
-    return set(await service._filter_new_order_ids(recent))
+    ids, _ = await service._filter_new_or_changed(recent)
+    return set(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -421,3 +423,32 @@ async def test_pending_claim_dedupes_against_live_redis(
         assert await service._claim_pending(_OLD_ORDER_ID) is True
     finally:
         await redis.delete(key)
+
+
+async def test_filter_flags_mirrored_order_whose_situation_changed(live_db: None) -> None:
+    """Late cancellation (2026-09-28 case: 109209/109227 cancelled in Tiny
+    after the last fetch): the listing reports situacao=2 while the mirror
+    still has 6 -> the incremental must re-fetch it."""
+    await _delete_synthetic_orders()
+    try:
+        async with AsyncSessionLocal() as session:
+            await PostgreSQLOrderRepository(session).upsert(
+                _synthetic_order(_RECENT_ORDER_ID, datetime.now(UTC).date(), 777)
+            )
+        service = OrderSyncService(tiny_client=MagicMock(), queue_publisher=MagicMock())
+
+        ids, drifted = await service._filter_new_or_changed(
+            [
+                {"id": _RECENT_ORDER_ID, "situacao": 2},
+                {"id": _OLD_ORDER_ID, "situacao": 6},
+            ]
+        )
+        assert ids == [_RECENT_ORDER_ID, _OLD_ORDER_ID]
+        assert drifted == 1
+
+        unchanged, drifted = await service._filter_new_or_changed(
+            [{"id": _RECENT_ORDER_ID, "situacao": 6}]
+        )
+        assert unchanged == [] and drifted == 0
+    finally:
+        await _delete_synthetic_orders()
