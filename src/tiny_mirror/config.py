@@ -265,6 +265,8 @@ class Settings(BaseSettings):
 
     # Daily ML account health: reputation snapshot + new infractions.
     sync_ml_account_health_cron: str = "30 7 * * *"
+    # Daily listing health (moderation/tags, quality, purchase experience).
+    sync_ml_item_health_cron: str = "50 7 * * *"
 
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.

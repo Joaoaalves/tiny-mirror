@@ -1287,6 +1287,46 @@ class MLInfractionORM(Base):
     )
 
 
+class MLItemHealthORM(Base):
+    __tablename__ = "ml_item_health"
+    __table_args__ = (
+        {
+            "comment": (
+                "Saúde atual de cada anúncio ML, em 3 partes com coleta própria: "
+                "item_* (status/sub_status de moderação e tags, multiget /items), "
+                "quality_* (/item/{id}/performance: nota, nível, pendências por "
+                "dimensão) e experience_* (experiência de compra, /reputation/items)."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    item_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    item_sub_status: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    item_tags: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    item_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    quality_score: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    quality_level: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    quality_level_wording: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    quality_calculated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # [{bucket, key, title, score}] das variáveis ainda não COMPLETED.
+    quality_pending: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    quality_buckets: Mapped[list[dict[str, Any]] | None] = mapped_column(JSONB, nullable=True)
+    quality_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    experience_color: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    experience_text: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    experience_value: Mapped[Decimal | None] = mapped_column(Numeric(6, 2), nullable=True)
+    experience_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    experience_raw: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    experience_fetched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 # ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------

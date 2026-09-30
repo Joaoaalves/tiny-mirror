@@ -142,6 +142,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_account_health": CronTrigger.from_crontab(
                 settings.sync_ml_account_health_cron, timezone="UTC"
             ),
+            "ml_item_health": CronTrigger.from_crontab(
+                settings.sync_ml_item_health_cron, timezone="UTC"
+            ),
             "ml_panel_scrape": CronTrigger.from_crontab(
                 settings.ml_panel_scrape_cron, timezone="UTC"
             ),
@@ -249,6 +252,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_account_health() -> None:
         await ml_account_health_job(http_client, app.state.ml_token_service)
+
+    async def _ml_item_health() -> None:
+        await ml_item_health_job(http_client, app.state.ml_token_service)
 
     async def _ml_panel_scrape() -> None:
         await ml_panel_scrape_job(http_client)
@@ -407,6 +413,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_account_health,
         trigger=triggers["ml_account_health"],
         id="ml_account_health",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_item_health,
+        trigger=triggers["ml_item_health"],
+        id="ml_item_health",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1108,6 +1120,18 @@ async def ml_account_health_job(http_client: Any, ml_token_service: Any) -> None
     await MLAccountHealthService(
         token_service=ml_token_service, http_client=http_client, ml_user_id=settings.ml_user_id
     ).sync()
+
+
+async def ml_item_health_job(http_client: Any, ml_token_service: Any) -> None:
+    """Daily listing health: moderation/tags, quality, purchase experience.
+    Read-only on ML."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML item health skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.services.ml_item_health_service import MLItemHealthService
+
+    await MLItemHealthService(token_service=ml_token_service, http_client=http_client).sync()
 
 
 async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:
