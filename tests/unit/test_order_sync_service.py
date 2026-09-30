@@ -81,7 +81,9 @@ def _service(listing: dict[str, Any], redis_client: Any = None) -> OrderSyncServ
     service = OrderSyncService(
         tiny_client=tiny, queue_publisher=publisher, redis_client=redis_client
     )
-    service._filter_new_order_ids = AsyncMock(side_effect=lambda ids: ids)  # type: ignore[method-assign]
+    service._filter_new_or_changed = AsyncMock(  # type: ignore[method-assign]
+        side_effect=lambda items: ([int(i["id"]) for i in items], 0)
+    )
     service._record_total_enqueued = AsyncMock()  # type: ignore[method-assign]
     return service
 
@@ -128,7 +130,8 @@ async def test_incremental_skips_orders_created_before_cutoff() -> None:
     await service.run_incremental_sync(sync_log_id=7)
 
     assert _published_order_ids(service) == [2, 4]
-    service._filter_new_order_ids.assert_awaited_once_with([2, 4])
+    (listed,) = service._filter_new_or_changed.await_args.args
+    assert [i["id"] for i in listed] == [2, 4]
     service._record_total_enqueued.assert_awaited_once_with(7, 2)
 
 
@@ -138,7 +141,7 @@ async def test_reconciliation_skips_old_orders_but_refetches_known_recent_ones()
     await service.run_reconciliation_sync(TODAY - timedelta(days=1), sync_log_id=9)
 
     # skip_existing=False: the DB filter is bypassed, only the age cut applies.
-    service._filter_new_order_ids.assert_not_awaited()
+    service._filter_new_or_changed.assert_not_awaited()
     assert _published_order_ids(service) == [2]
     service._record_total_enqueued.assert_awaited_once_with(9, 1)
 
@@ -307,3 +310,63 @@ async def test_upsert_without_cutoff_overwrites_invoice_link() -> None:
 
     assert "CASE" not in update_clause
     assert "invoice_id = excluded.invoice_id" in update_clause
+
+
+# ---------------------------------------------------------------------------
+# Situation drift: late cancellations land within one incremental run
+# ---------------------------------------------------------------------------
+def _session_returning(rows: list[tuple[int, int]]) -> Any:
+    @asynccontextmanager
+    async def factory() -> Any:
+        session = MagicMock()
+        result = MagicMock()
+        result.all.return_value = rows
+        session.execute = AsyncMock(return_value=result)
+        yield session
+
+    return factory
+
+
+async def test_filter_keeps_new_and_situation_changed_orders_only() -> None:
+    service = OrderSyncService(tiny_client=MagicMock(), queue_publisher=MagicMock())
+    listing = [
+        {"id": 1, "situacao": 6},  # mirrored as 6 -> unchanged, skip
+        {"id": 2, "situacao": 2},  # mirrored as 6 -> cancelled later, fetch
+        {"id": 3, "situacao": 3},  # not mirrored -> new, fetch
+        {"id": 4, "situacao": "2"},  # string situacao, mirrored as 5 -> fetch
+        {"id": 5},  # no situacao, mirrored -> cannot tell, skip
+    ]
+
+    with patch.object(
+        mod, "AsyncSessionLocal", _session_returning([(1, 6), (2, 6), (4, 5), (5, 6)])
+    ):
+        ids, drifted = await service._filter_new_or_changed(listing)
+
+    assert ids == [2, 3, 4]
+    assert drifted == 2
+
+
+async def test_filter_on_empty_page_skips_the_db() -> None:
+    service = OrderSyncService(tiny_client=MagicMock(), queue_publisher=MagicMock())
+
+    with patch.object(mod, "AsyncSessionLocal", side_effect=AssertionError("no DB call")):
+        assert await service._filter_new_or_changed([]) == ([], 0)
+
+
+async def test_incremental_publishes_late_cancellation_of_mirrored_order() -> None:
+    service = _service(_listing((109209, RECENT), (109210, RECENT)))
+    del service._filter_new_or_changed  # use the real filter
+    service._tiny.list_orders = AsyncMock(
+        return_value={
+            "itens": [
+                {"id": 109209, "situacao": 2, "dataCriacao": RECENT},
+                {"id": 109210, "situacao": 6, "dataCriacao": RECENT},
+            ],
+            "paginacao": {"total": 2},
+        }
+    )
+
+    with patch.object(mod, "AsyncSessionLocal", _session_returning([(109209, 8), (109210, 6)])):
+        await service.run_incremental_sync(sync_log_id=1)
+
+    assert _published_order_ids(service) == [109209]

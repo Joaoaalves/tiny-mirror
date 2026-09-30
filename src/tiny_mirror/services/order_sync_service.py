@@ -71,16 +71,16 @@ class OrderSyncService:
     # Incremental — hourly scheduler entry point
     # ------------------------------------------------------------------
     async def run_reconciliation_sync(self, target_date: date, sync_log_id: int) -> None:
-        """Re-fetch every order updated on ``target_date`` and upsert them.
+        """Re-fetch every order updated since ``target_date`` and upsert them.
 
         Tiny v3 exposes ``dataAtualizacao=YYYY-MM-DD`` which returns every
-        order whose last update happened on that day, regardless of when
-        the order was created. That is the only reliable way to catch
-        status changes (e.g. an order created on day N that was cancelled
-        on day N+2): the order's ``dataAtualizacao`` advances to N+2 and
-        shows up in this listing. Unlike the incremental path, this one
-        does NOT filter out ids already in the local table — the whole
-        point is to re-upsert and pick up status drift.
+        order whose last update is on or after that day (verified
+        2026-09-30: totals shrink as the date advances), regardless of when
+        the order was created. An order created on day N and cancelled on
+        N+2 has its ``dataAtualizacao`` advanced to N+2 and shows up here.
+        Unlike the incremental path, this one re-fetches every listed id,
+        not only new or situation-changed ones — a daily full re-upsert
+        also picks up drift in fields other than the situation.
         """
         logger.info(
             "Starting order reconciliation sync",
@@ -290,11 +290,12 @@ class OrderSyncService:
     ) -> int:
         """Paginate Tiny orders and publish one ``orders.item`` per id.
 
-        ``skip_existing=True`` (default) drops ids already in the local
-        ``orders`` table — used by the incremental cron to avoid
-        re-fetching the same order every hour. ``skip_existing=False``
-        publishes every id; used by the reconciliation path that has to
-        pick up status drift on already-mirrored orders.
+        ``skip_existing=True`` (default) keeps only ids that are not
+        mirrored yet or whose listed ``situacao`` differs from the mirror
+        (e.g. cancelled after the last fetch) — used by the incremental
+        cron, so a status change lands within one run without re-fetching
+        every order. ``skip_existing=False`` publishes every id; used by the
+        reconciliation path.
 
         ``created_since`` drops listing rows whose ``dataCriacao`` is older
         (rows without a parseable date are kept). Ids already pending on
@@ -303,6 +304,7 @@ class OrderSyncService:
         total_published = 0
         skipped_old = 0
         skipped_pending = 0
+        drifted = 0
         offset = 0
         while True:
             response = await self._tiny.list_orders(
@@ -323,7 +325,11 @@ class OrderSyncService:
             recent = [item for item in items if not _created_before(item, created_since)]
             skipped_old += len(items) - len(recent)
             page_ids = [int(item["id"]) for item in recent]
-            target_ids = await self._filter_new_order_ids(page_ids) if skip_existing else page_ids
+            if skip_existing:
+                target_ids, page_drifted = await self._filter_new_or_changed(recent)
+                drifted += page_drifted
+            else:
+                target_ids = page_ids
             skipped = len(page_ids) - len(target_ids)
 
             for order_tiny_id in target_ids:
@@ -362,12 +368,13 @@ class OrderSyncService:
             if (total and offset >= total) or len(items) < PAGE_SIZE:
                 break
 
-        if skipped_old or skipped_pending:
+        if skipped_old or skipped_pending or drifted:
             logger.info(
                 "Order fan-out skipped ids",
                 sync_log_id=sync_log_id,
                 skipped_old=skipped_old,
                 skipped_pending=skipped_pending,
+                situation_drift=drifted,
                 created_since=created_since.isoformat() if created_since else None,
                 total_published=total_published,
             )
@@ -420,24 +427,42 @@ class OrderSyncService:
                 error=str(exc),
             )
 
-    async def _filter_new_order_ids(self, candidate_ids: list[int]) -> list[int]:
-        """Drop ids that are already in the local orders table.
+    async def _filter_new_or_changed(self, items: list[dict[str, Any]]) -> tuple[list[int], int]:
+        """Ids worth fetching: not mirrored yet, or mirrored with a different
+        situation than the listing reports. Returns ``(ids, drifted_count)``.
 
-        The cron lookback window overlaps with prior runs, so the same
-        order surfaces hour after hour until it falls out of the window.
-        Re-fetching its detail every hour wastes the 60 req/min Tiny
-        budget without changing the row — status changes already arrive
-        through the order webhook, which calls process_order_item
-        directly without going through this fan-out.
+        The cron lookback overlaps with prior runs, so the same order is
+        listed run after run; re-fetching unchanged ones would waste the
+        60 req/min Tiny budget. The listing already carries ``situacao``,
+        so a cancellation (or any status move) is detected for free — the
+        Tiny order webhook is not configured, so this is the fast path.
         """
-        if not candidate_ids:
-            return []
+        listed: dict[int, int | None] = {
+            int(item["id"]): _to_situation(item.get("situacao")) for item in items
+        }
+        if not listed:
+            return [], 0
         async with AsyncSessionLocal() as session:
             result = await session.execute(
-                select(OrderORM.tiny_id).where(OrderORM.tiny_id.in_(candidate_ids))
+                select(OrderORM.tiny_id, OrderORM.situation).where(
+                    OrderORM.tiny_id.in_(list(listed))
+                )
             )
-            existing = {int(tid) for (tid,) in result.all()}
-        return [oid for oid in candidate_ids if oid not in existing]
+            mirrored = {int(tid): int(sit) for tid, sit in result.all()}
+        new = [oid for oid in listed if oid not in mirrored]
+        changed = [
+            oid
+            for oid, situation in listed.items()
+            if oid in mirrored and situation is not None and situation != mirrored[oid]
+        ]
+        if changed:
+            logger.info(
+                "Order situation drift detected",
+                count=len(changed),
+                sample=[(oid, mirrored[oid], listed[oid]) for oid in changed[:10]],
+            )
+        keep = set(new) | set(changed)
+        return [oid for oid in listed if oid in keep], len(changed)
 
     async def _record_total_enqueued(self, sync_log_id: int, total_enqueued: int) -> None:
         from sqlalchemy import update
@@ -476,3 +501,11 @@ def _created_before(item: dict[str, Any], cutoff: date | None) -> bool:
         return date.fromisoformat(raw[:10]) < cutoff
     except ValueError:
         return False
+
+
+def _to_situation(value: Any) -> int | None:
+    """Listing ``situacao`` as the int stored in ``orders.situation``."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
