@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     # status changes (cancellations, deliveries) the incremental cron
     # cannot see, since _filter_new_order_ids skips known ids.
     sync_orders_reconciliation_cron: str = "0 3 * * *"
+    # Both paths list by dataAtualizacao, which Tiny bumps on ANY change —
+    # including deleting an old NF to free storage (it zeroes the order's
+    # idNotaFiscal). On 2026-09-30 that turned ~20k 2025 orders into
+    # "updated today" and flooded tiny.sync.orders.item with 44k messages.
+    # Orders created more than this many days ago are skipped by both
+    # paths; historical backfills (date range) are unaffected.
+    orders_sync_max_age_days: int = 90
+    # An order id enqueued on tiny.sync.orders.item is marked pending in
+    # Redis until a consumer picks it up, so overlapping cron runs do not
+    # enqueue it again. The TTL only matters if a message is lost.
+    orders_item_pending_ttl_seconds: int = 3 * 60 * 60
     # Stock full sync runs daily (03:00 UTC). Stock is refreshed only here
     # — neither order webhooks nor the hourly order cron fan out per-product
     # stock refreshes anymore. Tiny order webhooks are too unreliable to

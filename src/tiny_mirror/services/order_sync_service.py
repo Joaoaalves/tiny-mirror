@@ -9,16 +9,23 @@ which slices the period into 7-day windows and fans out one
 
 Each method opens its own ``AsyncSession`` so the service is safe to
 share between long-lived consumer contexts.
+
+The incremental and reconciliation paths list by ``dataAtualizacao``,
+which Tiny bumps on any change to an order — including the deletion of an
+old NF to free storage. Two guards keep such bulk edits from flooding the
+item queue: orders created before :meth:`_cutoff_date` are skipped, and an
+id already waiting on ``tiny.sync.orders.item`` is not enqueued again.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from sqlalchemy import select
 
+from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
@@ -33,6 +40,8 @@ from tiny_mirror.mappers.order_mapper import OrderMapper
 from tiny_mirror.queue.publisher import QueuePublisher
 
 if TYPE_CHECKING:
+    import redis.asyncio as redis
+
     from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 
 logger = structlog.get_logger(__name__)
@@ -40,6 +49,7 @@ logger = structlog.get_logger(__name__)
 PAGE_SIZE = 100
 INCREMENTAL_LOOKBACK_HOURS = 2
 HISTORICAL_WINDOW_DAYS = 7
+PENDING_KEY_PREFIX = "tiny-mirror:orders-item-pending:"
 
 
 class OrderSyncService:
@@ -48,10 +58,14 @@ class OrderSyncService:
         tiny_client: TinyAPIClient,
         queue_publisher: QueuePublisher,
         invoice_sync: InvoiceSyncService | None = None,
+        redis_client: redis.Redis | None = None,
     ) -> None:
         self._tiny = tiny_client
         self._publisher = queue_publisher
         self._invoice_sync = invoice_sync
+        # None disables the pending-id dedupe (e.g. API-side instances that
+        # never fan out).
+        self._redis = redis_client
 
     # ------------------------------------------------------------------
     # Incremental — hourly scheduler entry point
@@ -77,6 +91,7 @@ class OrderSyncService:
             sync_log_id=sync_log_id,
             updated_after=target_date,
             skip_existing=False,
+            created_since=self._cutoff_date(),
         )
         await self._record_total_enqueued(sync_log_id, total_published)
         logger.info(
@@ -97,6 +112,7 @@ class OrderSyncService:
         total_published = await self._fan_out_orders(
             sync_log_id=sync_log_id,
             updated_after=lookback_dt,
+            created_since=self._cutoff_date(),
         )
 
         # Trigger a sale-bucket refresh covering the same window. Stock is
@@ -201,6 +217,9 @@ class OrderSyncService:
         calls — counter updates are skipped in that case.
         """
         logger.debug("Processing order item", order_tiny_id=order_tiny_id)
+        # From here on the id is no longer waiting in the queue: a later
+        # fan-out may enqueue it again (e.g. the reconciliation run).
+        await self._release_pending(order_tiny_id)
 
         try:
             raw = await self._tiny.get_order(order_tiny_id)
@@ -218,7 +237,9 @@ class OrderSyncService:
             orders = PostgreSQLOrderRepository(session)
             sync_logs = SyncLogRepository(session)
             try:
-                action = await orders.upsert(order_data)
+                action = await orders.upsert(
+                    order_data, invoice_link_frozen_before=self._cutoff_date()
+                )
                 await orders.upsert_items(order_tiny_id, items)
                 if sync_log_id is not None:
                     await sync_logs.increment_processed(sync_log_id)
@@ -265,6 +286,7 @@ class OrderSyncService:
         date_initial: date | None = None,
         date_final: date | None = None,
         skip_existing: bool = True,
+        created_since: date | None = None,
     ) -> int:
         """Paginate Tiny orders and publish one ``orders.item`` per id.
 
@@ -273,8 +295,14 @@ class OrderSyncService:
         re-fetching the same order every hour. ``skip_existing=False``
         publishes every id; used by the reconciliation path that has to
         pick up status drift on already-mirrored orders.
+
+        ``created_since`` drops listing rows whose ``dataCriacao`` is older
+        (rows without a parseable date are kept). Ids already pending on
+        the item queue are never published twice.
         """
         total_published = 0
+        skipped_old = 0
+        skipped_pending = 0
         offset = 0
         while True:
             response = await self._tiny.list_orders(
@@ -292,19 +320,28 @@ class OrderSyncService:
             if not items:
                 break
 
-            page_ids = [int(item["id"]) for item in items]
+            recent = [item for item in items if not _created_before(item, created_since)]
+            skipped_old += len(items) - len(recent)
+            page_ids = [int(item["id"]) for item in recent]
             target_ids = await self._filter_new_order_ids(page_ids) if skip_existing else page_ids
             skipped = len(page_ids) - len(target_ids)
 
             for order_tiny_id in target_ids:
-                await self._publisher.publish_sync_message(
-                    "orders.item",
-                    {
-                        "order_tiny_id": order_tiny_id,
-                        "sync_log_id": sync_log_id,
-                        "published_at": datetime.now(UTC).isoformat(),
-                    },
-                )
+                if not await self._claim_pending(order_tiny_id):
+                    skipped_pending += 1
+                    continue
+                try:
+                    await self._publisher.publish_sync_message(
+                        "orders.item",
+                        {
+                            "order_tiny_id": order_tiny_id,
+                            "sync_log_id": sync_log_id,
+                            "published_at": datetime.now(UTC).isoformat(),
+                        },
+                    )
+                except Exception:
+                    await self._release_pending(order_tiny_id)
+                    raise
                 logger.debug(
                     "Published order item",
                     order_tiny_id=order_tiny_id,
@@ -325,7 +362,63 @@ class OrderSyncService:
             if (total and offset >= total) or len(items) < PAGE_SIZE:
                 break
 
+        if skipped_old or skipped_pending:
+            logger.info(
+                "Order fan-out skipped ids",
+                sync_log_id=sync_log_id,
+                skipped_old=skipped_old,
+                skipped_pending=skipped_pending,
+                created_since=created_since.isoformat() if created_since else None,
+                total_published=total_published,
+            )
         return total_published
+
+    @staticmethod
+    def _cutoff_date() -> date:
+        """Oldest creation date the incremental/reconcile paths still sync.
+
+        Also the boundary below which an order's NF link is frozen: Tiny
+        zeroes ``idNotaFiscal`` when an old NF is deleted to free storage,
+        and the mirror keeps the last known link instead.
+        """
+        return datetime.now(UTC).date() - timedelta(days=settings.orders_sync_max_age_days)
+
+    async def _claim_pending(self, order_tiny_id: int) -> bool:
+        """Mark the id as waiting on the item queue. False = already waiting.
+
+        Fails open: if Redis is unavailable the id is published anyway —
+        a duplicate fetch is cheaper than a missed order.
+        """
+        if self._redis is None:
+            return True
+        try:
+            claimed = await self._redis.set(
+                f"{PENDING_KEY_PREFIX}{order_tiny_id}",
+                "1",
+                nx=True,
+                ex=settings.orders_item_pending_ttl_seconds,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Order pending claim failed, publishing anyway",
+                order_tiny_id=order_tiny_id,
+                error=str(exc),
+            )
+            return True
+        return bool(claimed)
+
+    async def _release_pending(self, order_tiny_id: int) -> None:
+        if self._redis is None:
+            return
+        try:
+            await self._redis.delete(f"{PENDING_KEY_PREFIX}{order_tiny_id}")
+        except Exception as exc:
+            # The TTL clears the key eventually; never fail the sync over it.
+            logger.warning(
+                "Order pending release failed",
+                order_tiny_id=order_tiny_id,
+                error=str(exc),
+            )
 
     async def _filter_new_order_ids(self, candidate_ids: list[int]) -> list[int]:
         """Drop ids that are already in the local orders table.
@@ -367,3 +460,19 @@ class OrderSyncService:
             # row was already in the DB), the per-item finalizer never runs.
             # Try to close the row right after the fan-out.
             await SyncLogRepository(session).try_finalize(sync_log_id)
+
+
+def _created_before(item: dict[str, Any], cutoff: date | None) -> bool:
+    """True when the listing row's ``dataCriacao`` is older than ``cutoff``.
+
+    Missing or unparseable dates return False so the order is still synced.
+    """
+    if cutoff is None:
+        return False
+    raw = item.get("dataCriacao")
+    if not isinstance(raw, str) or len(raw) < 10:
+        return False
+    try:
+        return date.fromisoformat(raw[:10]) < cutoff
+    except ValueError:
+        return False

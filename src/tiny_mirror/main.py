@@ -162,6 +162,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 tiny_client=tiny_client,
                 queue_publisher=app.state.queue_publisher,
                 invoice_sync=invoice_sync,
+                redis_client=get_redis(),
             ),
             stock_sync=StockSyncService(
                 tiny_client=tiny_client,

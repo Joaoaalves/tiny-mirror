@@ -9,11 +9,14 @@ Tests assume:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import json
+from datetime import UTC, date, datetime, timedelta
+from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
+from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.orm.models import OrderItemORM, OrderORM, SyncLogORM
@@ -26,7 +29,12 @@ from tiny_mirror.infrastructure.repositories.sync_log_repository import (
 from tiny_mirror.mappers.order_mapper import OrderMapper
 from tiny_mirror.queue.publisher import QueuePublisher
 from tiny_mirror.rabbitmq import get_channel
-from tiny_mirror.services.order_sync_service import OrderSyncService
+from tiny_mirror.redis_client import get_redis
+from tiny_mirror.services.order_sync_service import (
+    PENDING_KEY_PREFIX,
+    OrderSyncService,
+    _created_before,
+)
 
 pytestmark = pytest.mark.e2e
 
@@ -209,14 +217,12 @@ async def test_run_incremental_sync_publishes_orders_and_buckets(
     service = OrderSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
     await service.run_incremental_sync(sync_log_id)
 
-    # orders.item count must equal what list_orders reports for the same
-    # 2-hour window — but the live Tiny account may genuinely have zero
-    # recent orders, so we only assert non-negative parity with the API.
-    head = await live_tiny_client.list_orders(
-        updated_after=datetime.now(UTC) - timedelta(hours=2),
-        limit=1,
-    )
-    expected_orders = int(head.get("paginacao", {}).get("total", 0))
+    # orders.item count must equal the listing for the same window after
+    # the service's own filters: rows created before the age cutoff are
+    # skipped, and so are ids already mirrored. Any drained id must be one
+    # of those. The live account may genuinely have zero recent orders.
+    expected_ids = await _recent_unmirrored_ids(live_tiny_client, service)
+    expected_orders = len(expected_ids)
 
     drained_orders = 0
     while True:
@@ -224,6 +230,7 @@ async def test_run_incremental_sync_publishes_orders_and_buckets(
         if msg is None:
             break
         drained_orders += 1
+        assert json.loads(msg.body)["order_tiny_id"] in expected_ids
 
     assert drained_orders == expected_orders
 
@@ -293,3 +300,124 @@ async def test_run_incremental_sync_records_total_enqueued(
     metadata = row.sync_metadata or {}
     assert "total_enqueued" in metadata
     assert isinstance(metadata["total_enqueued"], int)
+
+
+async def _recent_unmirrored_ids(tiny_client: TinyAPIClient, service: OrderSyncService) -> set[int]:
+    """Ids the incremental run should publish: listed as updated in the
+    2-hour window, created on/after the age cutoff, not yet mirrored."""
+    cutoff = OrderSyncService._cutoff_date()
+    recent: list[int] = []
+    offset = 0
+    while True:
+        page = await tiny_client.list_orders(
+            updated_after=datetime.now(UTC) - timedelta(hours=2),
+            limit=100,
+            offset=offset,
+        )
+        items = page.get("itens", []) or []
+        recent += [int(i["id"]) for i in items if not _created_before(i, cutoff)]
+        offset += 100
+        if len(items) < 100:
+            break
+    return set(await service._filter_new_order_ids(recent))
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-30 — NF deletion storm guards
+# ---------------------------------------------------------------------------
+_OLD_ORDER_ID = 9_990_000_001
+_RECENT_ORDER_ID = 9_990_000_002
+
+
+def _synthetic_order(tiny_id: int, order_date: date, invoice_id: int | None) -> dict[str, object]:
+    return {
+        "tiny_id": tiny_id,
+        "order_number": tiny_id - 9_000_000_000,
+        "invoice_id": invoice_id,
+        "invoice_date": date(2025, 12, 12) if invoice_id else None,
+        "customer": {},
+        "situation": 6,
+        "order_date": order_date,
+        "synced_at": datetime.now(UTC),
+    }
+
+
+async def _delete_synthetic_orders() -> None:
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            delete(OrderORM).where(OrderORM.tiny_id.in_([_OLD_ORDER_ID, _RECENT_ORDER_ID]))
+        )
+        await session.commit()
+
+
+async def test_upsert_keeps_nf_link_of_old_order_when_tiny_zeroes_it(live_db: None) -> None:
+    """Deleting an old NF in Tiny zeroes the order's idNotaFiscal; the
+    mirror must keep the last known link for orders before the cutoff,
+    while recent orders keep following Tiny."""
+    cutoff = OrderSyncService._cutoff_date()
+    recent_date = datetime.now(UTC).date()
+    await _delete_synthetic_orders()
+    try:
+        async with AsyncSessionLocal() as session:
+            repo = PostgreSQLOrderRepository(session)
+            await repo.upsert(_synthetic_order(_OLD_ORDER_ID, date(2025, 11, 24), 123456))
+            await repo.upsert(_synthetic_order(_RECENT_ORDER_ID, recent_date, 777))
+
+            # Tiny now returns idNotaFiscal=0 and no invoice date for both.
+            await repo.upsert(
+                _synthetic_order(_OLD_ORDER_ID, date(2025, 11, 24), 0),
+                invoice_link_frozen_before=cutoff,
+            )
+            await repo.upsert(
+                _synthetic_order(_RECENT_ORDER_ID, recent_date, 0),
+                invoice_link_frozen_before=cutoff,
+            )
+
+        async with AsyncSessionLocal() as session:
+            rows = {
+                r.tiny_id: r
+                for r in (
+                    await session.execute(
+                        select(OrderORM).where(
+                            OrderORM.tiny_id.in_([_OLD_ORDER_ID, _RECENT_ORDER_ID])
+                        )
+                    )
+                ).scalars()
+            }
+        assert rows[_OLD_ORDER_ID].invoice_id == 123456
+        assert rows[_OLD_ORDER_ID].invoice_date == date(2025, 12, 12)
+        assert rows[_RECENT_ORDER_ID].invoice_id == 0
+        assert rows[_RECENT_ORDER_ID].invoice_date is None
+
+        # A genuinely new NF on an old order still replaces the link.
+        async with AsyncSessionLocal() as session:
+            await PostgreSQLOrderRepository(session).upsert(
+                _synthetic_order(_OLD_ORDER_ID, date(2025, 11, 24), 999999),
+                invoice_link_frozen_before=cutoff,
+            )
+            row = await PostgreSQLOrderRepository(session).get_by_tiny_id(_OLD_ORDER_ID)
+        assert row is not None and int(row["invoice_id"]) == 999999
+    finally:
+        await _delete_synthetic_orders()
+
+
+async def test_pending_claim_dedupes_against_live_redis(
+    live_redis: None, live_rabbitmq: QueuePublisher
+) -> None:
+    redis = get_redis()
+    service = OrderSyncService(
+        tiny_client=MagicMock(), queue_publisher=live_rabbitmq, redis_client=redis
+    )
+    key = f"{PENDING_KEY_PREFIX}{_OLD_ORDER_ID}"
+    await redis.delete(key)
+    try:
+        assert await service._claim_pending(_OLD_ORDER_ID) is True
+        assert await service._claim_pending(_OLD_ORDER_ID) is False
+        ttl = await redis.ttl(key)
+        assert 0 < ttl <= settings.orders_item_pending_ttl_seconds
+
+        await service._release_pending(_OLD_ORDER_ID)
+        assert await redis.exists(key) == 0
+        assert await service._claim_pending(_OLD_ORDER_ID) is True
+    finally:
+        await redis.delete(key)

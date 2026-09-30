@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from typing import Any
 
-from sqlalchemy import delete, func, literal_column, select
+from sqlalchemy import and_, case, delete, func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,12 +17,46 @@ class PostgreSQLOrderRepository(OrderRepository):
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def upsert(self, order_data: dict[str, Any]) -> str:
+    async def upsert(
+        self,
+        order_data: dict[str, Any],
+        *,
+        invoice_link_frozen_before: date | None = None,
+    ) -> str:
         stmt = pg_insert(OrderORM).values(**order_data)
         update_payload = {
             col: stmt.excluded[col] for col in order_data if col not in {"tiny_id", "created_at"}
         }
         update_payload["updated_at"] = func.now()  # type: ignore[assignment]
+        if invoice_link_frozen_before is not None:
+            # Deleting an old NF in Tiny (to free storage) zeroes the order's
+            # idNotaFiscal. For orders older than the cutoff the mirror keeps
+            # the last known link; recent orders still follow Tiny, where an
+            # unlinked NF can mean cancel + re-invoice.
+            is_old = OrderORM.order_date < invoice_link_frozen_before
+            if "invoice_id" in order_data:
+                update_payload["invoice_id"] = case(  # type: ignore[assignment]
+                    (
+                        and_(
+                            is_old,
+                            OrderORM.invoice_id > 0,
+                            or_(
+                                stmt.excluded.invoice_id.is_(None),
+                                stmt.excluded.invoice_id == 0,
+                            ),
+                        ),
+                        OrderORM.invoice_id,
+                    ),
+                    else_=stmt.excluded.invoice_id,
+                )
+            if "invoice_date" in order_data:
+                update_payload["invoice_date"] = case(  # type: ignore[assignment]
+                    (
+                        and_(is_old, stmt.excluded.invoice_date.is_(None)),
+                        OrderORM.invoice_date,
+                    ),
+                    else_=stmt.excluded.invoice_date,
+                )
         update_payload["synced_at"] = order_data.get("synced_at", func.now())
 
         stmt = stmt.on_conflict_do_update(  # type: ignore[assignment]
