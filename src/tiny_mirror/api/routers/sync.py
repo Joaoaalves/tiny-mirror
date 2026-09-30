@@ -27,6 +27,7 @@ from tiny_mirror.api.dependencies import (
     get_queue_publisher,
     get_redis_client,
     get_sync_log_repository,
+    get_tiny_client,
 )
 from tiny_mirror.api.schemas import (
     PaginationResponse,
@@ -36,11 +37,13 @@ from tiny_mirror.api.schemas import (
     SyncTriggerResponse,
 )
 from tiny_mirror.config import settings
+from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
 from tiny_mirror.infrastructure.orm.models import SyncLogORM
 from tiny_mirror.infrastructure.repositories.sync_log_repository import (
     SyncLogRepository,
 )
 from tiny_mirror.queue.publisher import QueuePublisher
+from tiny_mirror.services.invoice_sync_service import InvoiceSyncService
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -486,6 +489,40 @@ async def sync_ml_item_health(
     background.add_task(service.sync)
     logger.info("ML item health sync triggered")
     return {"message": "ML item health sync triggered"}
+
+
+class InvoiceItemsBackfillRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    origin_type: str | None = Field(default="devolucao", max_length=20)
+    date_from: date | None = None
+    date_to: date | None = None
+    limit: int | None = Field(default=None, ge=1, le=200_000)
+
+
+@router.post("/invoice-items", status_code=status.HTTP_202_ACCEPTED)
+async def backfill_invoice_items(
+    background: BackgroundTasks,
+    body: InvoiceItemsBackfillRequest = Body(default_factory=InvoiceItemsBackfillRequest),
+    tiny_client: TinyAPIClient = Depends(get_tiny_client),
+    publisher: QueuePublisher = Depends(get_queue_publisher),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Fetch the lines of mirrored NFs that have none (headers-only cold start
+    of 2026-05-07). Defaults to return NFs (``origin_type=devolucao``); pass
+    ``null`` for every type. Read-only on Tiny; runs in background, newest
+    first, through the shared rate limiter."""
+    await _acquire_sync_lock(redis_client, "invoice_items")
+    service = InvoiceSyncService(tiny_client=tiny_client, queue_publisher=publisher)
+    background.add_task(
+        service.backfill_missing_items,
+        origin_type=body.origin_type,
+        date_from=body.date_from,
+        date_to=body.date_to,
+        limit=body.limit,
+    )
+    logger.info("Invoice items backfill triggered", **body.model_dump(mode="json"))
+    return {"message": "Invoice items backfill triggered", **body.model_dump(mode="json")}
 
 
 @router.post(

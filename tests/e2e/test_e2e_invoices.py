@@ -340,3 +340,46 @@ async def test_finalize_cold_start_window_closes_log_on_last_window(
 
     assert row.status == "completed", "log must close when the only window finishes"
     assert row.completed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-30 — lines for NFs stored header-only by the cold start
+# ---------------------------------------------------------------------------
+async def test_backfill_missing_items_fills_one_live_nf(
+    live_tiny_client: TinyAPIClient,
+    live_rabbitmq: QueuePublisher,
+) -> None:
+    """Pick the newest mirrored NF without lines, fill it from live Tiny (read
+    only) and check the lines landed; re-running the same NF only replaces
+    its line set."""
+    from sqlalchemy import exists, func
+
+    from tiny_mirror.infrastructure.orm.models import InvoiceItemORM, InvoiceORM
+
+    async with AsyncSessionLocal() as session:
+        target = (
+            await session.execute(
+                select(InvoiceORM.tiny_id)
+                .where(~exists().where(InvoiceItemORM.invoice_tiny_id == InvoiceORM.tiny_id))
+                .order_by(InvoiceORM.issue_date.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+    if target is None:
+        pytest.skip("every mirrored NF already has its lines")
+
+    service = InvoiceSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
+    stats = await service.backfill_missing_items(origin_type=None, limit=1)
+
+    assert stats["candidates"] == 1
+    assert stats["filled"] + stats["gone_in_tiny"] == 1
+    if stats["filled"]:
+        async with AsyncSessionLocal() as session:
+            lines = (
+                await session.execute(
+                    select(func.count(InvoiceItemORM.id)).where(
+                        InvoiceItemORM.invoice_tiny_id == target
+                    )
+                )
+            ).scalar_one()
+        assert lines == stats["lines"] >= 1
