@@ -463,6 +463,31 @@ async def sync_ml_account(
     return {"message": "ML account health sync triggered"}
 
 
+@router.post("/ml-item-health", status_code=status.HTTP_202_ACCEPTED)
+async def sync_ml_item_health(
+    request: Request,
+    background: BackgroundTasks,
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Refresh ``ml_item_health`` (moderation/tags, quality, purchase experience)
+    for every non-closed listing. Read-only on ML."""
+    await _acquire_sync_lock(redis_client, "ml_item_health")
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    http_client = getattr(request.app.state, "http_client", None)
+    if ml_token_service is None or http_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML credentials not configured",
+        )
+
+    from tiny_mirror.services.ml_item_health_service import MLItemHealthService
+
+    service = MLItemHealthService(token_service=ml_token_service, http_client=http_client)
+    background.add_task(service.sync)
+    logger.info("ML item health sync triggered")
+    return {"message": "ML item health sync triggered"}
+
+
 @router.post(
     "/stock",
     status_code=status.HTTP_202_ACCEPTED,
