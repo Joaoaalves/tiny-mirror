@@ -1123,6 +1123,94 @@ class MLSalesDailyORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# ml_orders / ml_order_items / ml_shipments
+# ---------------------------------------------------------------------------
+class MLOrderORM(Base):
+    __tablename__ = "ml_orders"
+    __table_args__ = (
+        Index("ix_ml_orders_tiny_ref", "tiny_ref"),
+        Index("ix_ml_orders_date_created", "date_created"),
+        Index("ix_ml_orders_shipping_id", "shipping_id"),
+        {
+            "comment": (
+                "Pedidos do Mercado Livre (todos os status), da ML Orders API. "
+                "date_created tem hora exata (o Tiny só guarda a data). Liga no "
+                "Tiny por tiny_ref = orders.ecommerce_order_number (pack_id quando "
+                "existe, senão order_id; um pack = 1 pedido Tiny com N pedidos ML)."
+            ),
+        },
+    )
+
+    order_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    pack_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    tiny_ref: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(String(30), nullable=False)
+    date_created: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    date_closed: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_updated: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    buyer_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    total_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    paid_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    shipping_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # {group, code, description, requested_by, date} quando cancelado.
+    cancel_detail: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    tags: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MLOrderItemORM(Base):
+    __tablename__ = "ml_order_items"
+    __table_args__ = (
+        Index("ix_ml_order_items_order_id", "order_id"),
+        Index("ix_ml_order_items_mlb_id", "mlb_id"),
+        {
+            "comment": (
+                "Itens dos pedidos do ML. sale_fee é a comissão do ML POR UNIDADE "
+                "(total da linha = sale_fee * quantity)."
+            ),
+        },
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("ml_orders.order_id", ondelete="CASCADE"), nullable=False
+    )
+    mlb_id: Mapped[str] = mapped_column(String(20), nullable=False)
+    variation_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    seller_sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    quantity: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    sale_fee: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    listing_type_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+
+
+class MLShipmentORM(Base):
+    __tablename__ = "ml_shipments"
+    __table_args__ = (
+        {
+            "comment": (
+                "Envios do ML (1 envio pode atender vários pedidos de um pack). "
+                "seller_cost = frete pago pelo vendedor (senders.cost de "
+                "/shipments/{id}/costs), seller_save = desconto do ML ao vendedor, "
+                "buyer_cost = frete pago pelo comprador, list_cost = gross_amount."
+            ),
+        },
+    )
+
+    shipment_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    logistic_type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    seller_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    seller_save: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    buyer_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    list_cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------
 class MLPromoCapORM(Base):
