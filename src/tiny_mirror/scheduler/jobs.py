@@ -139,6 +139,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "ml_visits_sync": CronTrigger.from_crontab(
                 settings.sync_ml_visits_cron, timezone="UTC"
             ),
+            "ml_account_health": CronTrigger.from_crontab(
+                settings.sync_ml_account_health_cron, timezone="UTC"
+            ),
             "ml_panel_scrape": CronTrigger.from_crontab(
                 settings.ml_panel_scrape_cron, timezone="UTC"
             ),
@@ -243,6 +246,9 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         await ml_visits_sync_job(
             http_client, app.state.ml_token_service, settings.sync_ml_visits_window_days
         )
+
+    async def _ml_account_health() -> None:
+        await ml_account_health_job(http_client, app.state.ml_token_service)
 
     async def _ml_panel_scrape() -> None:
         await ml_panel_scrape_job(http_client)
@@ -395,6 +401,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_visits_sync,
         trigger=triggers["ml_visits_sync"],
         id="ml_visits_sync",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _ml_account_health,
+        trigger=triggers["ml_account_health"],
+        id="ml_account_health",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1083,6 +1095,19 @@ async def ml_visits_sync_job(http_client: Any, ml_token_service: Any, days: int)
     await MLVisitsSyncService(token_service=ml_token_service, http_client=http_client).sync(
         days=days
     )
+
+
+async def ml_account_health_job(http_client: Any, ml_token_service: Any) -> None:
+    """Daily ML reputation snapshot + new infractions. Read-only on ML."""
+    if ml_token_service is None or http_client is None:
+        logger.debug("ML account health skipped: ML token / http not configured")
+        return
+
+    from tiny_mirror.services.ml_account_health_service import MLAccountHealthService
+
+    await MLAccountHealthService(
+        token_service=ml_token_service, http_client=http_client, ml_user_id=settings.ml_user_id
+    ).sync()
 
 
 async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:
