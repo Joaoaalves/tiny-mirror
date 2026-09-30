@@ -333,7 +333,19 @@ class MLPanelScrapeService:
         do host — aqui só LEMOS; escrever concorrentemente arriscaria corromper)."""
         jar = http.cookiejar.MozillaCookieJar(self._jar_path)
         jar.load(ignore_discard=True, ignore_expires=True)
-        return "; ".join(f"{c.name}={c.value}" for c in jar)
+        parts = []
+        for c in jar:
+            value = f"{c.name}={c.value}"
+            if not value.isascii():
+                # LAST_SEARCH is an optional UI preference, not authentication.
+                # The host can export it as raw Unicode; HTTP headers require ASCII.
+                if c.name == "LAST_SEARCH":
+                    continue
+                raise PanelSessionExpired(
+                    "Cookie de sessao com formato invalido; renovar sessao no painel."
+                )
+            parts.append(value)
+        return "; ".join(parts)
 
     async def fetch_page(self, page: int, search: str | None = None) -> str:
         params: dict[str, Any] = {"page": page}
