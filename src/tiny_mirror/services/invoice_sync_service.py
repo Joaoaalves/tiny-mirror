@@ -22,10 +22,12 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 import structlog
+from sqlalchemy import exists, select
 
 from tiny_mirror.database import AsyncSessionLocal
-from tiny_mirror.exceptions import TinyAPIException
+from tiny_mirror.exceptions import TinyAPIException, TinyNotFoundException
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
+from tiny_mirror.infrastructure.orm.models import InvoiceItemORM, InvoiceORM
 from tiny_mirror.infrastructure.repositories.invoice_item_repository import (
     PostgreSQLInvoiceItemRepository,
 )
@@ -247,6 +249,54 @@ class InvoiceSyncService:
         async with AsyncSessionLocal() as session:
             repo = PostgreSQLInvoiceItemRepository(session)
             return await repo.replace_for_invoice(invoice_tiny_id, items)
+
+    async def backfill_missing_items(
+        self,
+        *,
+        origin_type: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        limit: int | None = None,
+    ) -> dict[str, int]:
+        """Fetch items for mirrored invoices that have none.
+
+        The 2026-05-07 cold start stored headers only (items skipped to keep
+        it cheap); every NF issued before mid-May 2026 lacks its lines —
+        including 619 return NFs the DASH needs per SKU. Newest first, since
+        old NFs are being deleted in Tiny to free storage (oldest first); a
+        NF already gone (404) is counted and skipped. Sequential: the Tiny
+        client rate-limits globally.
+        """
+        query = select(InvoiceORM.tiny_id).where(
+            ~exists().where(InvoiceItemORM.invoice_tiny_id == InvoiceORM.tiny_id)
+        )
+        if origin_type is not None:
+            query = query.where(InvoiceORM.origin_type == origin_type)
+        if date_from is not None:
+            query = query.where(InvoiceORM.issue_date >= date_from)
+        if date_to is not None:
+            query = query.where(InvoiceORM.issue_date <= date_to)
+        query = query.order_by(InvoiceORM.issue_date.desc(), InvoiceORM.tiny_id.desc())
+        if limit is not None:
+            query = query.limit(limit)
+        async with AsyncSessionLocal() as session:
+            ids = [int(tid) for (tid,) in (await session.execute(query)).all()]
+
+        stats = {"candidates": len(ids), "filled": 0, "lines": 0, "gone_in_tiny": 0, "failed": 0}
+        logger.info("invoice_items_backfill.started", origin_type=origin_type, **stats)
+        for tiny_id in ids:
+            try:
+                stats["lines"] += await self.sync_items_for_invoice(tiny_id)
+                stats["filled"] += 1
+            except TinyNotFoundException:
+                stats["gone_in_tiny"] += 1
+            except Exception as exc:
+                stats["failed"] += 1
+                logger.warning(
+                    "invoice_items_backfill.failed", invoice_tiny_id=tiny_id, error=str(exc)
+                )
+        logger.info("invoice_items_backfill.done", origin_type=origin_type, **stats)
+        return stats
 
     async def _sync_items_for_invoices(self, invoices: list[dict[str, Any]]) -> None:
         """Best-effort items fetch for a batch of invoices already upserted.
