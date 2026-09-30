@@ -1,8 +1,10 @@
 # CLAUDE.md — tiny-mirror
 
 Espelho do Tiny ERP + integrações Mercado Livre (FastAPI + Postgres + Redis + RabbitMQ).
-**Este código roda em PRODUÇÃO** na VPS (serviço systemd `tiny-mirror`, API em
-`erp.offshop.work`). Trate qualquer mudança como mudança de produção.
+**Este código roda em PRODUÇÃO** na VPS (serviço systemd `tiny-mirror`, uvicorn em
+`127.0.0.1:8001`, exposto em `https://dash.offshop.work/tiny-mirror/` via nginx). Trate
+qualquer mudança como mudança de produção. ⚠️ `erp.offshop.work` NÃO é este serviço: é o
+ERP .NET (`erp-api@8080`), sem consumidores — não usar.
 
 ## Regras INVIOLÁVEIS (segurança operacional)
 
@@ -24,9 +26,12 @@ Espelho do Tiny ERP + integrações Mercado Livre (FastAPI + Postgres + Redis + 
   `Co-Authored-By: Claude`.
 - Terminou: push da branch + PR (`gh pr create`). **Merge e deploy são conduzidos
   pelo João Alves** — não faça merge na main nem deploy por conta própria.
-- Deploy (referência, lado do João Alves): rsync explícito arquivo→arquivo de TODOS
-  os arquivos tocados para `/opt/tiny-mirror/current/` + `alembic upgrade head` (se
-  houver migração) + `systemctl restart tiny-mirror`. Deploy parcial = drift = incidente.
+- **Merge na `main` = deploy.** O CI (`.github/workflows/deploy.yml`) faz `rsync --delete`
+  da `main` inteira para `/opt/tiny-mirror/current/` + `alembic upgrade head` + restart.
+  Hotfix aplicado só em produção é REVERTIDO no próximo merge — antes de mergear, simular
+  (`rsync -n -c --delete` de um `git archive` da branch contra a VPS) e conferir que só
+  mudam os arquivos do PR. Deploy manual (arquivo→arquivo de TODOS os arquivos tocados)
+  só com `[skip ci]` no merge. Deploy parcial = drift = incidente.
 
 ## Toolchain e gates (pre-commit espelha o CI)
 
@@ -63,7 +68,12 @@ poetry run pytest tests/unit -m unit --cov=src/tiny_mirror --cov-fail-under=35 -
   — consumers RabbitMQ. Consumer novo = sincronizar bootstrap + topology + publisher;
   `sync_type` novo = migração para o CHECK constraint.
 - `alembic/versions/` — migrações de schema.
-- Peculiaridades Tiny: `dataAtualizacao` só aceita `YYYY-MM-DD`; client já retenta
+- Peculiaridades Tiny: `dataAtualizacao` só aceita `YYYY-MM-DD` e significa "atualizado
+  DESDE a data"; excluir NF antiga no Tiny zera o `idNotaFiscal` do pedido e o "atualiza"
+  (tempestade de 30/09 → corte por idade no sync). **Webhook de situação de pedido do
+  Tiny NÃO é usado** (não chega/não é confiável): mudança de situação é detectada pelo
+  sync incremental comparando a `situacao` da listagem com o espelho. Pedido do Tiny não
+  tem hora (v2 e v3) — hora exata vem do ML (`v_order_datetime`). Client já retenta
   status transientes sob um budget único de retries.
 
 ## Contexto de equipe
