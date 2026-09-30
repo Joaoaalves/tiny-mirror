@@ -257,6 +257,12 @@ class Settings(BaseSettings):
     sync_ml_orders_reconcile_cron: str = "15 6 * * 0"
     sync_ml_orders_reconcile_days: int = 90
 
+    # Daily visits per listing (ml_item_visits_daily), re-reading the last few
+    # days so the partial "today" gets completed. Initial history:
+    # POST /sync/ml-visits {"days": 150} (ML max).
+    sync_ml_visits_cron: str = "10 7 * * *"
+    sync_ml_visits_window_days: int = 3
+
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.
     ml_fl_ignore_days: int = 7

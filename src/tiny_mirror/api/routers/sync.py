@@ -404,6 +404,38 @@ async def sync_ml_orders(
     return {"message": f"ML orders backfill triggered (days={body.days})", "days": body.days}
 
 
+class MlVisitsSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    days: int = Field(default=150, ge=1, le=150)
+
+
+@router.post("/ml-visits", status_code=status.HTTP_202_ACCEPTED)
+async def sync_ml_visits(
+    request: Request,
+    background: BackgroundTasks,
+    body: MlVisitsSyncRequest = Body(default_factory=MlVisitsSyncRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``ml_item_visits_daily`` for the last ``days`` days (ML allows at
+    most 150). Read-only on ML; one GET per listing. Runs in background."""
+    await _acquire_sync_lock(redis_client, "ml_visits")
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    http_client = getattr(request.app.state, "http_client", None)
+    if ml_token_service is None or http_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML credentials not configured",
+        )
+
+    from tiny_mirror.services.ml_visits_sync_service import MLVisitsSyncService
+
+    service = MLVisitsSyncService(token_service=ml_token_service, http_client=http_client)
+    background.add_task(service.sync, days=body.days)
+    logger.info("ML visits backfill triggered", days=body.days)
+    return {"message": f"ML visits backfill triggered (days={body.days})", "days": body.days}
+
+
 @router.post(
     "/stock",
     status_code=status.HTTP_202_ACCEPTED,
