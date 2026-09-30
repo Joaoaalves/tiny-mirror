@@ -267,6 +267,9 @@ class Settings(BaseSettings):
     sync_ml_account_health_cron: str = "30 7 * * *"
     # Daily listing health (moderation/tags, quality, purchase experience).
     sync_ml_item_health_cron: str = "50 7 * * *"
+    # ML claims (reclamações/devoluções with reason), incremental by
+    # last_updated; the first run loads the whole history.
+    sync_ml_claims_cron: str = "40 */2 * * *"
 
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.

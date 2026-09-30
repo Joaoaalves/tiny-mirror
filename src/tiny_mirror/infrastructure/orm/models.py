@@ -1327,6 +1327,56 @@ class MLItemHealthORM(Base):
     )
 
 
+class MLClaimORM(Base):
+    __tablename__ = "ml_claims"
+    __table_args__ = (
+        Index("ix_ml_claims_resource_id", "resource_id"),
+        Index("ix_ml_claims_date_created", "date_created"),
+        Index("ix_ml_claims_reason_id", "reason_id"),
+        {
+            "comment": (
+                "Reclamações/mediações/devoluções do ML (/post-purchase/v1/claims). "
+                "resource_id = order_id do ML quando resource='order' (liga em "
+                "ml_orders/ml_order_items para MLB e SKU). Motivo em ml_claim_reasons."
+            ),
+        },
+    )
+
+    claim_id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=False)
+    type: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    stage: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    reason_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    resource: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    resource_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    parent_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    fulfilled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    quantity_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    date_created: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_updated: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # {reason, date_created, benefited, closed_by, applied_coverage}
+    resolution: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MLClaimReasonORM(Base):
+    __tablename__ = "ml_claim_reasons"
+    __table_args__ = (
+        {"comment": "Catálogo dos motivos de reclamação do ML (/post-purchase/v1/claims/reasons)."},
+    )
+
+    reason_id: Mapped[str] = mapped_column(String(30), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+    flow: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 # ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------
