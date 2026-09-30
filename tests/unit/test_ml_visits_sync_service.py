@@ -90,7 +90,7 @@ async def test_sync_fetches_every_listing_and_counts_failures() -> None:
         mlb = request.url.path.split("/")[2]
         seen.append((mlb, request.url.params["last"]))
         if mlb == "MLB2":
-            return httpx.Response(429)
+            return httpx.Response(404)
         return httpx.Response(200, json=WINDOW)
 
     service = _service(handler)
@@ -140,3 +140,60 @@ async def test_expired_token_is_refreshed() -> None:
 
     assert rows is not None and len(rows) == 3
     assert auth == ["Bearer tok", "Bearer tok2"]
+
+
+# ---------------------------------------------------------------------------
+# 429 handling (2026-09-30: 236/623 listings got 429 on the first backfill)
+# ---------------------------------------------------------------------------
+async def test_rate_limited_listing_is_retried_with_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+    answers = iter([429, 429, 200])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = next(answers)
+        headers = {"Retry-After": "3"} if len(sleeps) == 0 and status == 429 else {}
+        return httpx.Response(status, json=WINDOW if status == 200 else {}, headers=headers)
+
+    rows = await _service(handler)._fetch("MLB1", 3)
+
+    assert rows is not None and len(rows) == 3
+    assert sleeps[0] == 3.0  # Retry-After honoured
+    assert 2.0 <= sleeps[1] <= 2.5  # then exponential with jitter
+
+
+async def test_rate_limit_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+
+    rows = await _service(lambda r: httpx.Response(429))._fetch("MLB1", 3)
+
+    assert rows is None
+    assert len(sleeps) == mod._MAX_ATTEMPTS - 1
+    assert all(s <= mod._MAX_BACKOFF_SECONDS for s in sleeps)
+
+
+async def test_other_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        raise AssertionError("must not sleep")
+
+    monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(404)
+
+    assert await _service(handler)._fetch("MLB1", 3) is None
+    assert len(calls) == 1
