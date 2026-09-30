@@ -8,6 +8,7 @@ depend on these abstractions so they can be unit-tested with simple fakes
 from __future__ import annotations
 
 import abc
+from datetime import date
 from typing import Any
 
 from tiny_mirror.domain.models import OAuthToken
@@ -91,8 +92,17 @@ class OrderRepository(abc.ABC):
     """Persistence contract for orders and their line items."""
 
     @abc.abstractmethod
-    async def upsert(self, order_data: dict[str, Any]) -> str:
-        """Insert or update an order row. Returns ``"created"`` or ``"updated"``."""
+    async def upsert(
+        self,
+        order_data: dict[str, Any],
+        *,
+        invoice_link_frozen_before: date | None = None,
+    ) -> str:
+        """Insert or update an order row. Returns ``"created"`` or ``"updated"``.
+
+        With ``invoice_link_frozen_before``, an existing order dated before
+        it keeps its NF link when Tiny sends ``idNotaFiscal`` 0/None.
+        """
 
     @abc.abstractmethod
     async def upsert_items(self, order_tiny_id: int, items: list[dict[str, Any]]) -> None:
