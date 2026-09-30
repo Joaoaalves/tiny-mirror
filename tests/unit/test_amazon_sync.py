@@ -205,7 +205,7 @@ async def test_orders_pagination_repeats_filters_and_included_data(tmp_path: Pat
         )
 
     service = AmazonSyncService(_client(tmp_path, handler))
-    with patch.object(svc_mod, "_upsert", AsyncMock()) as upsert:
+    with patch.object(svc_mod, "upsert", AsyncMock()) as upsert:
         stats = await service.sync_orders(updated_hours=3)
 
     assert stats == {"orders": 2, "mode": "updated"}
@@ -225,7 +225,7 @@ async def test_backfill_uses_created_after(tmp_path: Path) -> None:
         seen.append(dict(request.url.params))
         return httpx.Response(200, json={"orders": [], "pagination": {}})
 
-    with patch.object(svc_mod, "_upsert", AsyncMock()):
+    with patch.object(svc_mod, "upsert", AsyncMock()):
         stats = await AmazonSyncService(_client(tmp_path, handler)).sync_orders(created_days=90)
 
     assert "createdAfter" in seen[0] and "lastUpdatedAfter" not in seen[0]
@@ -247,13 +247,13 @@ async def test_listings_full_pass_prunes_missing_skus(tmp_path: Path) -> None:
         return httpx.Response(200, json=next(pages))
 
     with (
-        patch.object(svc_mod, "_upsert", AsyncMock()),
-        patch.object(svc_mod, "_prune_listings", AsyncMock(return_value=4)) as prune,
+        patch.object(svc_mod, "upsert", AsyncMock()),
+        patch.object(svc_mod, "prune_listings", AsyncMock(return_value=4)) as prune,
     ):
         stats = await AmazonSyncService(_client(tmp_path, handler)).sync_listings()
 
     assert stats == {"listings": 2, "active": 2, "removed": 4, "complete": True}
-    assert prune.await_args.args[0] == {("5U-NIT-PT-RSP-TRV-500-N", ""), ("OTHER", "")}
+    assert prune.await_args.args == ("amazon", {("5U-NIT-PT-RSP-TRV-500-N", ""), ("OTHER", "")})
 
 
 # ---------------------------------------------------------------------------

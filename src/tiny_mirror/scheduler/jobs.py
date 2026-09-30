@@ -152,6 +152,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "amazon_listings": CronTrigger.from_crontab(
                 settings.sync_amazon_listings_cron, timezone="UTC"
             ),
+            "shopee_orders": CronTrigger.from_crontab(
+                settings.sync_shopee_orders_cron, timezone="UTC"
+            ),
+            "shopee_listings": CronTrigger.from_crontab(
+                settings.sync_shopee_listings_cron, timezone="UTC"
+            ),
             "ml_panel_scrape": CronTrigger.from_crontab(
                 settings.ml_panel_scrape_cron, timezone="UTC"
             ),
@@ -271,6 +277,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _amazon_listings() -> None:
         await amazon_sync_job(http_client, "listings")
+
+    async def _shopee_orders() -> None:
+        await shopee_sync_job(http_client, "orders")
+
+    async def _shopee_listings() -> None:
+        await shopee_sync_job(http_client, "listings")
 
     async def _ml_panel_scrape() -> None:
         await ml_panel_scrape_job(http_client)
@@ -453,6 +465,18 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _amazon_listings,
         trigger=triggers["amazon_listings"],
         id="amazon_listings",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _shopee_orders,
+        trigger=triggers["shopee_orders"],
+        id="shopee_orders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _shopee_listings,
+        trigger=triggers["shopee_listings"],
+        id="shopee_listings",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1203,6 +1227,38 @@ async def amazon_sync_job(http_client: Any, what: str) -> None:
         await service.sync_orders(updated_hours=settings.sync_amazon_orders_updated_hours)
     else:
         await service.sync_listings()
+
+
+def shopee_service(http_client: Any) -> Any:
+    """ShopeeSyncService over the exported credentials, or None if not exported."""
+    from tiny_mirror.infrastructure.external.marketplace_credentials import (
+        MarketplaceCredentials,
+    )
+    from tiny_mirror.infrastructure.external.shopee_client import ShopeeClient
+    from tiny_mirror.services.shopee_sync_service import ShopeeSyncService
+
+    creds = MarketplaceCredentials(settings.marketplace_credentials_file)
+    if http_client is None or creds.section("shopee_seller") is None:
+        return None
+    return ShopeeSyncService(ShopeeClient(http_client, creds))
+
+
+async def shopee_sync_job(http_client: Any, what: str) -> None:
+    """Shopee orders (hourly, by update time) or listings (daily). Read-only.
+    An expired exported token skips the run: OpenClaw refreshes it, never us."""
+    from tiny_mirror.infrastructure.external.shopee_client import ShopeeTokenExpired
+
+    service = shopee_service(http_client)
+    if service is None:
+        logger.debug("Shopee sync skipped: credentials not exported")
+        return
+    try:
+        if what == "orders":
+            await service.sync_orders(updated_hours=settings.sync_shopee_orders_updated_hours)
+        else:
+            await service.sync_listings()
+    except ShopeeTokenExpired as exc:
+        logger.warning("Shopee sync skipped: exported token expired", error=str(exc))
 
 
 async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:

@@ -17,12 +17,10 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import structlog
-from sqlalchemy import delete, tuple_
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.external.amazon_spapi_client import AmazonSPAPIClient
 from tiny_mirror.infrastructure.orm.models import MPListingORM, MPOrderORM
+from tiny_mirror.services.marketplace_store import prune_listings, upsert
 
 logger = structlog.get_logger(__name__)
 
@@ -66,7 +64,7 @@ class AmazonSyncService:
             # Same filters + includedData on every page, or later pages lose
             # fulfillment/proceeds.
             params = {**base, "paginationToken": token}
-        await _upsert(MPOrderORM, list(rows.values()), ["channel", "order_id"])
+        await upsert(MPOrderORM, list(rows.values()), ["channel", "order_id"])
         stats = {"orders": len(rows), "mode": "created" if created_days else "updated"}
         logger.info("amazon.orders_synced", **stats)
         return stats
@@ -90,10 +88,12 @@ class AmazonSyncService:
                 complete = True
                 break
             params = {**params, "pageToken": token}
-        await _upsert(MPListingORM, rows, ["channel", "listing_id", "variation_id"])
+        await upsert(MPListingORM, rows, ["channel", "listing_id", "variation_id"])
         removed = 0
         if complete and rows:
-            removed = await _prune_listings({(r["listing_id"], r["variation_id"]) for r in rows})
+            removed = await prune_listings(
+                CHANNEL, {(r["listing_id"], r["variation_id"]) for r in rows}
+            )
         stats = {
             "listings": len(rows),
             "active": sum(1 for r in rows if r["is_active"]),
@@ -102,37 +102,6 @@ class AmazonSyncService:
         }
         logger.info("amazon.listings_synced", **stats)
         return stats
-
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-async def _upsert(model: Any, rows: list[dict[str, Any]], keys: list[str]) -> None:
-    if not rows:
-        return
-    async with AsyncSessionLocal() as session:
-        for i in range(0, len(rows), 500):
-            chunk = rows[i : i + 500]
-            stmt = pg_insert(model).values(chunk)
-            stmt = stmt.on_conflict_do_update(
-                index_elements=keys,
-                set_={c: stmt.excluded[c] for c in chunk[0] if c not in keys},
-            )
-            await session.execute(stmt)
-        await session.commit()
-
-
-async def _prune_listings(seen: set[tuple[str, str]]) -> int:
-    """Drop this channel's listings that a complete pass no longer returned."""
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            delete(MPListingORM).where(
-                MPListingORM.channel == CHANNEL,
-                tuple_(MPListingORM.listing_id, MPListingORM.variation_id).not_in(list(seen)),
-            )
-        )
-        await session.commit()
-        return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
