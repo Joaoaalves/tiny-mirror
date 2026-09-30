@@ -99,8 +99,10 @@ async def test_refresh_upserts_every_item_and_returns_stats(monkeypatch) -> None
 
 @pytest.mark.asyncio
 async def test_refresh_skips_malformed_mlb_ids(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Spreadsheet sometimes has cells like 'MLB123 / 456' that must not
-    reach the DB (mlb_id is varchar(20))."""
+    """Spreadsheet sometimes has cells like 'MLB123 / 456'. A cell that only
+    repeats the same listing normalizes to it; anything else that is not a
+    single MLB id must not reach the DB (mlb_id is varchar(20))."""
+    monkeypatch.delenv("ML_COST_ID_ALIASES_PATH", raising=False)
     payload = {
         "items": {
             "MLB3884049149": {"sku": "OK", "active": True, "baseCost": 10},
@@ -125,9 +127,9 @@ async def test_refresh_skips_malformed_mlb_ids(monkeypatch) -> None:  # type: ig
     session.commit = AsyncMock()
     session.execute = AsyncMock(return_value=MagicMock(all=MagicMock(return_value=[])))
     stats = await refresh_all_from_bulk(session, _fake_gas(payload))
-    assert calls == ["MLB3884049149"]
-    assert stats["skipped_invalid_id"] == 2
-    assert stats["upserted"] == 1
+    assert calls == ["MLB3884049149", "MLB4078501557"]
+    assert stats["skipped_invalid_id"] == 1
+    assert stats["upserted"] == 2
 
 
 @pytest.mark.asyncio

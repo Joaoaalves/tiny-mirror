@@ -16,8 +16,11 @@ around for ad-hoc one-MLB refreshes.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -115,6 +118,72 @@ def _assert_payload_sane(items: dict[str, Any]) -> dict[str, float]:
     return ratios
 
 
+def _load_cost_id_aliases() -> list[dict[str, Any]]:
+    """Keep operator-verified aliases in deployment configuration, not source."""
+    path = os.environ.get("ML_COST_ID_ALIASES_PATH")
+    if not path:
+        return []
+    try:
+        aliases = json.loads(Path(path).read_text())
+        if not isinstance(aliases, list):
+            raise ValueError("Expected alias list")
+        seen = set()
+        for alias in aliases:
+            if not isinstance(alias, dict) or not isinstance(alias.get("ids"), list):
+                raise ValueError("Expected alias IDs")
+            ids = alias["ids"]
+            if len(ids) < 2 or not all(
+                isinstance(x, str) and _VALID_MLB_RE.fullmatch(x) for x in ids
+            ):
+                raise ValueError("Invalid alias IDs")
+            if (
+                alias.get("target") not in ids
+                or not isinstance(alias.get("sku"), str)
+                or not alias["sku"]
+            ):
+                raise ValueError("Invalid alias target or SKU")
+            key = frozenset(ids)
+            if key in seen:
+                raise ValueError("Duplicate alias")
+            seen.add(key)
+        return aliases
+    except (OSError, ValueError, TypeError) as exc:
+        raise CostRefreshError("Invalid cost ID alias configuration; refresh aborted") from exc
+
+
+def _normalize_cost_ids(
+    items: dict[str, Any], aliases: list[dict[str, Any]] | None = None
+) -> tuple[dict[str, Any], int]:
+    """Normalize syntax; resolve only explicitly verified aliases for the same SKU.
+
+    Reject collisions before writes. Unknown multi-ad cells remain invalid.
+    """
+    if aliases is None:
+        aliases = _load_cost_id_aliases()
+    lookup = {frozenset(alias["ids"]): alias for alias in aliases}
+    normalized: dict[str, Any] = {}
+    changed = 0
+    for raw, row in items.items():
+        parts = [part.strip().upper() for part in raw.split("/")]
+        ids = [part if part.startswith("MLB") else "MLB" + part for part in parts]
+        target = raw
+        if ids and all(_VALID_MLB_RE.fullmatch(part) for part in ids):
+            unique = set(ids)
+            if len(unique) == 1:
+                target = ids[0]
+            elif frozenset(unique) in lookup and isinstance(row, dict):
+                alias = lookup[frozenset(unique)]
+                if row.get("sku") == alias["sku"]:
+                    target = alias["target"]
+        if isinstance(row, dict) and "mlbId" in row:
+            row = {**row, "mlbId": target}
+        if target in normalized and normalized[target] != row:
+            raise CostRefreshError(f"Conflicting spreadsheet rows for {target}; refresh aborted")
+        normalized[target] = row
+        changed += target != raw
+    return normalized, changed
+
+
 def _decimal(v: Any) -> Decimal | None:
     if v is None:
         return None
@@ -159,6 +228,8 @@ async def refresh_all_from_bulk(
     items: dict[str, Any] = payload.get("items") or {}
     # Falha ALTO se a forma do payload indicar layout mudado — antes de gravar.
     ratios = _assert_payload_sane(items)
+    received = len(items)
+    items, normalized_ids = _normalize_cost_ids(items)
 
     snap_repo = MLCostsSnapshotRepository(session)
     ok = 0
@@ -220,7 +291,7 @@ async def refresh_all_from_bulk(
     await session.commit()
 
     stats = {
-        "received": len(items),
+        "received": received,
         "upserted": ok,
         "sku_fallback_upserts": sku_fallback,
         "skipped_no_data": skipped_no_data,
@@ -228,6 +299,7 @@ async def refresh_all_from_bulk(
     }
     logger.info(
         "cost_refresh_bulk_ok",
+        normalized_ids=normalized_ids,
         difal_pct=payload.get("difalPct"),
         generated_at=payload.get("generatedAt"),
         **stats,
