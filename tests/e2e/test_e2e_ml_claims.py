@@ -57,3 +57,21 @@ async def test_live_claims_sync_is_incremental(live_claims_service: MLClaimsSync
             )
         ).scalar_one()
     assert missing_reason == 0
+
+
+async def test_shipment_claims_reach_the_sku(live_claims_service: MLClaimsSyncService) -> None:
+    """Claims with resource='shipment' link through ml_orders.shipping_id."""
+    await live_claims_service.sync()
+    async with AsyncSessionLocal() as session:
+        unlinked = (
+            await session.execute(
+                text(
+                    "SELECT count(*) FROM ml_claims c "
+                    "JOIN ml_orders o ON o.shipping_id = c.resource_id "
+                    "WHERE c.resource = 'shipment' AND NOT EXISTS ("
+                    "  SELECT 1 FROM v_ml_claims v "
+                    "  WHERE v.claim_id = c.claim_id AND v.seller_sku IS NOT NULL)"
+                )
+            )
+        ).scalar_one()
+    assert unlinked == 0
