@@ -436,6 +436,33 @@ async def sync_ml_visits(
     return {"message": f"ML visits backfill triggered (days={body.days})", "days": body.days}
 
 
+@router.post("/ml-account", status_code=status.HTTP_202_ACCEPTED)
+async def sync_ml_account(
+    request: Request,
+    background: BackgroundTasks,
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Refresh the ML reputation snapshot and mirror new infractions (the first
+    run loads the whole infraction history). Read-only on ML."""
+    await _acquire_sync_lock(redis_client, "ml_account")
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    http_client = getattr(request.app.state, "http_client", None)
+    if ml_token_service is None or http_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML credentials not configured",
+        )
+
+    from tiny_mirror.services.ml_account_health_service import MLAccountHealthService
+
+    service = MLAccountHealthService(
+        token_service=ml_token_service, http_client=http_client, ml_user_id=settings.ml_user_id
+    )
+    background.add_task(service.sync)
+    logger.info("ML account health sync triggered")
+    return {"message": "ML account health sync triggered"}
+
+
 @router.post(
     "/stock",
     status_code=status.HTTP_202_ACCEPTED,

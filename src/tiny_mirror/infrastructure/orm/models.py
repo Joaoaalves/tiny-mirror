@@ -1231,6 +1231,62 @@ class MLItemVisitsDailyORM(Base):
     )
 
 
+class MLSellerReputationDailyORM(Base):
+    __tablename__ = "ml_seller_reputation_daily"
+    __table_args__ = (
+        {
+            "comment": (
+                "Snapshot diário (data BRT) da reputação da conta no ML, de "
+                "/users/{id}.seller_reputation: nível, medalha, transações, "
+                "avaliações e métricas (vendas, reclamações, atrasos, cancelamentos)."
+            ),
+        },
+    )
+
+    snapshot_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    level_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    power_seller_status: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    transactions_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    transactions_completed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    transactions_canceled: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rating_positive: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+    rating_neutral: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+    rating_negative: Mapped[Decimal | None] = mapped_column(Numeric(6, 4), nullable=True)
+    # {sales, claims, delayed_handling_time, cancellations} com rate/value/period.
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MLInfractionORM(Base):
+    __tablename__ = "ml_infractions"
+    __table_args__ = (
+        Index("ix_ml_infractions_date_created", "date_created"),
+        Index("ix_ml_infractions_related_item", "related_item_id"),
+        {
+            "comment": (
+                "Infrações/moderações da conta no ML, de "
+                "/moderations/infractions/{user_id}. related_item_id = MLB afetado."
+            ),
+        },
+    )
+
+    infraction_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    date_created: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    element_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    element_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    filter_subgroup: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    remedy: Mapped[str | None] = mapped_column(Text, nullable=True)
+    related_item_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 # ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------

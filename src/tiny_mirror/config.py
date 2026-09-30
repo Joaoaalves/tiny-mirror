@@ -263,6 +263,9 @@ class Settings(BaseSettings):
     sync_ml_visits_cron: str = "10 7 * * *"
     sync_ml_visits_window_days: int = 3
 
+    # Daily ML account health: reputation snapshot + new infractions.
+    sync_ml_account_health_cron: str = "30 7 * * *"
+
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.
     ml_fl_ignore_days: int = 7
