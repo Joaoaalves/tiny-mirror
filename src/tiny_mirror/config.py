@@ -271,6 +271,16 @@ class Settings(BaseSettings):
     # last_updated; the first run loads the whole history.
     sync_ml_claims_cron: str = "40 */2 * * *"
 
+    # Other marketplaces. Credentials are OWNED by OpenClaw and exported
+    # read-only by a root cron (deploy/export_marketplace_credentials.py); a
+    # missing file simply disables these jobs.
+    marketplace_credentials_file: str = "/opt/tiny-mirror/marketplace-credentials.json"
+    # Amazon orders: hourly by lastUpdatedAfter (new + status changes).
+    # Initial history: POST /sync/amazon-orders {"days": 90}.
+    sync_amazon_orders_cron: str = "25 * * * *"
+    sync_amazon_orders_updated_hours: int = 3
+    sync_amazon_listings_cron: str = "20 8 * * *"
+
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.
     ml_fl_ignore_days: int = 7

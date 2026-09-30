@@ -146,6 +146,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
                 settings.sync_ml_item_health_cron, timezone="UTC"
             ),
             "ml_claims": CronTrigger.from_crontab(settings.sync_ml_claims_cron, timezone="UTC"),
+            "amazon_orders": CronTrigger.from_crontab(
+                settings.sync_amazon_orders_cron, timezone="UTC"
+            ),
+            "amazon_listings": CronTrigger.from_crontab(
+                settings.sync_amazon_listings_cron, timezone="UTC"
+            ),
             "ml_panel_scrape": CronTrigger.from_crontab(
                 settings.ml_panel_scrape_cron, timezone="UTC"
             ),
@@ -259,6 +265,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _ml_claims() -> None:
         await ml_claims_sync_job(http_client, app.state.ml_token_service)
+
+    async def _amazon_orders() -> None:
+        await amazon_sync_job(http_client, "orders")
+
+    async def _amazon_listings() -> None:
+        await amazon_sync_job(http_client, "listings")
 
     async def _ml_panel_scrape() -> None:
         await ml_panel_scrape_job(http_client)
@@ -429,6 +441,18 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _ml_claims,
         trigger=triggers["ml_claims"],
         id="ml_claims",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _amazon_orders,
+        trigger=triggers["amazon_orders"],
+        id="amazon_orders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _amazon_listings,
+        trigger=triggers["amazon_listings"],
+        id="amazon_listings",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1153,6 +1177,32 @@ async def ml_claims_sync_job(http_client: Any, ml_token_service: Any) -> None:
     from tiny_mirror.services.ml_claims_sync_service import MLClaimsSyncService
 
     await MLClaimsSyncService(token_service=ml_token_service, http_client=http_client).sync()
+
+
+def amazon_service(http_client: Any) -> Any:
+    """AmazonSyncService over the exported credentials, or None if not exported."""
+    from tiny_mirror.infrastructure.external.amazon_spapi_client import AmazonSPAPIClient
+    from tiny_mirror.infrastructure.external.marketplace_credentials import (
+        MarketplaceCredentials,
+    )
+    from tiny_mirror.services.amazon_sync_service import AmazonSyncService
+
+    creds = MarketplaceCredentials(settings.marketplace_credentials_file)
+    if http_client is None or creds.section("amazon_spapi") is None:
+        return None
+    return AmazonSyncService(AmazonSPAPIClient(http_client, creds))
+
+
+async def amazon_sync_job(http_client: Any, what: str) -> None:
+    """Amazon orders (hourly, by last update) or listings (daily). Read-only."""
+    service = amazon_service(http_client)
+    if service is None:
+        logger.debug("Amazon sync skipped: credentials not exported")
+        return
+    if what == "orders":
+        await service.sync_orders(updated_hours=settings.sync_amazon_orders_updated_hours)
+    else:
+        await service.sync_listings()
 
 
 async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:

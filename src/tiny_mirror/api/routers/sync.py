@@ -516,6 +516,56 @@ async def sync_ml_claims(
     return {"message": "ML claims sync triggered"}
 
 
+class AmazonOrdersRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    days: int = Field(default=90, ge=1, le=730)
+
+
+@router.post("/amazon-orders", status_code=status.HTTP_202_ACCEPTED)
+async def sync_amazon_orders(
+    request: Request,
+    background: BackgroundTasks,
+    body: AmazonOrdersRequest = Body(default_factory=AmazonOrdersRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``mp_orders`` (Amazon) for orders created in the last ``days``
+    days. Read-only on Amazon; runs in background."""
+    from tiny_mirror.scheduler.jobs import amazon_service
+
+    service = amazon_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Amazon credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "amazon_orders")
+    background.add_task(service.sync_orders, created_days=body.days)
+    logger.info("Amazon orders backfill triggered", days=body.days)
+    return {"message": f"Amazon orders backfill triggered (days={body.days})", "days": body.days}
+
+
+@router.post("/amazon-listings", status_code=status.HTTP_202_ACCEPTED)
+async def sync_amazon_listings(
+    request: Request,
+    background: BackgroundTasks,
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Refresh ``mp_listings`` for Amazon (full pass). Read-only on Amazon."""
+    from tiny_mirror.scheduler.jobs import amazon_service
+
+    service = amazon_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Amazon credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "amazon_listings")
+    background.add_task(service.sync_listings)
+    logger.info("Amazon listings sync triggered")
+    return {"message": "Amazon listings sync triggered"}
+
+
 class InvoiceItemsBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

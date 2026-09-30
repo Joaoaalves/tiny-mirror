@@ -1378,6 +1378,67 @@ class MLClaimReasonORM(Base):
 
 
 # ---------------------------------------------------------------------------
+# mp_orders / mp_listings — other marketplaces (Amazon, Shopee)
+# ---------------------------------------------------------------------------
+class MPOrderORM(Base):
+    __tablename__ = "mp_orders"
+    __table_args__ = (
+        Index("ix_mp_orders_created_at", "created_at"),
+        Index("ix_mp_orders_order_id", "order_id"),
+        {
+            "comment": (
+                "Pedidos de outros marketplaces (amazon, shopee) direto da API do canal. "
+                "created_at tem hora exata (o Tiny só tem data). Liga no Tiny por "
+                "order_id = orders.ecommerce_order_number."
+            ),
+        },
+    )
+
+    channel: Mapped[str] = mapped_column(String(20), primary_key=True)
+    order_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_updated: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    fulfilled_by: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    total_amount: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class MPListingORM(Base):
+    __tablename__ = "mp_listings"
+    __table_args__ = (
+        Index("ix_mp_listings_sku", "sku"),
+        {
+            "comment": (
+                "Anúncios de outros marketplaces (amazon, shopee), snapshot atual por "
+                "canal. listing_id = SKU do vendedor (amazon) / item_id (shopee); "
+                "variation_id = '' ou model_id (shopee). is_active = vendável agora."
+            ),
+        },
+    )
+
+    channel: Mapped[str] = mapped_column(String(20), primary_key=True)
+    listing_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    variation_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    sku: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    external_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    title: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    price: Mapped[Decimal | None] = mapped_column(Numeric(12, 2), nullable=True)
+    stock: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    synced_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+# ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------
 class MLPromoCapORM(Base):
