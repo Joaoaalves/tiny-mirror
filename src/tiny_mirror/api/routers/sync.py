@@ -372,6 +372,38 @@ async def sync_ml_sales(
     return {"message": f"ML sales backfill triggered (days={body.days})", "days": body.days}
 
 
+@router.post("/ml-orders", status_code=status.HTTP_202_ACCEPTED)
+async def sync_ml_orders(
+    request: Request,
+    background: BackgroundTasks,
+    body: MlSalesSyncRequest = Body(default_factory=MlSalesSyncRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``ml_orders`` / ``ml_order_items`` / ``ml_shipments`` from the
+    ML Orders API for the last ``days`` days. Read-only on ML (GET only);
+    writes only our mirror. Runs in background; re-runnable (upserts).
+    """
+    await _acquire_sync_lock(redis_client, "ml_orders")
+    ml_token_service = getattr(request.app.state, "ml_token_service", None)
+    http_client = getattr(request.app.state, "http_client", None)
+    if ml_token_service is None or http_client is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="ML credentials not configured",
+        )
+
+    from tiny_mirror.services.ml_order_sync_service import MLOrderSyncService
+
+    service = MLOrderSyncService(
+        token_service=ml_token_service,
+        http_client=http_client,
+        ml_user_id=settings.ml_user_id,
+    )
+    background.add_task(service.sync, days=body.days)
+    logger.info("ML orders backfill triggered", days=body.days)
+    return {"message": f"ML orders backfill triggered (days={body.days})", "days": body.days}
+
+
 @router.post(
     "/stock",
     status_code=status.HTTP_202_ACCEPTED,

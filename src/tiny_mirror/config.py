@@ -248,6 +248,15 @@ class Settings(BaseSettings):
     sync_ml_sales_reconcile_cron: str = "30 5 * * 0"
     sync_ml_sales_reconcile_days: int = 90
 
+    # Per-order ML data (exact order time, commission, seller freight, cancel
+    # reason) into ml_orders/items/shipments. Hourly over a short window for
+    # new orders + weekly wider pass for late cancellations. Initial history:
+    # POST /sync/ml-orders {"days": 90}.
+    sync_ml_orders_cron: str = "20 * * * *"
+    sync_ml_orders_window_days: int = 2
+    sync_ml_orders_reconcile_cron: str = "15 6 * * 0"
+    sync_ml_orders_reconcile_days: int = 90
+
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.
     ml_fl_ignore_days: int = 7
