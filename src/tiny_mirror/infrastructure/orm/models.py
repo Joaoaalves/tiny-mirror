@@ -1210,6 +1210,27 @@ class MLShipmentORM(Base):
     )
 
 
+class MLItemVisitsDailyORM(Base):
+    __tablename__ = "ml_item_visits_daily"
+    __table_args__ = (
+        Index("ix_ml_item_visits_daily_date", "visit_date"),
+        {
+            "comment": (
+                "Visitas diárias por anúncio (MLB), de /items/{id}/visits/time_window "
+                "do ML. O dia corrente é parcial e é regravado na rodada seguinte. "
+                "Conversão = ml_sales_daily.qty / visits no mesmo (mlb_id, dia)."
+            ),
+        },
+    )
+
+    mlb_id: Mapped[str] = mapped_column(String(20), primary_key=True)
+    visit_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    visits: Mapped[int] = mapped_column(Integer, nullable=False)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 # ---------------------------------------------------------------------------
 # ml_promo_caps
 # ---------------------------------------------------------------------------
