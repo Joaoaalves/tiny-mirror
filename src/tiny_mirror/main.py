@@ -207,6 +207,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         docs_url="/docs" if settings.is_development else None,
         redoc_url=None,
+        openapi_url="/openapi.json" if settings.is_development else None,
     )
 
     app.add_middleware(RequestLoggingMiddleware)
