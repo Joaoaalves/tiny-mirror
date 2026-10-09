@@ -21,6 +21,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import delete
 
+from tiny_mirror.config import settings
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.orm.models import (
     OrderItemORM,
@@ -156,6 +157,20 @@ async def test_request_id_is_propagated_when_supplied_by_client(
 ) -> None:
     response = await http_client.get("/health", headers={"X-Request-Id": "test-fixed-id"})
     assert response.headers.get("X-Request-Id") == "test-fixed-id"
+
+
+async def test_openapi_schema_is_not_served_in_production(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "app_env", "production")
+    app = create_app()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for path in ("/openapi.json", "/docs"):
+            response = await client.get(path)
+            assert response.status_code == 404, path
 
 
 # ---------------------------------------------------------------------------
