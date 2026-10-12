@@ -25,6 +25,8 @@ done
 cd "$(git rev-parse --show-toplevel)"
 git fetch -q origin
 SRC="$(mktemp -d)"
+# mktemp cria 700; sem isso o rsync fecharia current/ para o usuário do serviço.
+chmod 755 "$SRC"
 trap 'rm -rf "$SRC"' EXIT
 git archive "$REF" | tar -x -C "$SRC"
 echo "→ $REF = $(git rev-parse --short "$REF")"
