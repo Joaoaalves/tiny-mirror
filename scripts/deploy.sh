@@ -40,8 +40,9 @@ EXCLUDES=(
 )
 
 # O rsync remoto roda como tiny-deploy, dono dos arquivos como o CI deixava;
-# rodar como root quebra o próximo deploy (exit 23 por permissão).
-RSYNC=(rsync -rlptzc --no-owner --no-group --delete --itemize-changes
+# rodar como root quebra o próximo deploy (exit 23 por permissão). go-w tira a
+# escrita de grupo que o umask 002 do export deixaria no código.
+RSYNC=(rsync -rlptzc --no-owner --no-group --chmod=go-w --delete --itemize-changes
   --rsync-path="sudo -u tiny-deploy rsync" "${EXCLUDES[@]}")
 
 if [[ "$DRY" == "1" ]]; then
