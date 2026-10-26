@@ -7,8 +7,8 @@ token raises :class:`TikTokTokenExpired` and the run is skipped until the
 next export.
 
 The OAuth grant carries write scopes (products, promotions, fulfilment), so
-only the search endpoints in ``READ_PATHS`` can be called: they are POSTs
-that read. Signature: HMAC-SHA256(app_secret, app_secret + path + sorted
+only reads can be called: the search endpoints in ``READ_PATHS`` (POSTs that
+read) and the product detail GET (``get_product``). Signature: HMAC-SHA256(app_secret, app_secret + path + sorted
 query key+value pairs (without ``sign``/``access_token``) + body + app_secret).
 """
 
@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import random
+import re
 import time
 from typing import Any
 
@@ -33,6 +34,8 @@ BASE = "https://open-api.tiktokglobalshop.com"
 ORDERS_SEARCH = "/order/202309/orders/search"
 PRODUCTS_SEARCH = "/product/202309/products/search"
 READ_PATHS = frozenset({ORDERS_SEARCH, PRODUCTS_SEARCH})
+PRODUCT_DETAIL = "/product/202309/products/{product_id}"
+_PRODUCT_ID = re.compile(r"\d{1,30}")
 _MAX_ATTEMPTS = 4
 _MAX_BACKOFF_SECONDS = 30.0
 _TOKEN_MARGIN_SECONDS = 60
@@ -76,7 +79,17 @@ class TikTokShopClient:
     ) -> dict[str, Any]:
         if path not in READ_PATHS:
             raise ValueError(f"{path} is not a read endpoint")
-        payload = json.dumps(body, separators=(",", ":"))
+        return await self._call("POST", path, params, json.dumps(body, separators=(",", ":")))
+
+    async def get_product(self, product_id: str) -> dict[str, Any]:
+        """Product detail (images, variation names, attributes, package...). GET only."""
+        if not _PRODUCT_ID.fullmatch(product_id):
+            raise ValueError(f"invalid product id {product_id!r}")
+        return await self._call("GET", PRODUCT_DETAIL.format(product_id=product_id), {}, "")
+
+    async def _call(
+        self, method: str, path: str, params: dict[str, Any], payload: str
+    ) -> dict[str, Any]:
         for attempt in range(_MAX_ATTEMPTS):
             c = self.credentials()
             query = {
@@ -86,10 +99,11 @@ class TikTokShopClient:
                 "shop_cipher": c["shop_cipher"],
             }
             query["sign"] = signature(c["app_secret"], path, query, payload)
-            r = await self._http.post(
+            r = await self._http.request(
+                method,
                 f"{BASE}{path}",
                 params=query,
-                content=payload,
+                content=payload or None,
                 headers={
                     "x-tts-access-token": c["access_token"],
                     "content-type": "application/json",
