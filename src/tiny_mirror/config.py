@@ -285,6 +285,11 @@ class Settings(BaseSettings):
     sync_shopee_orders_cron: str = "35 * * * *"
     sync_shopee_orders_updated_hours: int = 3
     sync_shopee_listings_cron: str = "40 8 * * *"
+    # TikTok Shop: same shape as Shopee. Initial history:
+    # POST /sync/tiktok-orders {"days": 90}.
+    sync_tiktok_orders_cron: str = "45 * * * *"
+    sync_tiktok_orders_updated_hours: int = 3
+    sync_tiktok_listings_cron: str = "50 8 * * *"
 
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.
