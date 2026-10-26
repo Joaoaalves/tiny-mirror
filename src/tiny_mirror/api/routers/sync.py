@@ -610,6 +610,50 @@ async def sync_shopee_listings(
     return {"message": "Shopee listings sync triggered"}
 
 
+@router.post("/tiktok-orders", status_code=status.HTTP_202_ACCEPTED)
+async def sync_tiktok_orders(
+    request: Request,
+    background: BackgroundTasks,
+    body: AmazonOrdersRequest = Body(default_factory=AmazonOrdersRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``mp_orders`` (TikTok Shop) for orders created in the last
+    ``days`` days. Read-only on TikTok; runs in background."""
+    from tiny_mirror.scheduler.jobs import tiktok_service
+
+    service = tiktok_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="TikTok credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "tiktok_orders")
+    background.add_task(service.sync_orders, created_days=body.days)
+    logger.info("TikTok orders backfill triggered", days=body.days)
+    return {"message": f"TikTok orders backfill triggered (days={body.days})", "days": body.days}
+
+
+@router.post("/tiktok-listings", status_code=status.HTTP_202_ACCEPTED)
+async def sync_tiktok_listings(
+    request: Request,
+    background: BackgroundTasks,
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Refresh ``mp_listings`` for TikTok Shop (full pass). Read-only on TikTok."""
+    from tiny_mirror.scheduler.jobs import tiktok_service
+
+    service = tiktok_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="TikTok credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "tiktok_listings")
+    background.add_task(service.sync_listings)
+    logger.info("TikTok listings sync triggered")
+    return {"message": "TikTok listings sync triggered"}
+
+
 class InvoiceItemsBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
