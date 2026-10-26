@@ -312,3 +312,77 @@ def test_exporter_copies_only_what_tiny_mirror_needs(
     }
     assert "refresh_token" not in json.dumps(out["shopee_seller"])
     assert "amazon_ads" not in out and "tiktok_ads" not in out
+
+
+def _write_tiktok(tmp_path: Path, conf: dict[str, Any]) -> None:
+    (tmp_path / "accounts.json").write_text(json.dumps(CREDS))
+    (tmp_path / "shopee.json").write_text(json.dumps({}))
+    (tmp_path / "tiktok_shop.json").write_text(json.dumps(conf))
+
+
+TIKTOK_CONF: dict[str, Any] = {
+    "app_key": "ak",
+    "app_secret": "as",
+    "service_id": "77",
+    "status": "authorized",
+    "auth": {
+        "access_token": "tt-token",
+        "refresh_token": "never-exported",
+        "expires_at": 1_793_000_000_000,
+        "refresh_expires_at": 4_900_000_000_000,
+        "granted_scopes": ["seller.order.info"],
+    },
+    "shops": [{"id": "7496203764540869177", "cipher": "CIPH", "name": "Loja", "region": "BR"}],
+}
+
+
+def test_exporter_copies_tiktok_shop_without_refresh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exporter = _load_exporter()
+    _write_tiktok(tmp_path, TIKTOK_CONF)
+    monkeypatch.setattr(exporter, "SRC", str(tmp_path))
+
+    out = exporter.build()
+
+    assert out["tiktok_shop"] == {
+        "app_key": "ak",
+        "app_secret": "as",
+        "shop_id": "7496203764540869177",
+        "shop_cipher": "CIPH",
+        "access_token": "tt-token",
+        "expires_at": 1_793_000_000,
+    }
+    assert "never-exported" not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    "conf",
+    [
+        {"app_key": "ak", "app_secret": "as", "status": "credentials_saved"},
+        {**TIKTOK_CONF, "shops": []},
+        {**TIKTOK_CONF, "shops": [{"id": "1", "cipher": ""}]},
+        {**TIKTOK_CONF, "auth": {}},
+    ],
+)
+def test_exporter_skips_tiktok_shop_until_authorized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, conf: dict[str, Any]
+) -> None:
+    exporter = _load_exporter()
+    _write_tiktok(tmp_path, conf)
+    monkeypatch.setattr(exporter, "SRC", str(tmp_path))
+
+    assert "tiktok_shop" not in exporter.build()
+
+
+def test_exporter_works_without_tiktok_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exporter = _load_exporter()
+    (tmp_path / "accounts.json").write_text(json.dumps(CREDS))
+    (tmp_path / "shopee.json").write_text(json.dumps({}))
+    monkeypatch.setattr(exporter, "SRC", str(tmp_path))
+
+    out = exporter.build()
+
+    assert "tiktok_shop" not in out and out["amazon_spapi"] == CREDS["amazon_spapi"]
