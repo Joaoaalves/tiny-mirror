@@ -58,3 +58,34 @@ async def test_live_listings_full_pass(live_tiktok: TikTokSyncService) -> None:
             )
         ).scalar_one()
     assert stored == stats["listings"] >= stats["products"]
+
+    async with AsyncSessionLocal() as session:
+        with_detail = (
+            await session.execute(
+                select(func.count())
+                .select_from(MPListingORM)
+                .where(
+                    MPListingORM.channel == "tiktok",
+                    MPListingORM.raw["detail"].isnot(None),
+                    MPListingORM.raw["product"]["main_images"].isnot(None),
+                )
+            )
+        ).scalar_one()
+    assert with_detail > 0
+    if stats["details_failed"] == 0:
+        assert with_detail == stored
+
+    # second pass: nothing changed, so every detail is reused (no detail calls)
+    again = await live_tiktok.sync_listings()
+    assert again["details_fetched"] + again["details_failed"] <= 5
+
+
+async def test_live_product_detail_has_images(live_tiktok: TikTokSyncService) -> None:
+    page = await live_tiktok._client.search("/product/202309/products/search", {"page_size": 1}, {})
+    product_id = str(page["products"][0]["id"])
+
+    detail = await live_tiktok._client.get_product(product_id)
+
+    assert str(detail["id"]) == product_id
+    assert detail["main_images"][0]["thumb_urls"][0].startswith("https://")
+    assert all("id" in sku for sku in detail["skus"])

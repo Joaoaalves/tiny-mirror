@@ -10,11 +10,11 @@ import hashlib
 import hmac
 import json
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -33,8 +33,10 @@ from tiny_mirror.scheduler import jobs as jobs_mod
 from tiny_mirror.services import tiktok_sync_service as svc_mod
 from tiny_mirror.services.tiktok_sync_service import (
     TikTokSyncService,
+    detail_is_stale,
     parse_order,
     parse_product,
+    stored_details,
 )
 
 pytestmark = pytest.mark.unit
@@ -107,6 +109,39 @@ PRODUCT = {
     ],
 }
 
+DETAIL = {
+    "id": PRODUCT["id"],
+    "status": "ACTIVATE",
+    "title": "Suporte TV Fixo",
+    "update_time": 1792000000,
+    "brand": {"id": "1", "name": "RT AT"},
+    "main_images": [
+        {"thumb_urls": ["https://img/main-300.jpeg"], "urls": ["https://img/main.jpeg"]}
+    ],
+    "package_weight": {"unit": "KILOGRAM", "value": "1.2"},
+    "skus": [
+        {
+            "id": "1729000000000000101",
+            "seller_sku": "DGS-SPM86",
+            "price": {"currency": "BRL", "tax_exclusive_price": "70.00"},
+            "inventory": [{"quantity": 1}],
+            "identifier_code": {"code": "7908812704280", "type": "GTIN"},
+            "sales_attributes": [
+                {
+                    "name": "Cor",
+                    "value_name": "Preto",
+                    "sku_img": {"thumb_urls": ["https://img/preto-300.jpeg"]},
+                }
+            ],
+        }
+    ],
+}
+
+
+def _fresh(update_time: int = 1792000000, days_old: int = 0) -> dict[str, Any]:
+    synced = (datetime.now(UTC) - timedelta(days=days_old)).isoformat()
+    return {**DETAIL, "_detail": {"update_time": update_time, "synced_at": synced}}
+
 
 # ---------------------------------------------------------------------------
 # Client
@@ -150,6 +185,37 @@ async def test_only_read_paths_are_callable(tmp_path: Path) -> None:
         await _client(tmp_path, handler).search(
             "/product/202309/products/1/inventory/update", {}, {}
         )
+    assert calls == []
+
+
+async def test_get_product_is_a_signed_get_without_body(tmp_path: Path) -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["path"] = request.url.path
+        seen["params"] = dict(request.url.params)
+        seen["body"] = request.content
+        return _ok(DETAIL)
+
+    data = await _client(tmp_path, handler).get_product(PRODUCT["id"])
+
+    path = f"/product/202309/products/{PRODUCT['id']}"
+    assert data["main_images"] == DETAIL["main_images"]
+    assert seen["method"] == "GET" and seen["path"] == path and seen["body"] == b""
+    assert seen["params"]["sign"] == signature("sec", path, seen["params"], "")
+
+
+async def test_get_product_rejects_non_numeric_ids(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return _ok({})
+
+    for bad in ("1/inventory/update", "", "abc"):
+        with pytest.raises(ValueError):
+            await _client(tmp_path, handler).get_product(bad)
     assert calls == []
 
 
@@ -223,6 +289,53 @@ def test_parse_product_one_row_per_sku() -> None:
     assert "skus" not in rows[0]["raw"]["product"]
 
 
+def test_parse_product_merges_detail_but_keeps_fresh_price_and_stock() -> None:
+    rows = parse_product(PRODUCT, _fresh())
+    first = rows[0]
+
+    assert first["price"] == Decimal("79.90") and first["stock"] == 15  # from the search
+    assert first["raw"]["sku"]["sales_attributes"][0]["value_name"] == "Preto"
+    assert first["raw"]["sku"]["identifier_code"]["code"] == "7908812704280"
+    assert first["raw"]["sku"]["inventory"] == PRODUCT["skus"][0]["inventory"]
+    assert first["raw"]["product"]["main_images"] == DETAIL["main_images"]
+    assert first["raw"]["product"]["brand"]["name"] == "RT AT"
+    assert "skus" not in first["raw"]["product"] and "_detail" not in first["raw"]["product"]
+    assert first["raw"]["detail"]["update_time"] == 1792000000
+    # a SKU the detail doesn't know still gets the product-level detail
+    assert "sales_attributes" not in rows[1]["raw"]["sku"]
+    assert rows[1]["raw"]["product"]["main_images"] == DETAIL["main_images"]
+
+
+def test_parse_product_without_detail_has_no_detail_marker() -> None:
+    assert all("detail" not in r["raw"] for r in parse_product(PRODUCT))
+
+
+def test_detail_is_stale_rules() -> None:
+    assert detail_is_stale(PRODUCT, None)  # never fetched
+    assert not detail_is_stale(PRODUCT, _fresh())
+    assert detail_is_stale(PRODUCT, _fresh(update_time=1))  # product changed
+    assert detail_is_stale(PRODUCT, _fresh(days_old=8))  # too old
+    assert detail_is_stale(PRODUCT, {**DETAIL, "_detail": {"update_time": 1792000000}})
+
+
+async def test_stored_details_rebuilds_product_from_sku_rows() -> None:
+    raw_a = parse_product(PRODUCT, _fresh())
+    rows = [(r["listing_id"], r["raw"]) for r in raw_a] + [("9", {"product": {}, "sku": {}})]
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=MagicMock(all=lambda: rows))
+    ctx = MagicMock(__aenter__=AsyncMock(return_value=session), __aexit__=AsyncMock())
+
+    with patch.object(svc_mod, "AsyncSessionLocal", return_value=ctx):
+        out = await stored_details()
+
+    assert set(out) == {PRODUCT["id"]}  # the row without detail is ignored
+    d = out[PRODUCT["id"]]
+    assert d["_detail"]["update_time"] == 1792000000
+    assert d["main_images"] == DETAIL["main_images"] and len(d["skus"]) == 2
+    assert not detail_is_stale(PRODUCT, d)
+    assert parse_product(PRODUCT, d)[0]["raw"] == raw_a[0]["raw"]
+
+
 # ---------------------------------------------------------------------------
 # Sync
 # ---------------------------------------------------------------------------
@@ -263,6 +376,8 @@ async def test_orders_backfill_filters_by_create_time(tmp_path: Path) -> None:
 
 async def test_listings_skip_deleted_and_prune(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _ok({"update_time": 1792000000})
         assert request.url.path == PRODUCTS_SEARCH
         return _ok(
             {
@@ -275,12 +390,20 @@ async def test_listings_skip_deleted_and_prune(tmp_path: Path) -> None:
         )
 
     with (
+        patch.object(svc_mod, "stored_details", AsyncMock(return_value={})),
         patch.object(svc_mod, "upsert", AsyncMock()),
         patch.object(svc_mod, "prune_listings", AsyncMock(return_value=4)) as prune,
     ):
         stats = await TikTokSyncService(_client(tmp_path, handler)).sync_listings()
 
-    assert stats == {"products": 2, "listings": 3, "active": 2, "removed": 4}
+    assert stats == {
+        "products": 2,
+        "listings": 3,
+        "active": 2,
+        "removed": 4,
+        "details_fetched": 2,
+        "details_failed": 0,
+    }
     assert prune.await_args.args == (
         "tiktok",
         {
@@ -293,11 +416,47 @@ async def test_listings_skip_deleted_and_prune(tmp_path: Path) -> None:
 
 async def test_empty_listings_never_prune(tmp_path: Path) -> None:
     with (
+        patch.object(svc_mod, "stored_details", AsyncMock(return_value={})),
         patch.object(svc_mod, "upsert", AsyncMock()),
         patch.object(svc_mod, "prune_listings", AsyncMock()) as prune,
     ):
         await TikTokSyncService(_client(tmp_path, lambda r: _ok({"products": []}))).sync_listings()
     prune.assert_not_awaited()
+
+
+async def test_listings_fetch_detail_only_for_new_or_changed_products(tmp_path: Path) -> None:
+    gets: list[str] = []
+    unchanged = {**PRODUCT, "id": "11"}
+    changed = {**PRODUCT, "id": "22", "update_time": 1792999999}
+    new = {**PRODUCT, "id": "33"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            pid = request.url.path.rsplit("/", 1)[1]
+            gets.append(pid)
+            if pid == "33":
+                return httpx.Response(200, json={"code": 12052700, "message": "boom"})
+            return _ok({**DETAIL, "id": pid, "update_time": 1792999999})
+        return _ok({"products": [unchanged, changed, new]})
+
+    stored = {"11": {**_fresh(), "id": "11"}, "22": {**_fresh(), "id": "22"}}
+    with (
+        patch.object(svc_mod, "stored_details", AsyncMock(return_value=stored)),
+        patch.object(svc_mod, "upsert", AsyncMock()) as upsert,
+        patch.object(svc_mod, "prune_listings", AsyncMock(return_value=0)),
+    ):
+        stats = await TikTokSyncService(_client(tmp_path, handler)).sync_listings()
+
+    assert sorted(gets) == ["22", "33"]  # "11" reuses its stored detail
+    assert stats["details_fetched"] == 1 and stats["details_failed"] == 1
+    first_sku = PRODUCT["skus"][0]["id"]
+    by_id = {
+        r["listing_id"]: r for r in upsert.await_args.args[1] if r["variation_id"] == first_sku
+    }
+    assert by_id["11"]["raw"]["detail"] == stored["11"]["_detail"]
+    assert by_id["22"]["raw"]["detail"]["update_time"] == 1792999999
+    assert "detail" not in by_id["33"]["raw"]  # failed: stays without detail, retried next run
+    assert by_id["33"]["price"] == Decimal("79.90")
 
 
 async def test_job_skips_quietly_when_exported_token_expired(tmp_path: Path) -> None:

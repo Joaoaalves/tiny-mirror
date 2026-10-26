@@ -7,19 +7,30 @@
   Tiny links by ``ecommerce_order_number`` = order id ("TikTok Shop").
 - Listings: ``products/search`` (every status; DELETED is skipped), one row
   per SKU (variation_id = sku id). A full pass replaces the channel's snapshot.
+  The search has no images, variation names, attributes or package data, so
+  each product's detail (GET, read-only) is merged into ``raw``. To keep the
+  pass cheap the detail is fetched only for products that are new, whose
+  ``update_time`` moved since the stored detail, or whose detail is older than
+  ``_DETAIL_MAX_AGE``; the rest reuse the stored one. Price and stock always
+  come from the fresh search (stock changes don't bump ``update_time``).
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+import httpx
 import structlog
+from sqlalchemy import select
 
+from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.external.tiktok_shop_client import (
     ORDERS_SEARCH,
     PRODUCTS_SEARCH,
+    TikTokAPIError,
     TikTokShopClient,
 )
 from tiny_mirror.infrastructure.orm.models import MPListingORM, MPOrderORM
@@ -30,6 +41,8 @@ logger = structlog.get_logger(__name__)
 CHANNEL = "tiktok"
 _PAGE = 100
 _MAX_PAGES = 500
+_DETAIL_CONCURRENCY = 4
+_DETAIL_MAX_AGE = timedelta(days=7)
 _PII = frozenset(
     {"recipient_address", "buyer_email", "buyer_message", "cpf", "cpf_name", "user_id"}
 )
@@ -64,9 +77,15 @@ class TikTokSyncService:
     async def sync_listings(self) -> dict[str, Any]:
         products = await self._pages(PRODUCTS_SEARCH, "products", {}, {})
         live = [p for p in products if p.get("status") != "DELETED"]
+        details = await stored_details()
+        due = [p for p in live if detail_is_stale(p, details.get(str(p.get("id"))))]
+        fetched, failed = await self._fetch_details([str(p.get("id")) for p in due])
+        details.update(fetched)
         rows = list(
             {
-                (r["listing_id"], r["variation_id"]): r for p in live for r in parse_product(p)
+                (r["listing_id"], r["variation_id"]): r
+                for p in live
+                for r in parse_product(p, details.get(str(p.get("id"))))
             }.values()
         )
         await upsert(MPListingORM, rows, ["channel", "listing_id", "variation_id"])
@@ -80,9 +99,33 @@ class TikTokSyncService:
             "listings": len(rows),
             "active": sum(1 for r in rows if r["is_active"]),
             "removed": removed,
+            "details_fetched": len(fetched),
+            "details_failed": failed,
         }
         logger.info("tiktok.listings_synced", **stats)
         return stats
+
+    async def _fetch_details(self, product_ids: list[str]) -> tuple[dict[str, Any], int]:
+        """Detail of each product, ``_DETAIL_CONCURRENCY`` at a time. A product
+        whose call fails keeps its stored detail (or none) until the next run."""
+        sem = asyncio.Semaphore(_DETAIL_CONCURRENCY)
+        now = datetime.now(UTC).isoformat()
+
+        async def one(pid: str) -> tuple[str, dict[str, Any] | None]:
+            async with sem:
+                try:
+                    detail = await self._client.get_product(pid)
+                except (TikTokAPIError, httpx.HTTPError, ValueError) as exc:
+                    logger.warning("tiktok.product_detail_failed", product_id=pid, error=str(exc))
+                    return pid, None
+            return pid, {
+                **detail,
+                "_detail": {"update_time": detail.get("update_time"), "synced_at": now},
+            }
+
+        results = await asyncio.gather(*(one(pid) for pid in product_ids))
+        fetched = {pid: d for pid, d in results if d is not None}
+        return fetched, len(results) - len(fetched)
 
     async def _pages(
         self, path: str, key: str, body: dict[str, Any], params: dict[str, Any]
@@ -124,12 +167,58 @@ def parse_order(raw: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def parse_product(product: dict[str, Any]) -> list[dict[str, Any]]:
+def detail_is_stale(product: dict[str, Any], detail: dict[str, Any] | None) -> bool:
+    meta = (detail or {}).get("_detail") or {}
+    if not meta or meta.get("update_time") != product.get("update_time"):
+        return True
+    try:
+        synced = datetime.fromisoformat(str(meta.get("synced_at")))
+    except ValueError:
+        return True
+    return datetime.now(UTC) - synced > _DETAIL_MAX_AGE
+
+
+async def stored_details() -> dict[str, dict[str, Any]]:
+    """Product detail already in the mirror, rebuilt from the per-SKU rows."""
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(MPListingORM.listing_id, MPListingORM.raw).where(
+                    MPListingORM.channel == CHANNEL
+                )
+            )
+        ).all()
+    out: dict[str, dict[str, Any]] = {}
+    for listing_id, raw in rows:
+        if not (raw or {}).get("detail"):
+            continue
+        d = out.setdefault(
+            listing_id, {**(raw.get("product") or {}), "_detail": raw["detail"], "skus": []}
+        )
+        d["skus"].append(raw.get("sku") or {})
+    return out
+
+
+def parse_product(
+    product: dict[str, Any], detail: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     product_id = str(product.get("id"))
     status = product.get("status")
+    detail = detail or {}
+    detail_skus = {str(k.get("id")): k for k in detail.get("skus") or []}
+    product_raw = {
+        **{k: v for k, v in detail.items() if k not in ("skus", "_detail")},
+        **{k: v for k, v in product.items() if k != "skus"},
+    }
     rows = []
     for sku in product.get("skus") or []:
         stock = sum(int(i.get("quantity") or 0) for i in sku.get("inventory") or [])
+        raw: dict[str, Any] = {
+            "product": product_raw,
+            "sku": {**detail_skus.get(str(sku.get("id")), {}), **sku},
+        }
+        if detail.get("_detail"):
+            raw["detail"] = detail["_detail"]
         rows.append(
             {
                 "channel": CHANNEL,
@@ -143,7 +232,7 @@ def parse_product(product: dict[str, Any]) -> list[dict[str, Any]]:
                 "price": _dec((sku.get("price") or {}).get("tax_exclusive_price")),
                 "stock": stock if sku.get("inventory") is not None else None,
                 "url": f"https://shop.tiktok.com/view/product/{product_id}",
-                "raw": {"product": {k: v for k, v in product.items() if k != "skus"}, "sku": sku},
+                "raw": raw,
                 "synced_at": datetime.now(UTC),
             }
         )
