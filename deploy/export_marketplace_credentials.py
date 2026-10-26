@@ -12,6 +12,10 @@ refresh). tiny-mirror only READS a copy of what it needs:
   short-lived access tokens)
 - shopee_seller: partner_id, partner_key, shop_id, access_token, expires_at
   (never refreshed by tiny-mirror)
+- tiktok_shop: app_key, app_secret, shop_id, shop_cipher, access_token,
+  expires_at (the plugin renews the token at :14; tiny-mirror never refreshes
+  it and never sees the refresh token). Optional: skipped until the shop is
+  authorized.
 
 Install (root, on the VPS) — never run it from the deploy dir, which the
 deploy user can write:
@@ -60,7 +64,33 @@ def build() -> dict[str, object]:
             # plugin stores milliseconds; export seconds
             "expires_at": int(shop["expires_at"]) // 1000,
         }
+    tiktok = _tiktok_shop()
+    if tiktok:
+        out["tiktok_shop"] = tiktok
     return out
+
+
+def _tiktok_shop() -> dict[str, object] | None:
+    try:
+        with open(os.path.join(SRC, "tiktok_shop.json")) as fh:
+            conf = json.load(fh)
+    except FileNotFoundError:
+        return None
+    auth = conf.get("auth") or {}
+    shop = next(iter(conf.get("shops") or []), None)
+    if not (conf.get("app_key") and conf.get("app_secret") and auth.get("access_token")):
+        return None
+    if not (shop and shop.get("id") and shop.get("cipher")):
+        return None
+    return {
+        "app_key": conf["app_key"],
+        "app_secret": conf["app_secret"],
+        "shop_id": str(shop["id"]),
+        "shop_cipher": shop["cipher"],
+        "access_token": auth["access_token"],
+        # plugin stores milliseconds; export seconds
+        "expires_at": int(auth["expires_at"]) // 1000,
+    }
 
 
 def main() -> int:
