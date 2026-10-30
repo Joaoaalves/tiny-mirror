@@ -18,12 +18,13 @@ ERP .NET (`erp-api@8080`), sem consumidores — não usar.
    produção. Todo trabalho acontece num clone do repo.
 4. **Segredos vivem só em `/opt/tiny-mirror/.env` na VPS.** Nunca commitar tokens,
    cookies ou `.env` — `.env.example` é a referência do que existe. Exceção: credenciais
-   de marketplaces (Amazon SP-API, Shopee, TikTok Shop) são do **OpenClaw**; um cron root
+   de marketplaces (Amazon SP-API, Shopee, TikTok Shop, Magalu) são do **OpenClaw**; um cron root
    (`deploy/export_marketplace_credentials.py`, instalado em `/usr/local/bin`) exporta uma
    cópia só-leitura para `/opt/tiny-mirror/marketplace-credentials.json`.
-5. **Outros marketplaces (Amazon, Shopee, TikTok Shop): só leitura.** O tiny-mirror **NUNCA
-   renova o token da Shopee nem o do TikTok** (quem renova é o OpenClaw). O grant do TikTok
-   inclui escopos de escrita: o código usa só endpoints de busca/leitura.
+5. **Outros marketplaces (Amazon, Shopee, TikTok Shop, Magalu): só leitura.** O tiny-mirror
+   **NUNCA renova o token da Shopee, do TikTok nem da Magalu** (quem renova é o OpenClaw; o
+   refresh token da Magalu gira a cada renovação). O grant do TikTok inclui escopos de escrita:
+   o código usa só endpoints de busca/leitura. O da Magalu só tem escopos de leitura.
 
 ## Fluxo de trabalho
 
