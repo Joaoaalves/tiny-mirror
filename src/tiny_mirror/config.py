@@ -290,6 +290,12 @@ class Settings(BaseSettings):
     sync_tiktok_orders_cron: str = "45 * * * *"
     sync_tiktok_orders_updated_hours: int = 3
     sync_tiktok_listings_cron: str = "50 8 * * *"
+    # Magalu: orders hourly by updated_at, listings daily. OpenClaw renews the
+    # 2h token at :15/:45 and the export runs at :17/:47, so stay clear of
+    # those minutes. Initial history: POST /sync/magalu-orders {"days": 90}.
+    sync_magalu_orders_cron: str = "55 * * * *"
+    sync_magalu_orders_updated_hours: int = 3
+    sync_magalu_listings_cron: str = "0 9 * * *"
 
     # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
     # antes de ele reaparecer.

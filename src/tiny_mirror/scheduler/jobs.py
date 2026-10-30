@@ -164,6 +164,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
             "tiktok_listings": CronTrigger.from_crontab(
                 settings.sync_tiktok_listings_cron, timezone="UTC"
             ),
+            "magalu_orders": CronTrigger.from_crontab(
+                settings.sync_magalu_orders_cron, timezone="UTC"
+            ),
+            "magalu_listings": CronTrigger.from_crontab(
+                settings.sync_magalu_listings_cron, timezone="UTC"
+            ),
             "ml_panel_scrape": CronTrigger.from_crontab(
                 settings.ml_panel_scrape_cron, timezone="UTC"
             ),
@@ -295,6 +301,12 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
 
     async def _tiktok_listings() -> None:
         await tiktok_sync_job(http_client, "listings")
+
+    async def _magalu_orders() -> None:
+        await magalu_sync_job(http_client, "orders")
+
+    async def _magalu_listings() -> None:
+        await magalu_sync_job(http_client, "listings")
 
     async def _ml_panel_scrape() -> None:
         await ml_panel_scrape_job(http_client)
@@ -501,6 +513,18 @@ def setup_scheduler(app: FastAPI) -> AsyncIOScheduler:
         _tiktok_listings,
         trigger=triggers["tiktok_listings"],
         id="tiktok_listings",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _magalu_orders,
+        trigger=triggers["magalu_orders"],
+        id="magalu_orders",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        _magalu_listings,
+        trigger=triggers["magalu_listings"],
+        id="magalu_listings",
         replace_existing=True,
     )
     scheduler.add_job(
@@ -1315,6 +1339,38 @@ async def tiktok_sync_job(http_client: Any, what: str) -> None:
             await service.sync_listings()
     except TikTokTokenExpired as exc:
         logger.warning("TikTok sync skipped: exported token expired", error=str(exc))
+
+
+def magalu_service(http_client: Any) -> Any:
+    """MagaluSyncService over the exported credentials, or None if not exported."""
+    from tiny_mirror.infrastructure.external.magalu_client import MagaluClient
+    from tiny_mirror.infrastructure.external.marketplace_credentials import (
+        MarketplaceCredentials,
+    )
+    from tiny_mirror.services.magalu_sync_service import MagaluSyncService
+
+    creds = MarketplaceCredentials(settings.marketplace_credentials_file)
+    if http_client is None or creds.section("magalu") is None:
+        return None
+    return MagaluSyncService(MagaluClient(http_client, creds))
+
+
+async def magalu_sync_job(http_client: Any, what: str) -> None:
+    """Magalu orders (hourly, by update time) or listings (daily). Read-only.
+    An expired/refused exported token skips the run: OpenClaw renews it, never us."""
+    from tiny_mirror.infrastructure.external.magalu_client import MagaluTokenExpired
+
+    service = magalu_service(http_client)
+    if service is None:
+        logger.debug("Magalu sync skipped: credentials not exported")
+        return
+    try:
+        if what == "orders":
+            await service.sync_orders(updated_hours=settings.sync_magalu_orders_updated_hours)
+        else:
+            await service.sync_listings()
+    except MagaluTokenExpired as exc:
+        logger.warning("Magalu sync skipped: exported token expired", error=str(exc))
 
 
 async def flex_calibration_job(http_client: Any, ml_token_service: Any) -> None:

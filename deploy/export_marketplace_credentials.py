@@ -16,12 +16,16 @@ refresh). tiny-mirror only READS a copy of what it needs:
   expires_at (the plugin renews the token at :14; tiny-mirror never refreshes
   it and never sees the refresh token). Optional: skipped until the shop is
   authorized.
+- magalu: access_token, expires_at, seller_id, tenant_id, channel_id (the
+  plugin renews the 2h token at :15/:45 — the ID Magalu refresh token ROTATES,
+  so tiny-mirror never refreshes and never sees it nor the client secret).
+  Optional: skipped until the store is authorized.
 
 Install (root, on the VPS) — never run it from the deploy dir, which the
 deploy user can write:
 
     install -o root -g root -m 755 deploy/export_marketplace_credentials.py /usr/local/bin/
-    # root crontab: right after the Shopee refresh (:12)
+    # root crontab: right after the Shopee (:12) and Magalu (:15/:45) refreshes
     17,47 * * * * /usr/local/bin/export_marketplace_credentials.py >> /var/log/export-marketplace-credentials.log 2>&1
 
 Writes atomically to /opt/tiny-mirror/marketplace-credentials.json as
@@ -67,6 +71,9 @@ def build() -> dict[str, object]:
     tiktok = _tiktok_shop()
     if tiktok:
         out["tiktok_shop"] = tiktok
+    magalu = _magalu()
+    if magalu:
+        out["magalu"] = magalu
     return out
 
 
@@ -90,6 +97,26 @@ def _tiktok_shop() -> dict[str, object] | None:
         "access_token": auth["access_token"],
         # plugin stores milliseconds; export seconds
         "expires_at": int(auth["expires_at"]) // 1000,
+    }
+
+
+def _magalu() -> dict[str, object] | None:
+    try:
+        with open(os.path.join(SRC, "magalu.json")) as fh:
+            conf = json.load(fh)
+    except FileNotFoundError:
+        return None
+    auth = conf.get("auth") or {}
+    if not (auth.get("access_token") and auth.get("expires_at")):
+        return None
+    seller = conf.get("seller") or {}
+    return {
+        "access_token": auth["access_token"],
+        # plugin stores milliseconds; export seconds
+        "expires_at": int(auth["expires_at"]) // 1000,
+        "seller_id": seller.get("id") or conf.get("seller_id"),
+        "tenant_id": seller.get("tenant_id") or conf.get("tenant_id"),
+        "channel_id": seller.get("channel_id") or conf.get("channel_id"),
     }
 
 

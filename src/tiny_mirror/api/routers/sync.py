@@ -654,6 +654,50 @@ async def sync_tiktok_listings(
     return {"message": "TikTok listings sync triggered"}
 
 
+@router.post("/magalu-orders", status_code=status.HTTP_202_ACCEPTED)
+async def sync_magalu_orders(
+    request: Request,
+    background: BackgroundTasks,
+    body: AmazonOrdersRequest = Body(default_factory=AmazonOrdersRequest),
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Backfill ``mp_orders`` (Magalu) for orders purchased in the last ``days``
+    days, one day per window. Read-only on Magalu; runs in background."""
+    from tiny_mirror.scheduler.jobs import magalu_service
+
+    service = magalu_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Magalu credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "magalu_orders")
+    background.add_task(service.sync_orders, created_days=body.days)
+    logger.info("Magalu orders backfill triggered", days=body.days)
+    return {"message": f"Magalu orders backfill triggered (days={body.days})", "days": body.days}
+
+
+@router.post("/magalu-listings", status_code=status.HTTP_202_ACCEPTED)
+async def sync_magalu_listings(
+    request: Request,
+    background: BackgroundTasks,
+    redis_client: redis.Redis = Depends(get_redis_client),
+) -> dict[str, Any]:
+    """Refresh ``mp_listings`` for Magalu (full pass). Read-only on Magalu."""
+    from tiny_mirror.scheduler.jobs import magalu_service
+
+    service = magalu_service(getattr(request.app.state, "http_client", None))
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Magalu credentials not exported",
+        )
+    await _acquire_sync_lock(redis_client, "magalu_listings")
+    background.add_task(service.sync_listings)
+    logger.info("Magalu listings sync triggered")
+    return {"message": "Magalu listings sync triggered"}
+
+
 class InvoiceItemsBackfillRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
