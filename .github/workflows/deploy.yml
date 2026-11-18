@@ -30,13 +30,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install Poetry
-        # Pinned to commit SHA (v1 = 76e04a9, fetched 2026-05-15). Bump
-        # only after reviewing the new commit's contents.
-        uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1
-        with:
-          version: latest
-          virtualenvs-create: true
-          virtualenvs-in-project: true
+        # install.python-poetry.org answers 403 to the Python-urllib user agent
+        # (2026-11-18), which is how snok/install-poetry downloads it.
+        run: |
+          pipx install poetry
+          poetry config virtualenvs.create true
+          poetry config virtualenvs.in-project true
 
       - name: Cache virtualenv
         id: cached-poetry-dependencies
@@ -92,13 +91,12 @@ jobs:
           python-version: "3.12"
 
       - name: Install Poetry
-        # Pinned to commit SHA (v1 = 76e04a9, fetched 2026-05-15). Bump
-        # only after reviewing the new commit's contents.
-        uses: snok/install-poetry@76e04a911780d5b312d89783f7b1cd627778900a # v1
-        with:
-          version: latest
-          virtualenvs-create: true
-          virtualenvs-in-project: true
+        # install.python-poetry.org answers 403 to the Python-urllib user agent
+        # (2026-11-18), which is how snok/install-poetry downloads it.
+        run: |
+          pipx install poetry
+          poetry config virtualenvs.create true
+          poetry config virtualenvs.in-project true
 
       - name: Cache virtualenv
         id: cached-poetry-dependencies
