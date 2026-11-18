@@ -8,7 +8,15 @@ closes the log automatically when every page has been upserted.
 
 Incremental: :meth:`run_incremental_sync` fetches the last
 ``INCREMENTAL_LOOKBACK_DAYS`` of NFs inline (no fan-out needed; the window
-is small) and closes the log with ``update_sync_log_complete``.
+is small), then re-reads the supplier NFs of the last
+``SUPPLIER_ENTRY_LOOKBACK_DAYS`` and closes the log with
+``update_sync_log_complete``.
+
+Tiny's ``/notas`` date filter is the ISSUE date. A supplier NF is registered
+in Tiny (XML import, ``tipo=E`` / ``situacao=8``) only when the goods arrive,
+days or weeks after the supplier issued it, so it is already outside the
+2-day window when it appears. Without the second pass 252 of 306 supplier
+NFs issued between 2026-05-15 and 2026-11-18 never reached the mirror.
 
 Date-range: :meth:`run_date_range_sync` is the shared worker called by
 both paths. It paginates the Tiny ``/notas`` endpoint, maps each page with
@@ -42,6 +50,9 @@ logger = structlog.get_logger(__name__)
 
 PAGE_SIZE = 100
 INCREMENTAL_LOOKBACK_DAYS = 2
+SUPPLIER_ENTRY_LOOKBACK_DAYS = 90
+SUPPLIER_ENTRY_TYPE = "E"
+SUPPLIER_ENTRY_STATUS = "8"
 COLD_START_WINDOW_DAYS = 30
 COLD_START_FROM = date(2024, 5, 8)  # Tiny plan only allows queries from this date
 
@@ -111,7 +122,7 @@ class InvoiceSyncService:
     # Incremental — triggered by scheduler or order sync
     # ------------------------------------------------------------------
     async def run_incremental_sync(self, sync_log_id: int | None) -> None:
-        """Fetch NFs for the past INCREMENTAL_LOOKBACK_DAYS and close the log."""
+        """Fetch recent NFs plus late-registered supplier NFs and close the log."""
         date_to = datetime.now(UTC).date()
         date_from = date_to - timedelta(days=INCREMENTAL_LOOKBACK_DAYS)
 
@@ -123,6 +134,9 @@ class InvoiceSyncService:
         )
 
         total = await self.run_date_range_sync(date_from, date_to, sync_log_id)
+        total += await self.sync_supplier_entries(
+            date_to - timedelta(days=SUPPLIER_ENTRY_LOOKBACK_DAYS), date_to, sync_log_id
+        )
 
         if sync_log_id is not None:
             async with AsyncSessionLocal() as session:
@@ -136,6 +150,24 @@ class InvoiceSyncService:
             total=total,
         )
 
+    async def sync_supplier_entries(
+        self, date_from: date, date_to: date, sync_log_id: int | None
+    ) -> int:
+        """Upsert supplier NFs (tipo E, situacao 8) issued in ``[date_from, date_to]``.
+
+        Re-reads the whole window every run because the issue date says
+        nothing about when the NF was registered. Items are fetched only for
+        NFs that have none yet, so a daily 90-day pass costs a few list pages.
+        """
+        return await self.run_date_range_sync(
+            date_from,
+            date_to,
+            sync_log_id,
+            invoice_type=SUPPLIER_ENTRY_TYPE,
+            status=SUPPLIER_ENTRY_STATUS,
+            items_only_when_missing=True,
+        )
+
     # ------------------------------------------------------------------
     # Per-window worker — called by InvoiceFullSyncConsumer
     # ------------------------------------------------------------------
@@ -146,6 +178,9 @@ class InvoiceSyncService:
         sync_log_id: int | None,
         *,
         fetch_items: bool = True,
+        invoice_type: str | None = None,
+        status: str | None = None,
+        items_only_when_missing: bool = False,
     ) -> int:
         """Paginate Tiny /notas for ``[date_from, date_to]``, map and upsert.
 
@@ -177,6 +212,8 @@ class InvoiceSyncService:
                     date_final=date_to,
                     limit=PAGE_SIZE,
                     offset=offset,
+                    invoice_type=invoice_type,
+                    status=status,
                 )
             except TinyAPIException as exc:
                 logger.error(
@@ -209,6 +246,8 @@ class InvoiceSyncService:
                     await sync_logs.try_finalize(sync_log_id)
 
             if fetch_items:
+                if items_only_when_missing:
+                    invoices = await _without_items(invoices)
                 await self._sync_items_for_invoices(invoices)
 
             logger.debug(
@@ -321,6 +360,20 @@ class InvoiceSyncService:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+async def _without_items(invoices: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ids = [int(inv["tiny_id"]) for inv in invoices]
+    if not ids:
+        return []
+    async with AsyncSessionLocal() as session:
+        rows = await session.execute(
+            select(InvoiceItemORM.invoice_tiny_id)
+            .where(InvoiceItemORM.invoice_tiny_id.in_(ids))
+            .distinct()
+        )
+        with_items = {int(tid) for (tid,) in rows.all()}
+    return [inv for inv in invoices if int(inv["tiny_id"]) not in with_items]
+
+
 async def _set_total_enqueued(sync_log_id: int, total: int) -> None:
     from sqlalchemy import select, update
 
