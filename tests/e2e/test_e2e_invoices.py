@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
 from tiny_mirror.database import AsyncSessionLocal
 from tiny_mirror.infrastructure.external.tiny_client import TinyAPIClient
-from tiny_mirror.infrastructure.orm.models import SyncLogORM
+from tiny_mirror.infrastructure.orm.models import InvoiceORM, SyncLogORM
 from tiny_mirror.infrastructure.repositories.invoice_repository import (
     PostgreSQLInvoiceRepository,
 )
@@ -27,6 +27,7 @@ from tiny_mirror.rabbitmq import get_channel
 from tiny_mirror.services.invoice_sync_service import (
     COLD_START_FROM,
     COLD_START_WINDOW_DAYS,
+    SUPPLIER_ENTRY_LOOKBACK_DAYS,
     InvoiceSyncService,
 )
 
@@ -66,6 +67,54 @@ async def test_list_invoices_date_filter_returns_subset(
 
     assert "itens" in response
     assert "paginacao" in response
+
+
+async def test_list_invoices_type_and_status_filter_returns_only_supplier_entries(
+    live_tiny_client: TinyAPIClient,
+) -> None:
+    today = datetime.now(UTC).date()
+    response = await live_tiny_client.list_invoices(
+        date_initial=today - timedelta(days=SUPPLIER_ENTRY_LOOKBACK_DAYS),
+        date_final=today,
+        limit=20,
+        invoice_type="E",
+        status="8",
+    )
+
+    items = response.get("itens") or []
+    assert items, "expected supplier NFs registered in the last 90 days"
+    for item in items:
+        assert item.get("tipo") == "E"
+        assert str(item.get("situacao")) == "8"
+
+
+async def test_sync_supplier_entries_mirrors_every_registered_nf(
+    live_tiny_client: TinyAPIClient,
+    live_rabbitmq: QueuePublisher,
+    live_db: None,
+) -> None:
+    today = datetime.now(UTC).date()
+    date_from = today - timedelta(days=30)
+
+    service = InvoiceSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
+    total = await service.sync_supplier_entries(date_from, today, sync_log_id=None)
+
+    head = await live_tiny_client.list_invoices(
+        date_initial=date_from, date_final=today, limit=1, invoice_type="E", status="8"
+    )
+    assert total == int(head.get("paginacao", {}).get("total", 0))
+
+    async with AsyncSessionLocal() as session:
+        mirrored = (
+            await session.execute(
+                select(InvoiceORM.tiny_id).where(
+                    InvoiceORM.type == "E",
+                    InvoiceORM.status == "8",
+                    InvoiceORM.issue_date >= date_from,
+                )
+            )
+        ).all()
+    assert len(mirrored) >= total
 
 
 # ---------------------------------------------------------------------------

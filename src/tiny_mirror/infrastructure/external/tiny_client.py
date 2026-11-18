@@ -142,12 +142,18 @@ class TinyAPIClient:
         date_final: datetime | date | str | None = None,
         limit: int = 100,
         offset: int = 0,
+        invoice_type: str | None = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"limit": limit, "offset": offset}
         if date_initial is not None:
             params["dataInicial"] = _format_date_only(date_initial)
         if date_final is not None:
             params["dataFinal"] = _format_date_only(date_final)
+        if invoice_type is not None:
+            params["tipo"] = invoice_type
+        if status is not None:
+            params["situacao"] = status
         return await self._request("GET", "/notas", params=params)
 
     async def get_invoice(self, invoice_tiny_id: int) -> dict[str, Any]:
