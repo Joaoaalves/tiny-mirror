@@ -8,7 +8,7 @@ from tiny_mirror import main
 
 pytestmark = pytest.mark.unit
 
-RETIRED_PREFIXES = ["/ml-fl-tracking"]
+RETIRED_PREFIXES = ["/ml-fl-tracking", "/ml-promotions/evaluate-all"]
 
 
 @pytest.mark.parametrize("prefix", RETIRED_PREFIXES)
