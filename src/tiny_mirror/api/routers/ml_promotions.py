@@ -1461,29 +1461,6 @@ async def evaluate_sku(
     ]
 
 
-@router.post("/evaluate-all", response_model=dict[str, int])
-async def evaluate_all(
-    session: AsyncSession = Depends(db_session),
-    service: MLPromotionService = Depends(_service_dep),
-) -> dict[str, int]:
-    """Iterate every SKU with at least one auto_apply=true cap and evaluate.
-    Returns count summary."""
-    repo = MLPromoCapRepository(session)
-    rows, _ = await repo.list_all(only_auto=True, limit=2000)
-    summary: dict[str, int] = {}
-    # Caps are now per-MLB; dedupe SKUs so we don't call evaluate_sku N times.
-    skus_seen: set[str] = set()
-    for cap in rows:
-        if cap.sku in skus_seen:
-            continue
-        skus_seen.add(cap.sku)
-        results = await service.evaluate_sku(session, cap.sku, dry_run=True, actor="cron")
-        for r in results:
-            summary[r["decision"].action] = summary.get(r["decision"].action, 0) + 1
-    await session.commit()
-    return summary
-
-
 @router.post("/analyze-all")
 async def analyze_all(
     limit: int = Query(default=2000, ge=1, le=5000),

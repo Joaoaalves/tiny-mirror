@@ -352,7 +352,7 @@ async def sync_ml_sales(
     """Backfill ``ml_sales_daily`` (qty + revenue por anúncio) da ML Orders API
     para os últimos ``days`` dias. Read-only quanto ao ML (só GET /orders/search),
     grava só no nosso espelho. Roda em background (o backfill de 90d é longo);
-    re-executável. Necessário 1x após o deploy pra a Curva ABC ter receita histórica.
+    re-executável.
     """
     await _acquire_sync_lock(redis_client, "ml_sales")
     ml_token_service = getattr(request.app.state, "ml_token_service", None)
