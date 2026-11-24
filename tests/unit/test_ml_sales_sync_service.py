@@ -152,9 +152,9 @@ async def test_fetch_day_missing_unit_price_defaults_revenue_zero(
     assert agg[("MLB1", date(2026, 6, 10))]["revenue"] == 0.0
 
 
-async def test_fetch_day_full_qty_from_fulfillment_shipment(token_service: MagicMock) -> None:
-    """A Full-shipped order (shipment.logistic_type='fulfillment') counts into
-    full_qty/full_revenue as well as the totals."""
+async def test_fetch_day_reads_only_the_orders_search(token_service: MagicMock) -> None:
+    """Orders with a shipment are aggregated from the order itself: one
+    /orders/search page, no per-order GET /shipments."""
     http = AsyncMock()
     http.get = AsyncMock(
         side_effect=[
@@ -165,42 +165,14 @@ async def test_fetch_day_full_qty_from_fulfillment_shipment(token_service: Magic
                     "paging": {"total": 1},
                 },
             ),
-            _response(200, {"logistic_type": "fulfillment"}),  # GET /shipments/S1
         ]
     )
     service = MLSalesSyncService(token_service, http, "12345")
 
     agg = await service._fetch_day(date(2026, 6, 10))
-    k = ("MLB1", date(2026, 6, 10))
-    assert agg[k]["qty"] == 2
-    assert agg[k]["full_qty"] == 2
-    assert agg[k]["revenue"] == pytest.approx(100.0)
-    assert agg[k]["full_revenue"] == pytest.approx(100.0)
 
-
-async def test_fetch_day_non_full_shipment_excluded_from_full(token_service: MagicMock) -> None:
-    """A Flex/self_service shipment stays in the totals but NOT in full_qty —
-    that's what the ML Full 'vendas 30d' excludes."""
-    http = AsyncMock()
-    http.get = AsyncMock(
-        side_effect=[
-            _response(
-                200,
-                {
-                    "results": [_order("MLB1", 3, unit_price=10.0, shipping_id="S9")],
-                    "paging": {"total": 1},
-                },
-            ),
-            _response(200, {"logistic_type": "self_service"}),  # GET /shipments/S9
-        ]
-    )
-    service = MLSalesSyncService(token_service, http, "12345")
-
-    agg = await service._fetch_day(date(2026, 6, 10))
-    k = ("MLB1", date(2026, 6, 10))
-    assert agg[k]["qty"] == 3
-    assert agg[k]["full_qty"] == 0
-    assert agg[k]["full_revenue"] == pytest.approx(0.0)
+    assert http.get.await_count == 1
+    assert agg[("MLB1", date(2026, 6, 10))] == {"qty": 2, "sku": "SKU-1", "revenue": 100.0}
 
 
 async def test_fetch_day_stops_at_paging_total(token_service: MagicMock) -> None:

@@ -297,10 +297,6 @@ class Settings(BaseSettings):
     sync_magalu_orders_updated_hours: int = 3
     sync_magalu_listings_cron: str = "0 9 * * *"
 
-    # Estoque Full — quantos dias o botão "Ignorar" (aba Novos) esconde o anúncio
-    # antes de ele reaparecer.
-    ml_fl_ignore_days: int = 7
-
     # Flex fee calibration (real commission + freight per Flex MLB from settled
     # orders). Weekly — Sundays 04:20 UTC. Heavy (re-pulls orders + shipment
     # costs), so off-peak and infrequent.
