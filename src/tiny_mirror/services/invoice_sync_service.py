@@ -184,11 +184,13 @@ class InvoiceSyncService:
     ) -> int:
         """Paginate Tiny /notas for ``[date_from, date_to]``, map and upsert.
 
-        When ``fetch_items`` is True (default), every invoice in the window
-        also gets a ``GET /notas/{id}`` detail call so its ``itens`` are
-        persisted into ``invoice_items``. Cold-start passes False to keep
-        the historical full-catalog backfill cheap — items are populated
-        later by a focused backfill script for the relevant date window.
+        When ``fetch_items`` is True (default), the ``itens`` of every
+        invoice in the window are persisted into ``invoice_items``. The list
+        payload already carries them, field for field the same as
+        ``GET /notas/{id}``, so the detail call is only a fallback for a row
+        that arrives without lines. Cold-start passes False to keep the
+        historical full-catalog backfill cheap — items are populated later by
+        a focused backfill script for the relevant date window.
 
         Returns the total number of NFs upserted. When ``sync_log_id`` is
         not None, atomically increments ``items_processed`` after each page
@@ -246,9 +248,7 @@ class InvoiceSyncService:
                     await sync_logs.try_finalize(sync_log_id)
 
             if fetch_items:
-                if items_only_when_missing:
-                    invoices = await _without_items(invoices)
-                await self._sync_items_for_invoices(invoices)
+                await self._persist_items(invoices, items, items_only_when_missing)
 
             logger.debug(
                 "Invoice page upserted",
@@ -337,6 +337,42 @@ class InvoiceSyncService:
         logger.info("invoice_items_backfill.done", origin_type=origin_type, **stats)
         return stats
 
+    async def _persist_items(
+        self,
+        invoices: list[dict[str, Any]],
+        raw_items: list[dict[str, Any]],
+        only_missing: bool,
+    ) -> None:
+        """Store the lines of one ``/notas`` page.
+
+        Re-reading every NF of the day through ``GET /notas/{id}`` on each
+        30-min order sync was ~90% of the mirror's Tiny calls (2026-11-24);
+        the list rows carry the same ``itens`` (checked up to 49 lines).
+        """
+        if only_missing:
+            missing = {int(inv["tiny_id"]) for inv in await _without_items(invoices)}
+            raw_items = [raw for raw in raw_items if int(raw["id"]) in missing]
+        listed = [raw for raw in raw_items if _listed_lines(raw)]
+        if listed:
+            async with AsyncSessionLocal() as session:
+                repo = PostgreSQLInvoiceItemRepository(session)
+                for raw in listed:
+                    tiny_id = int(raw["id"])
+                    try:
+                        await repo.replace_for_invoice(
+                            tiny_id, InvoiceMapper.items_from_tiny_detail(tiny_id, raw)
+                        )
+                    except Exception as exc:
+                        await session.rollback()
+                        logger.warning(
+                            "Invoice items from listing failed, continuing",
+                            invoice_tiny_id=tiny_id,
+                            error=str(exc),
+                        )
+        await self._sync_items_for_invoices(
+            [{"tiny_id": int(raw["id"])} for raw in raw_items if not _listed_lines(raw)]
+        )
+
     async def _sync_items_for_invoices(self, invoices: list[dict[str, Any]]) -> None:
         """Best-effort items fetch for a batch of invoices already upserted.
 
@@ -360,6 +396,11 @@ class InvoiceSyncService:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+def _listed_lines(raw: dict[str, Any]) -> bool:
+    lines = raw.get("itens")
+    return isinstance(lines, list) and bool(lines)
+
+
 async def _without_items(invoices: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ids = [int(inv["tiny_id"]) for inv in invoices]
     if not ids:

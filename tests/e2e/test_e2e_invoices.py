@@ -432,3 +432,67 @@ async def test_backfill_missing_items_fills_one_live_nf(
                 )
             ).scalar_one()
         assert lines == stats["lines"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Lines come from the /notas list payload (no per-NF detail call)
+# ---------------------------------------------------------------------------
+async def test_listing_lines_match_the_detail_endpoint(
+    live_tiny_client: TinyAPIClient,
+) -> None:
+    today = datetime.now(UTC).date()
+    page = await live_tiny_client.list_invoices(
+        date_initial=today - timedelta(days=3), date_final=today, limit=100
+    )
+    rows = [r for r in page.get("itens") or [] if r.get("itens")]
+    if not rows:
+        pytest.skip("no NF with lines in the last 3 days")
+    sample = sorted(rows, key=lambda r: -len(r["itens"]))[:3]
+
+    for row in sample:
+        detail = await live_tiny_client.get_invoice(int(row["id"]))
+        tiny_id = int(row["id"])
+        assert InvoiceMapper.items_from_tiny_detail(
+            tiny_id, row
+        ) == InvoiceMapper.items_from_tiny_detail(tiny_id, detail)
+
+
+async def test_date_range_sync_stores_lines_without_detail_calls(
+    live_tiny_client: TinyAPIClient,
+    live_rabbitmq: QueuePublisher,
+    live_db: None,
+) -> None:
+    from sqlalchemy import func
+
+    from tiny_mirror.infrastructure.orm.models import InvoiceItemORM
+
+    today = datetime.now(UTC).date()
+    page = await live_tiny_client.list_invoices(date_initial=today, date_final=today, limit=100)
+    listed = {int(r["id"]): len(r["itens"]) for r in page.get("itens") or [] if r.get("itens")}
+    if not listed:
+        pytest.skip("no NF with lines issued today")
+
+    detail_calls: list[int] = []
+    original = live_tiny_client.get_invoice
+
+    async def counting_get_invoice(invoice_id: int) -> dict:
+        detail_calls.append(invoice_id)
+        return await original(invoice_id)
+
+    live_tiny_client.get_invoice = counting_get_invoice  # type: ignore[method-assign]
+    try:
+        service = InvoiceSyncService(tiny_client=live_tiny_client, queue_publisher=live_rabbitmq)
+        await service.run_date_range_sync(today, today, sync_log_id=None)
+    finally:
+        live_tiny_client.get_invoice = original  # type: ignore[method-assign]
+
+    assert not set(detail_calls) & set(listed)
+    async with AsyncSessionLocal() as session:
+        rows = (
+            await session.execute(
+                select(InvoiceItemORM.invoice_tiny_id, func.count(InvoiceItemORM.id))
+                .where(InvoiceItemORM.invoice_tiny_id.in_(list(listed)))
+                .group_by(InvoiceItemORM.invoice_tiny_id)
+            )
+        ).all()
+    assert dict(rows) == listed
