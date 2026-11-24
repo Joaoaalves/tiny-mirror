@@ -1,10 +1,10 @@
 """Translation between the Tiny ERP NF schema (PT) and ours (EN).
 
-The list endpoint ``GET /notas`` returns enough for the header table. To
-get ``itens`` (one row per product line on the NF — the source of truth
-for which SKU actually shipped, including kit components) the caller must
-also hit ``GET /notas/{id}``; ``items_from_tiny_detail`` parses that
-response into rows for ``invoice_items``.
+The list endpoint ``GET /notas`` returns enough for the header table and
+also the ``itens`` (one row per product line on the NF — the source of
+truth for which SKU actually shipped, including kit components), with the
+same fields as ``GET /notas/{id}``; ``items_from_tiny_detail`` parses either
+payload into rows for ``invoice_items``.
 
 Tiny sends empty strings instead of null for missing optional fields; this
 mapper normalises those to Python ``None`` before persisting.

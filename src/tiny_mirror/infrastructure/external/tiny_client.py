@@ -159,8 +159,8 @@ class TinyAPIClient:
     async def get_invoice(self, invoice_tiny_id: int) -> dict[str, Any]:
         """Detail call: returns the full NF including its ``itens`` array.
 
-        The list endpoint omits line items, so phantom detection (and any
-        per-SKU sales view) must pull this per invoice. Schema:
+        The list endpoint carries the same ``itens``, so the sync only calls
+        this as a fallback for a row that arrives without lines. Schema:
         ``{ "id", "itens": [{"idItem","idProduto","codigo","quantidade",...}], ... }``.
         """
         return await self._request("GET", f"/notas/{invoice_tiny_id}")
