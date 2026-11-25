@@ -106,6 +106,7 @@ class ProductORM(Base):
         Index("ix_products_updated_at_tiny", "updated_at_tiny"),
         Index("ix_products_brand_name", "brand_name"),
         Index("ix_products_manual_status", "manual_status"),
+        Index("ix_products_sku", "sku"),
         {
             "comment": (
                 "Mirror of all products from Tiny ERP. Products of type K (kit) have "
