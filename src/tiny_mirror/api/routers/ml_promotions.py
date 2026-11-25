@@ -17,6 +17,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Any, Literal
@@ -717,21 +718,87 @@ async def _stock_by_skus(session: AsyncSession, skus: list[str]) -> dict[str, di
     }
 
 
-async def _enrich_cap(
-    session: AsyncSession,
-    cap: Any,
-) -> CapOut:
-    """Attach the matching cost snapshot, catalog status, and listing row
-    to a per-MLB cap. Each enrichment lookup is keyed by ``cap.mlb_id``.
-    """
+@dataclass
+class _CapEnrichment:
+    """Everything ``_enrich_cap_from`` reads, pre-loaded for a whole page of caps.
+
+    Each map is keyed by ``mlb_id`` (ML-side rows) or ``sku`` (Tiny-side rows),
+    so enriching N caps costs a fixed 7 queries instead of ~8 per cap."""
+
+    snapshots: dict[str, Any] = field(default_factory=dict)
+    listings: dict[str, Any] = field(default_factory=dict)
+    calibrations: dict[str, Any] = field(default_factory=dict)
+    catalog: dict[str, Any] = field(default_factory=dict)
+    manual_status: dict[str, str | None] = field(default_factory=dict)
+    tiny_cost: dict[str, Any] = field(default_factory=dict)
+    stock: dict[str, dict[str, int]] = field(default_factory=dict)
+
+
+# Per-row lookups by sku used ``... WHERE sku = :sku LIMIT 1`` with no ORDER BY,
+# i.e. the first matching row in heap order (same order a btree returns equal
+# keys in). ``DISTINCT ON (sku) ... ORDER BY sku, ctid`` keeps that exact pick,
+# so SKUs with several product rows resolve to the same row as before.
+_MANUAL_STATUS_BY_SKU_SQL = (
+    "SELECT DISTINCT ON (sku) sku, manual_status FROM products "
+    "WHERE sku = ANY(:skus) ORDER BY sku, ctid"
+)
+_TINY_COST_BY_SKU_SQL = (
+    "SELECT DISTINCT ON (sku) sku, NULLIF(prices->>'cost_price', '')::numeric AS cost "
+    "FROM products WHERE sku = ANY(:skus) "
+    "AND NULLIF(prices->>'cost_price', '') IS NOT NULL ORDER BY sku, ctid"
+)
+
+
+async def _load_cap_enrichment(session: AsyncSession, caps: list[Any]) -> _CapEnrichment:
+    """Batch-load the enrichment inputs for ``caps`` (7 queries total)."""
     from sqlalchemy import select
 
-    from tiny_mirror.config import settings
-    from tiny_mirror.infrastructure.orm.models import MLCatalogStatusORM, MLListingORM
-    from tiny_mirror.services.pricing_service import PricingDataError, margin_at_price
+    from tiny_mirror.infrastructure.orm.models import (
+        MLCatalogStatusORM,
+        MLCostsSnapshotORM,
+        MLFlexFeeCalibrationORM,
+        MLListingORM,
+    )
 
-    snap_repo = MLCostsSnapshotRepository(session)
-    snap = await snap_repo.get(cap.mlb_id)
+    mlb_ids = list(dict.fromkeys(c.mlb_id for c in caps))
+    skus = list(dict.fromkeys(c.sku for c in caps if c.sku))
+    data = _CapEnrichment()
+    if not mlb_ids:
+        return data
+
+    async def by_mlb(model: Any) -> dict[str, Any]:
+        rows = (await session.execute(select(model).where(model.mlb_id.in_(mlb_ids)))).scalars()
+        return {r.mlb_id: r for r in rows}
+
+    data.snapshots = await by_mlb(MLCostsSnapshotORM)
+    data.listings = await by_mlb(MLListingORM)
+    data.calibrations = await by_mlb(MLFlexFeeCalibrationORM)
+    data.catalog = await by_mlb(MLCatalogStatusORM)
+    if skus:
+        data.manual_status = {
+            r[0]: r[1]
+            for r in (await session.execute(text(_MANUAL_STATUS_BY_SKU_SQL), {"skus": skus})).all()
+        }
+        data.tiny_cost = {
+            r[0]: r[1]
+            for r in (await session.execute(text(_TINY_COST_BY_SKU_SQL), {"skus": skus})).all()
+        }
+        data.stock = await _stock_by_skus(session, skus)
+    return data
+
+
+def _enrich_cap_from(data: _CapEnrichment, cap: Any) -> CapOut:
+    """Attach the matching cost snapshot, fees, catalog status, listing row and
+    stock to a per-MLB cap. Pure: every lookup comes from ``data``."""
+    from tiny_mirror.config import settings
+    from tiny_mirror.services.pricing_service import (
+        PricingDataError,
+        apply_flex_calibration,
+        margin_at_price,
+    )
+
+    snap = data.snapshots.get(cap.mlb_id)
+    listing = data.listings.get(cap.mlb_id)
 
     out = CapOut.model_validate(cap)
     out.difal_pct = Decimal(str(settings.margin_difal_pct))
@@ -744,35 +811,27 @@ async def _enrich_cap(
     # Flex listings: override the (wrong) spreadsheet commission + generic freight
     # bands with the per-MLB calibration. Fulfillment is unchanged. Roda mesmo sem
     # snapshot (snap=None) — a calibração Flex independe do custo da planilha.
-    eff_commission_pct, eff_freight_bands, eff_commission_bands = await _effective_fees(
-        session, cap.mlb_id, snap
+    # Same rules as ``_effective_fees`` (no listing/logistic_type → snapshot as-is).
+    base_comm = snap.commission_pct if snap is not None else None
+    base_bands = snap.freight_bands if snap is not None else None
+    eff_commission_pct, eff_freight_bands, eff_commission_bands = apply_flex_calibration(
+        listing.logistic_type if listing is not None else None,
+        base_comm,
+        base_bands,
+        data.calibrations.get(cap.mlb_id),
     )
     out.commission_pct = eff_commission_pct
     out.freight_bands = eff_freight_bands
     out.commission_bands = eff_commission_bands
 
     # Status manual do produto (cores da planilha GERAL → products.manual_status).
-    out.manual_status = (
-        await session.execute(
-            text("SELECT manual_status FROM products WHERE sku = :sku LIMIT 1"),
-            {"sku": cap.sku},
-        )
-    ).scalar_one_or_none()
+    out.manual_status = data.manual_status.get(cap.sku)
 
     # Fallback de custo: quando a PLANILHA não tem (snapshot vazio/ausente), usa o
     # custo do Tiny (products.prices.cost_price) — senão a margem fica "—". Na prática
     # o custo do Tiny vem da mesma planilha, então tende a bater.
     if out.base_cost is None:
-        tiny_cost = (
-            await session.execute(
-                text(
-                    "SELECT NULLIF(prices->>'cost_price', '')::numeric FROM products "
-                    "WHERE sku = :sku AND NULLIF(prices->>'cost_price', '') IS NOT NULL "
-                    "LIMIT 1"
-                ),
-                {"sku": cap.sku},
-            )
-        ).scalar_one_or_none()
+        tiny_cost = data.tiny_cost.get(cap.sku)
         if tiny_cost is not None:
             out.base_cost = Decimal(str(tiny_cost))
 
@@ -796,9 +855,6 @@ async def _enrich_cap(
         except PricingDataError:
             pass
 
-    listing = (
-        await session.execute(select(MLListingORM).where(MLListingORM.mlb_id == cap.mlb_id))
-    ).scalar_one_or_none()
     if listing is not None:
         out.logistic_type = listing.logistic_type
         out.listing_status = listing.status
@@ -812,7 +868,7 @@ async def _enrich_cap(
     else:
         out.has_active_listing = False
 
-    st = (await _stock_by_skus(session, [cap.sku])).get(cap.sku)
+    st = data.stock.get(cap.sku)
     in_transfer = st["full_in_transfer"] if st is not None else 0
     if st is not None:
         out.warehouse_available = st["warehouse_available"]  # galpão p/ FLEX
@@ -823,11 +879,7 @@ async def _enrich_cap(
     # (full_in_transit) por cima.
     out.full_available = (out.available_quantity or 0) + in_transfer
 
-    cat = (
-        await session.execute(
-            select(MLCatalogStatusORM).where(MLCatalogStatusORM.mlb_id == cap.mlb_id)
-        )
-    ).scalar_one_or_none()
+    cat = data.catalog.get(cap.mlb_id)
     if cat is not None:
         out.catalog_listing = bool(cat.catalog_listing)
         out.catalog_status = cat.status
@@ -838,6 +890,17 @@ async def _enrich_cap(
         out.competitors_sharing_first_place = cat.competitors_sharing_first_place
 
     return out
+
+
+async def _enrich_caps(session: AsyncSession, caps: list[Any]) -> list[CapOut]:
+    """Enrich a list of caps with a fixed number of queries (order preserved)."""
+    data = await _load_cap_enrichment(session, caps)
+    return [_enrich_cap_from(data, c) for c in caps]
+
+
+async def _enrich_cap(session: AsyncSession, cap: Any) -> CapOut:
+    """Single-cap convenience wrapper over the batch enrichment."""
+    return (await _enrich_caps(session, [cap]))[0]
 
 
 @router.get("/caps", response_model=list[CapOut])
@@ -874,7 +937,7 @@ async def list_caps(
 
     repo = MLPromoCapRepository(session)
     rows, _ = await repo.list_all(only_auto=only_auto, limit=limit, offset=offset)
-    enriched = [await _enrich_cap(session, r) for r in rows]
+    enriched = await _enrich_caps(session, list(rows))
     if not include_orphans:
         enriched = [c for c in enriched if c.has_active_listing]
     if include_capless:
@@ -890,6 +953,7 @@ async def list_caps(
             .all()
         )
         now = datetime.now(UTC)
+        synths: list[CapOut] = []
         for lst in listings:
             if lst.mlb_id in have:
                 continue
@@ -906,8 +970,45 @@ async def list_caps(
                 updated_by=None,
                 updated_at=now,
             )
-            enriched.append(await _enrich_cap(session, synth))
+            synths.append(synth)
+        enriched.extend(await _enrich_caps(session, synths))
     return enriched
+
+
+class CapsSummaryOut(BaseModel):
+    total: int
+    auto_apply: int
+
+
+# Same population as ``GET /caps`` (default ``include_orphans=false``): caps whose
+# MLB is ``active`` in ml_listings. ``include_orphans=true`` counts every cap row.
+_CAPS_SUMMARY_SQL = (
+    "SELECT count(*) AS total, count(*) FILTER (WHERE c.auto_apply) AS auto_apply "
+    "FROM ml_promo_caps c "
+    "WHERE :include_orphans OR EXISTS ("
+    "  SELECT 1 FROM ml_listings l WHERE l.mlb_id = c.mlb_id AND l.status = 'active')"
+)
+
+
+@router.get("/caps/summary", response_model=CapsSummaryOut)
+async def caps_summary(
+    include_orphans: Annotated[
+        bool,
+        Query(description="Count caps whose MLB is not active too (default: same as /caps)."),
+    ] = False,
+    session: AsyncSession = Depends(db_session),
+) -> CapsSummaryOut:
+    """Counts for the Promoções header (``total`` caps and how many are
+    ``auto_apply``) without downloading and enriching every cap. Equals
+    ``len(GET /caps)`` and ``sum(auto_apply)`` over it for the same
+    ``include_orphans``. Declared before ``/caps/{mlb_id}`` so ``summary`` is
+    not taken as an MLB id."""
+    row = (
+        (await session.execute(text(_CAPS_SUMMARY_SQL), {"include_orphans": include_orphans}))
+        .mappings()
+        .one()
+    )
+    return CapsSummaryOut(total=int(row["total"]), auto_apply=int(row["auto_apply"]))
 
 
 @router.get("/caps/by-sku/{sku}", response_model=list[CapOut])
@@ -918,7 +1019,7 @@ async def list_caps_by_sku(
     """All per-MLB caps for a SKU. Used by the drawer + kit grouping flows."""
     repo = MLPromoCapRepository(session)
     rows = await repo.get_by_sku(sku)
-    return [await _enrich_cap(session, r) for r in rows]
+    return await _enrich_caps(session, list(rows))
 
 
 @router.get("/caps/{mlb_id}", response_model=CapOut)
